@@ -1,0 +1,28 @@
+{
+  "name": "spike-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "monitor": "npm run build && node dist/liveMonitor.js",
+    "backtest": "npm run build && node dist/backtestRunner.js",
+    "test": "vitest run"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.15.0",
+    "dotenv": "^17.4.2",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2",
+    "vitest": "^3.2.4"
+  }
+}
