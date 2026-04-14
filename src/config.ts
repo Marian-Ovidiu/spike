@@ -6,10 +6,49 @@ dotenv.config();
 export const configDefaults = {
   /** Minimum relative 1-tick move (fraction) to count as a spike. */
   spikeThreshold: 0.005,
+  /** Minimum practical move quality for direct tradability (0.0015 = 0.15%). */
+  tradableSpikeMinPercent: 0.0015,
   /** Max prior-window chop (excl. latest tick) for a “stable” regime. */
   rangeThreshold: 0.0012,
+  /** Soft tolerance over rangeThreshold to classify pre-spike range as acceptable. */
+  stableRangeSoftToleranceRatio: 1.5,
+  /** Max prior range for normal mean-reversion entries (0.0015 = 0.15%). */
+  maxPriorRangeForNormalEntry: 0.0015,
+  /**
+   * Hard reject threshold for unstable pre-spike context:
+   * if stableRangeDetected=false and priorRangePercent exceeds this value.
+   */
+  hardRejectPriorRangePercent: 0.002,
+  /** Optional hard reject for strong spikes when pre-range quality is poor. */
+  strongSpikeHardRejectPoorRange: false,
+  /** Number of ticks to wait for normal strong-spike confirmation. */
+  strongSpikeConfirmationTicks: 1,
+  /** Min spike percent to consider a move exceptional (0.0025 = 0.25%). */
+  exceptionalSpikePercent: 0.0025,
+  /** If true, exceptional spikes can bypass cooldown-only blockers. */
+  exceptionalSpikeOverridesCooldown: true,
+  /** Hard cap for opposite-side entry quote (independent from entryPrice). */
+  maxOppositeSideEntryPrice: 0.35,
+  /** Lower bound of neutral quote band where both sides are considered non-tradable. */
+  neutralQuoteBandMin: 0.45,
+  /** Upper bound of neutral quote band where both sides are considered non-tradable. */
+  neutralQuoteBandMax: 0.55,
   /** Spike move must be ≥ this × prior-window relative range (filters weak spikes). */
   spikeMinRangeMultiple: 2.2,
+  /** Borderline lower bound as ratio of SPIKE_THRESHOLD (e.g. 0.85 = 85%). */
+  borderlineMinRatio: 0.85,
+  /** Ticks to observe after a borderline move before delayed decision. */
+  borderlineWatchTicks: 2,
+  /** Require momentum pause during borderline watch window. */
+  borderlineRequirePause: true,
+  /** Block delayed entry if same-direction continuation stays strong. */
+  borderlineRequireNoContinuation: true,
+  /** Extra same-direction extension needed (fraction of original move) to call continuation. */
+  borderlineContinuationThreshold: 0.25,
+  /** Opposite-direction retrace needed (fraction of original move) to call reversion. */
+  borderlineReversionThreshold: 0.2,
+  /** Narrow band around detection price to classify as pause (fraction; 0.00015 = 0.015%). */
+  borderlinePauseBandPercent: 0.00015,
   entryPrice: 0.22,
   exitPrice: 0.52,
   /** Exit long if mark at or below this (tighter = less $ at risk per contract). */
@@ -27,13 +66,32 @@ export const configDefaults = {
 } as const;
 
 export type AppConfig = {
-  [K in keyof typeof configDefaults]: number;
+  [K in keyof typeof configDefaults]:
+    (typeof configDefaults)[K] extends boolean ? boolean : number;
 };
 
 const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   spikeThreshold: "SPIKE_THRESHOLD",
+  tradableSpikeMinPercent: "TRADABLE_SPIKE_MIN_PERCENT",
   rangeThreshold: "RANGE_THRESHOLD",
+  stableRangeSoftToleranceRatio: "STABLE_RANGE_SOFT_TOLERANCE_RATIO",
+  maxPriorRangeForNormalEntry: "MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY",
+  hardRejectPriorRangePercent: "HARD_REJECT_PRIOR_RANGE_PERCENT",
+  strongSpikeHardRejectPoorRange: "STRONG_SPIKE_HARD_REJECT_POOR_RANGE",
+  strongSpikeConfirmationTicks: "STRONG_SPIKE_CONFIRMATION_TICKS",
+  exceptionalSpikePercent: "EXCEPTIONAL_SPIKE_PERCENT",
+  exceptionalSpikeOverridesCooldown: "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
+  maxOppositeSideEntryPrice: "MAX_OPPOSITE_SIDE_ENTRY_PRICE",
+  neutralQuoteBandMin: "NEUTRAL_QUOTE_BAND_MIN",
+  neutralQuoteBandMax: "NEUTRAL_QUOTE_BAND_MAX",
   spikeMinRangeMultiple: "SPIKE_MIN_RANGE_MULT",
+  borderlineMinRatio: "BORDERLINE_MIN_RATIO",
+  borderlineWatchTicks: "BORDERLINE_WATCH_TICKS",
+  borderlineRequirePause: "BORDERLINE_REQUIRE_PAUSE",
+  borderlineRequireNoContinuation: "BORDERLINE_REQUIRE_NO_CONTINUATION",
+  borderlineContinuationThreshold: "BORDERLINE_CONTINUATION_THRESHOLD",
+  borderlineReversionThreshold: "BORDERLINE_REVERSION_THRESHOLD",
+  borderlinePauseBandPercent: "BORDERLINE_PAUSE_BAND_PERCENT",
   entryPrice: "ENTRY_PRICE",
   exitPrice: "EXIT_PRICE",
   stopLoss: "STOP_LOSS",
@@ -69,6 +127,30 @@ function parseEnvNumber(
   return { value: parsed, fromEnv: true };
 }
 
+function parseEnvBoolean(
+  envVar: string,
+  defaultValue: boolean
+): { value: boolean; fromEnv: boolean } {
+  const raw = process.env[envVar];
+  if (raw === undefined) {
+    return { value: defaultValue, fromEnv: false };
+  }
+  const trimmed = raw.trim().toLowerCase();
+  if (trimmed === "") {
+    return { value: defaultValue, fromEnv: false };
+  }
+  if (trimmed === "1" || trimmed === "true" || trimmed === "yes" || trimmed === "on") {
+    return { value: true, fromEnv: true };
+  }
+  if (trimmed === "0" || trimmed === "false" || trimmed === "no" || trimmed === "off") {
+    return { value: false, fromEnv: true };
+  }
+  console.warn(
+    `[config] ${envVar}="${raw}" is not a valid boolean; using default ${defaultValue}`
+  );
+  return { value: defaultValue, fromEnv: false };
+}
+
 function loadConfig(): {
   config: AppConfig;
   _meta: { [K in keyof AppConfig]: { fromEnv: boolean } };
@@ -77,13 +159,90 @@ function loadConfig(): {
     "SPIKE_THRESHOLD",
     configDefaults.spikeThreshold
   );
+  const tradableSpikeMinPercent = parseEnvNumber(
+    "TRADABLE_SPIKE_MIN_PERCENT",
+    configDefaults.tradableSpikeMinPercent
+  );
   const rangeThreshold = parseEnvNumber(
     "RANGE_THRESHOLD",
     configDefaults.rangeThreshold
   );
+  const stableRangeSoftToleranceRatio = parseEnvNumber(
+    "STABLE_RANGE_SOFT_TOLERANCE_RATIO",
+    configDefaults.stableRangeSoftToleranceRatio
+  );
+  const maxPriorRangeForNormalEntry = parseEnvNumber(
+    "MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY",
+    configDefaults.maxPriorRangeForNormalEntry
+  );
+  const hardRejectPriorRangePercent = parseEnvNumber(
+    "HARD_REJECT_PRIOR_RANGE_PERCENT",
+    configDefaults.hardRejectPriorRangePercent
+  );
+  const strongSpikeHardRejectPoorRange = parseEnvBoolean(
+    "STRONG_SPIKE_HARD_REJECT_POOR_RANGE",
+    configDefaults.strongSpikeHardRejectPoorRange
+  );
+  const strongSpikeConfirmationTicksRaw = parseEnvNumber(
+    "STRONG_SPIKE_CONFIRMATION_TICKS",
+    configDefaults.strongSpikeConfirmationTicks
+  );
+  const strongSpikeConfirmationTicks = Math.max(
+    0,
+    Math.trunc(strongSpikeConfirmationTicksRaw.value)
+  );
+  const exceptionalSpikePercent = parseEnvNumber(
+    "EXCEPTIONAL_SPIKE_PERCENT",
+    configDefaults.exceptionalSpikePercent
+  );
+  const exceptionalSpikeOverridesCooldown = parseEnvBoolean(
+    "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
+    configDefaults.exceptionalSpikeOverridesCooldown
+  );
+  const maxOppositeSideEntryPrice = parseEnvNumber(
+    "MAX_OPPOSITE_SIDE_ENTRY_PRICE",
+    configDefaults.maxOppositeSideEntryPrice
+  );
+  const neutralQuoteBandMin = parseEnvNumber(
+    "NEUTRAL_QUOTE_BAND_MIN",
+    configDefaults.neutralQuoteBandMin
+  );
+  const neutralQuoteBandMax = parseEnvNumber(
+    "NEUTRAL_QUOTE_BAND_MAX",
+    configDefaults.neutralQuoteBandMax
+  );
   const spikeMinRangeMultiple = parseEnvNumber(
     "SPIKE_MIN_RANGE_MULT",
     configDefaults.spikeMinRangeMultiple
+  );
+  const borderlineMinRatio = parseEnvNumber(
+    "BORDERLINE_MIN_RATIO",
+    configDefaults.borderlineMinRatio
+  );
+  const borderlineWatchTicksRaw = parseEnvNumber(
+    "BORDERLINE_WATCH_TICKS",
+    configDefaults.borderlineWatchTicks
+  );
+  const borderlineWatchTicks = Math.max(0, Math.trunc(borderlineWatchTicksRaw.value));
+  const borderlineRequirePause = parseEnvBoolean(
+    "BORDERLINE_REQUIRE_PAUSE",
+    configDefaults.borderlineRequirePause
+  );
+  const borderlineRequireNoContinuation = parseEnvBoolean(
+    "BORDERLINE_REQUIRE_NO_CONTINUATION",
+    configDefaults.borderlineRequireNoContinuation
+  );
+  const borderlineContinuationThreshold = parseEnvNumber(
+    "BORDERLINE_CONTINUATION_THRESHOLD",
+    configDefaults.borderlineContinuationThreshold
+  );
+  const borderlineReversionThreshold = parseEnvNumber(
+    "BORDERLINE_REVERSION_THRESHOLD",
+    configDefaults.borderlineReversionThreshold
+  );
+  const borderlinePauseBandPercent = parseEnvNumber(
+    "BORDERLINE_PAUSE_BAND_PERCENT",
+    configDefaults.borderlinePauseBandPercent
   );
   const entryPrice = parseEnvNumber("ENTRY_PRICE", configDefaults.entryPrice);
   const exitPrice = parseEnvNumber("EXIT_PRICE", configDefaults.exitPrice);
@@ -113,8 +272,32 @@ function loadConfig(): {
   return {
     config: {
       spikeThreshold: spikeThreshold.value,
+      tradableSpikeMinPercent: Math.max(0, tradableSpikeMinPercent.value),
       rangeThreshold: rangeThreshold.value,
+      stableRangeSoftToleranceRatio: Math.max(
+        1,
+        stableRangeSoftToleranceRatio.value
+      ),
+      maxPriorRangeForNormalEntry: Math.max(0, maxPriorRangeForNormalEntry.value),
+      hardRejectPriorRangePercent: Math.max(0, hardRejectPriorRangePercent.value),
+      strongSpikeHardRejectPoorRange: strongSpikeHardRejectPoorRange.value,
+      strongSpikeConfirmationTicks,
+      exceptionalSpikePercent: Math.max(0, exceptionalSpikePercent.value),
+      exceptionalSpikeOverridesCooldown: exceptionalSpikeOverridesCooldown.value,
+      maxOppositeSideEntryPrice: Math.max(0, maxOppositeSideEntryPrice.value),
+      neutralQuoteBandMin: Math.max(0, Math.min(1, neutralQuoteBandMin.value)),
+      neutralQuoteBandMax: Math.max(0, Math.min(1, neutralQuoteBandMax.value)),
       spikeMinRangeMultiple: Math.max(0, spikeMinRangeMultiple.value),
+      borderlineMinRatio: Math.min(1, Math.max(0, borderlineMinRatio.value)),
+      borderlineWatchTicks,
+      borderlineRequirePause: borderlineRequirePause.value,
+      borderlineRequireNoContinuation: borderlineRequireNoContinuation.value,
+      borderlineContinuationThreshold: Math.max(
+        0,
+        borderlineContinuationThreshold.value
+      ),
+      borderlineReversionThreshold: Math.max(0, borderlineReversionThreshold.value),
+      borderlinePauseBandPercent: Math.max(0, borderlinePauseBandPercent.value),
       entryPrice: entryPrice.value,
       exitPrice: exitPrice.value,
       stopLoss: stopLoss.value,
@@ -126,8 +309,42 @@ function loadConfig(): {
     },
     _meta: {
       spikeThreshold: { fromEnv: spikeThreshold.fromEnv },
+      tradableSpikeMinPercent: { fromEnv: tradableSpikeMinPercent.fromEnv },
       rangeThreshold: { fromEnv: rangeThreshold.fromEnv },
+      stableRangeSoftToleranceRatio: {
+        fromEnv: stableRangeSoftToleranceRatio.fromEnv,
+      },
+      maxPriorRangeForNormalEntry: {
+        fromEnv: maxPriorRangeForNormalEntry.fromEnv,
+      },
+      hardRejectPriorRangePercent: {
+        fromEnv: hardRejectPriorRangePercent.fromEnv,
+      },
+      strongSpikeHardRejectPoorRange: {
+        fromEnv: strongSpikeHardRejectPoorRange.fromEnv,
+      },
+      strongSpikeConfirmationTicks: {
+        fromEnv: strongSpikeConfirmationTicksRaw.fromEnv,
+      },
+      exceptionalSpikePercent: { fromEnv: exceptionalSpikePercent.fromEnv },
+      exceptionalSpikeOverridesCooldown: {
+        fromEnv: exceptionalSpikeOverridesCooldown.fromEnv,
+      },
+      maxOppositeSideEntryPrice: { fromEnv: maxOppositeSideEntryPrice.fromEnv },
+      neutralQuoteBandMin: { fromEnv: neutralQuoteBandMin.fromEnv },
+      neutralQuoteBandMax: { fromEnv: neutralQuoteBandMax.fromEnv },
       spikeMinRangeMultiple: { fromEnv: spikeMinRangeMultiple.fromEnv },
+      borderlineMinRatio: { fromEnv: borderlineMinRatio.fromEnv },
+      borderlineWatchTicks: { fromEnv: borderlineWatchTicksRaw.fromEnv },
+      borderlineRequirePause: { fromEnv: borderlineRequirePause.fromEnv },
+      borderlineRequireNoContinuation: {
+        fromEnv: borderlineRequireNoContinuation.fromEnv,
+      },
+      borderlineContinuationThreshold: {
+        fromEnv: borderlineContinuationThreshold.fromEnv,
+      },
+      borderlineReversionThreshold: { fromEnv: borderlineReversionThreshold.fromEnv },
+      borderlinePauseBandPercent: { fromEnv: borderlinePauseBandPercent.fromEnv },
       entryPrice: { fromEnv: entryPrice.fromEnv },
       exitPrice: { fromEnv: exitPrice.fromEnv },
       stopLoss: { fromEnv: stopLoss.fromEnv },
@@ -144,6 +361,17 @@ const loaded = loadConfig();
 export const config: AppConfig = loaded.config;
 const _meta = loaded._meta;
 
+/**
+ * When truthy (`1`, `true`, `yes`), the live monitor prints extra
+ * per-tick strategy diagnostics: spike debug lines, rolling range %,
+ * strongest recent move, and expanded blocks for rejected candidates.
+ * Controlled by the `DEBUG_MONITOR` environment variable.
+ */
+export const debugMonitor: boolean = (() => {
+  const raw = process.env.DEBUG_MONITOR?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+})();
+
 /** Pretty-print current config (call once at startup). */
 export function logConfig(): void {
   const keys = Object.keys(configDefaults) as (keyof AppConfig)[];
@@ -153,7 +381,7 @@ export function logConfig(): void {
     "────────── Configuration ──────────",
     ...keys.map((key) => {
       const name = String(key).padEnd(labelW);
-      const val = formatConfigNumber(config[key]);
+      const val = formatConfigValue(config[key]);
       const source = _meta[key].fromEnv
         ? `env ${ENV_KEYS[key]}`
         : "default";
@@ -164,7 +392,9 @@ export function logConfig(): void {
   console.log(lines.join("\n"));
 }
 
-function formatConfigNumber(n: number): string {
+function formatConfigValue(v: number | boolean): string {
+  if (typeof v === "boolean") return String(v);
+  const n = v;
   if (!Number.isFinite(n)) return String(n);
   if (Number.isInteger(n)) return String(n);
   const s = n.toString();

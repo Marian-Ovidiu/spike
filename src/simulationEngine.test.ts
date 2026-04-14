@@ -15,6 +15,7 @@ function trade(pl: number): SimulatedTrade {
     profitLoss: pl,
     riskAtEntry: 0,
     exitReason: "profit",
+    entryPath: "strong_spike_immediate",
     openedAt: 0,
     closedAt: 1,
   };
@@ -67,7 +68,27 @@ describe("SimulationEngine.onTradeClosed", () => {
 
     sim.onTick({
       now: 1_000,
-      entry: { shouldEnter: true, direction: "UP", reasons: [] },
+      entry: {
+        shouldEnter: true,
+        direction: "UP",
+        reasons: [],
+        stableRangeDetected: true,
+        priorRangePercent: 0.1,
+        stableRangeQuality: "good",
+        rangeDecisionNote: "test",
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        movement: {
+          strongestMovePercent: 0.01,
+          strongestMoveAbsolute: 0.2,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.005,
+          thresholdRatio: 2,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+        windowSpike: undefined,
+      },
       sides: { upSidePrice: 0.2, downSidePrice: 0.5 },
       config: tickConfig,
     });
@@ -75,7 +96,27 @@ describe("SimulationEngine.onTradeClosed", () => {
 
     sim.onTick({
       now: 2_000,
-      entry: { shouldEnter: false, direction: null, reasons: ["market_not_stable"] },
+      entry: {
+        shouldEnter: false,
+        direction: null,
+        reasons: ["market_not_stable"],
+        stableRangeDetected: false,
+        priorRangePercent: 1.2,
+        stableRangeQuality: "poor",
+        rangeDecisionNote: "test",
+        movementClassification: "no_signal",
+        spikeDetected: false,
+        movement: {
+          strongestMovePercent: 0,
+          strongestMoveAbsolute: 0,
+          strongestMoveDirection: null,
+          thresholdPercent: 0.005,
+          thresholdRatio: 0,
+          classification: "no_signal",
+          sourceWindowLabel: null,
+        },
+        windowSpike: undefined,
+      },
       sides: { upSidePrice: 0.55, downSidePrice: 0.45 },
       config: tickConfig,
     });

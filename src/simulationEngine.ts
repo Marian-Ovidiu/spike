@@ -15,6 +15,8 @@ export type SimulatedTrade = {
   /** Planned max loss at stop for this size (≤ risk budget). */
   riskAtEntry: number;
   exitReason: ExitReason;
+  /** Which strategy path opened this trade. */
+  entryPath: "strong_spike_immediate" | "borderline_delayed";
   openedAt: number;
   closedAt: number;
 };
@@ -24,12 +26,15 @@ type OpenSimPosition = {
   contracts: number;
   entryPrice: number;
   stopLoss: number;
+  entryPath: "strong_spike_immediate" | "borderline_delayed";
   openedAt: number;
 };
 
 export type SimulationTickInput = {
   now: number;
   entry: EntryEvaluation;
+  /** Optional source tagging for attribution stats. */
+  entryPath?: "strong_spike_immediate" | "borderline_delayed";
   sides: { upSidePrice: number; downSidePrice: number };
   /** Exit, stop, sizing, cooldown. */
   config: Pick<
@@ -116,6 +121,18 @@ export class SimulationEngine {
       entryPrice: this.position.entryPrice,
       contracts: this.position.contracts,
     };
+  }
+
+  /**
+   * True when a new entry can be accepted right now, considering open position
+   * and post-exit cooldown.
+   */
+  canOpenNewPosition(now: number, cooldownMs: number): boolean {
+    if (this.position !== null) return false;
+    if (this.lastExitAt !== null && now - this.lastExitAt < cooldownMs) {
+      return false;
+    }
+    return true;
   }
 
   /** Cumulative stats including equity / drawdown (paper account). */
@@ -206,6 +223,7 @@ export class SimulationEngine {
         contracts,
         entryPrice: fill,
         stopLoss: config.stopLoss,
+        entryPath: input.entryPath ?? "strong_spike_immediate",
         openedAt: now,
       };
       if (!this.silent) {
@@ -223,7 +241,7 @@ export class SimulationEngine {
   ): void {
     if (!this.position) return;
 
-    const { direction, contracts, entryPrice, stopLoss, openedAt } =
+    const { direction, contracts, entryPrice, stopLoss, entryPath, openedAt } =
       this.position;
     this.position = null;
 
@@ -247,6 +265,7 @@ export class SimulationEngine {
       profitLoss,
       riskAtEntry,
       exitReason,
+      entryPath,
       openedAt,
       closedAt,
     };

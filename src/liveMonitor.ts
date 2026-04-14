@@ -1,91 +1,160 @@
 import {
-
   BOT_TICK_INTERVAL_MS,
-
   MIN_SAMPLES_FOR_STRATEGY,
-
   runStrategyTick,
-
   type BotContext,
-
 } from "./botLoop.js";
-
-import { config, logConfig } from "./config.js";
-
+import { config, debugMonitor, logConfig } from "./config.js";
 import {
-
   buildMonitorSessionSummary,
-
   MonitorFilePersistence,
-
 } from "./monitorPersistence.js";
-
 import {
-
+  formatDebugTickExtras,
+  logBorderlineLifecycleBlock,
   formatMonitorTickLine,
-
+  logOpportunityBlock,
   logPaperTradeClosedBlock,
-
   logValidOpportunityBlock,
-
   printLiveMonitorBanner,
-
   printPeriodicRuntimeSummary,
-
   printShutdownReport,
-
 } from "./monitorConsole.js";
-
 import { MonitorRuntimeStats } from "./monitorRuntimeStats.js";
-
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
-
 import type { SimulatedTrade } from "./simulationEngine.js";
-
 import { SimulationEngine } from "./simulationEngine.js";
-
 import { isPolymarketGammaEnabled } from "./polymarketGamma.js";
-
 import { OpportunityTracker } from "./opportunityTracker.js";
-import { evaluateSession, printSessionEvaluationReport } from "./sessionEvaluator.js";
+import {
+  evaluateSession,
+  printSessionEvaluationReport,
+} from "./sessionEvaluator.js";
+import { SpikeDebugTracker } from "./spikeDebugTracker.js";
+import {
+  BorderlineCandidateStore,
+} from "./borderlineCandidateStore.js";
+import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
+import {
+  formatStrategyDecisionLog,
+  runStrategyDecisionPipeline,
+} from "./strategyDecisionPipeline.js";
 
-
-
-const runtimeStats = new MonitorRuntimeStats();
-
+const runtimeStats = new MonitorRuntimeStats({
+  exceptionalSpikePercent: config.exceptionalSpikePercent,
+});
 const persistence = new MonitorFilePersistence();
-
-
+const spikeDebug = new SpikeDebugTracker();
+const borderlineManager = new BorderlineCandidateStore({
+  symbol: "BTCUSD",
+  watchTicks: config.borderlineWatchTicks,
+});
+const strongSpikeManager = new StrongSpikeCandidateStore({
+  symbol: "BTCUSD",
+  watchTicks: config.strongSpikeConfirmationTicks,
+});
 
 let monitorStartedAtMs = 0;
-
 let tickTimer: ReturnType<typeof setInterval> | undefined;
-
 let statsTimer: ReturnType<typeof setInterval> | undefined;
-
 let shutdownInProgress = false;
 
+function buildInterpretationLines(): string[] {
+  const lines: string[] = [];
+  if (
+    runtimeStats.noSignalMoves >
+    runtimeStats.borderlineMoves + runtimeStats.strongSpikeMoves
+  ) {
+    lines.push("market too flat");
+  }
+  const blockedByQuotes =
+    runtimeStats.blockedByInvalidQuotes +
+    runtimeStats.blockedByExpensiveOppositeSide +
+    runtimeStats.blockedByNeutralQuotes;
+  if (runtimeStats.rejectedByWeakSpikeQuality > runtimeStats.validOpportunities) {
+    lines.push("too many weak spikes rejected");
+  }
+  const trendNoiseFiltered =
+    runtimeStats.rejectedByPriorRangeTooWide + runtimeStats.rejectedByHardUnstableContext;
+  if (trendNoiseFiltered >= runtimeStats.validOpportunities) {
+    lines.push("trend/noise filter removed most signals");
+  }
+  if (blockedByQuotes > 0 && blockedByQuotes >= runtimeStats.validOpportunities) {
+    lines.push("quote quality blocked most entries");
+  }
+  if (runtimeStats.cooldownOverridesUsed > 0 && runtimeStats.exceptionalSpikeEntries > 0) {
+    lines.push("exceptional spikes bypassed cooldown successfully");
+  }
+  if (
+    runtimeStats.validOpportunities > 0 &&
+    runtimeStats.validOpportunities < runtimeStats.rejectedOpportunities
+  ) {
+    lines.push("strategy now focuses on high-quality setups");
+  }
+  if (lines.length === 0) {
+    lines.push("session mixed: monitor movement mix and blocker counters");
+  }
+  return lines;
+}
 
+function formatTopRejectionReasons(): string {
+  const top = runtimeStats.getTopRejectionReasons(5);
+  if (top.length === 0) return "none";
+  return top.map((r) => `${r.reason}:${r.count}`).join(" | ");
+}
+
+function borderlineImpactVerdict(): "helpful" | "neutral" | "harmful" {
+  if (runtimeStats.borderlineTradesClosed <= 0) return "neutral";
+  const avgDelta =
+    runtimeStats.borderlineAveragePnL - runtimeStats.strongSpikeAveragePnL;
+  if (avgDelta > 0) return "helpful";
+  if (avgDelta < 0) return "harmful";
+  return "neutral";
+}
+
+function borderlineNetImpact(): "positive" | "negative" | "flat" {
+  if (runtimeStats.borderlinePnL > 0) return "positive";
+  if (runtimeStats.borderlinePnL < 0) return "negative";
+  return "flat";
+}
 
 function gracefulShutdown(): void {
-
   if (shutdownInProgress) return;
-
   shutdownInProgress = true;
-
   if (statsTimer !== undefined) clearInterval(statsTimer);
-
   if (tickTimer !== undefined) clearInterval(tickTimer);
 
-  printShutdownReport(monitorStartedAtMs, {
+  printShutdownReport(
+    monitorStartedAtMs,
+    {
+      ticksObserved: runtimeStats.ticksObserved,
+      validOpportunities: runtimeStats.validOpportunities,
+      rejectedOpportunities: runtimeStats.rejectedOpportunities,
+    },
+    simulation.getPerformanceStats(),
+    {
+      strongSpikeWinRate: runtimeStats.strongSpikeWinRate,
+      delayedBorderlineWinRate: runtimeStats.borderlineWinRate,
+      averageStrongSpikePnL: runtimeStats.strongSpikeAveragePnL,
+      averageBorderlinePnL: runtimeStats.borderlineAveragePnL,
+      borderlinePnL: runtimeStats.borderlinePnL,
+      borderlineNetImpact: borderlineNetImpact(),
+      borderlinePromotions: runtimeStats.borderlinePromotions,
+      borderlineSignals: runtimeStats.borderlineSignals,
+      qualityWeak: runtimeStats.qualityWeak,
+      qualityStrong: runtimeStats.qualityStrong,
+      qualityExceptional: runtimeStats.qualityExceptional,
+      topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
+      verdict: borderlineImpactVerdict(),
+    }
+  );
+  for (const line of buildInterpretationLines()) {
+    console.log(`[interpretation] ${line}`);
+  }
 
-    ticksObserved: runtimeStats.ticksObserved,
-
-    validOpportunities: runtimeStats.validOpportunities,
-
-    rejectedOpportunities: runtimeStats.rejectedOpportunities,
-
-  }, simulation.getPerformanceStats());
+  if (spikeDebug.getReadyTickCount() > 0) {
+    console.log(spikeDebug.formatSummary());
+  }
 
   const perfForEval = simulation.getPerformanceStats();
   printSessionEvaluationReport(
@@ -98,305 +167,434 @@ function gracefulShutdown(): void {
   );
 
   const endedAt = Date.now();
-
   try {
-
     persistence.writeSessionSummary(
-
       buildMonitorSessionSummary({
-
         outputDirectory: persistence.getOutputDir(),
-
         startedAtMs: monitorStartedAtMs,
-
         endedAtMs: endedAt,
-
         ticksObserved: runtimeStats.ticksObserved,
-
         btcFetchFailures: runtimeStats.btcFetchFailures,
-
         spikeEventsDetected: runtimeStats.spikeEventsDetected,
-
         candidateOpportunities: runtimeStats.candidateOpportunities,
-
         validOpportunities: runtimeStats.validOpportunities,
-
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
-
         perf: simulation.getPerformanceStats(),
-
+        extended: {
+          strongSpikeSignals: runtimeStats.strongSpikeSignals,
+          strongSpikeEntries: runtimeStats.strongSpikeEntries,
+          noSignalMoves: runtimeStats.noSignalMoves,
+          borderlineMoves: runtimeStats.borderlineMoves,
+          strongSpikeMoves: runtimeStats.strongSpikeMoves,
+          borderlineSignals: runtimeStats.borderlineSignals,
+          borderlineCandidatesCreated: runtimeStats.borderlineCandidatesCreated,
+          borderlinePromotions: runtimeStats.borderlinePromotions,
+          borderlineCancellations: runtimeStats.borderlineCancellations,
+          borderlineExpirations: runtimeStats.borderlineExpirations,
+          blockedByCooldown: runtimeStats.blockedByCooldown,
+          blockedByActivePosition: runtimeStats.blockedByActivePosition,
+          blockedByInvalidQuotes: runtimeStats.blockedByInvalidQuotes,
+          blockedByNoisyRange: runtimeStats.blockedByNoisyRange,
+          blockedByWidePriorRange: runtimeStats.blockedByWidePriorRange,
+          blockedByHardRejectUnstableContext:
+            runtimeStats.blockedByHardRejectUnstableContext,
+          rejectedByWeakSpikeQuality: runtimeStats.rejectedByWeakSpikeQuality,
+          rejectedByPriorRangeTooWide: runtimeStats.rejectedByPriorRangeTooWide,
+          rejectedByHardUnstableContext: runtimeStats.rejectedByHardUnstableContext,
+          rejectedByStrongSpikeContinuation:
+            runtimeStats.rejectedByStrongSpikeContinuation,
+          rejectedByBorderlineContinuation:
+            runtimeStats.rejectedByBorderlineContinuation,
+          rejectedByExpensiveOppositeSide: runtimeStats.rejectedByExpensiveOppositeSide,
+          exceptionalSpikeSignals: runtimeStats.exceptionalSpikeSignals,
+          exceptionalSpikeEntries: runtimeStats.exceptionalSpikeEntries,
+          cooldownOverridesUsed: runtimeStats.cooldownOverridesUsed,
+          blockedByExpensiveOppositeSide: runtimeStats.blockedByExpensiveOppositeSide,
+          blockedByNeutralQuotes: runtimeStats.blockedByNeutralQuotes,
+          borderlineTradesClosed: runtimeStats.borderlineTradesClosed,
+          borderlineWins: runtimeStats.borderlineWins,
+          borderlineLosses: runtimeStats.borderlineLosses,
+          borderlinePnL: runtimeStats.borderlinePnL,
+          averageBorderlinePnL: runtimeStats.borderlineAveragePnL,
+          strongSpikeTradesClosed: runtimeStats.strongSpikeTradesClosed,
+          strongSpikeWins: runtimeStats.strongSpikeWins,
+          strongSpikeLosses: runtimeStats.strongSpikeLosses,
+          strongSpikePnL: runtimeStats.strongSpikePnL,
+          averageStrongSpikePnL: runtimeStats.strongSpikeAveragePnL,
+          strongSpikeWinRate: runtimeStats.strongSpikeWinRate,
+          delayedBorderlineWinRate: runtimeStats.borderlineWinRate,
+          borderlineNetImpact: borderlineNetImpact(),
+          verdict: borderlineImpactVerdict(),
+          qualityWeak: runtimeStats.qualityWeak,
+          qualityStrong: runtimeStats.qualityStrong,
+          qualityExceptional: runtimeStats.qualityExceptional,
+          topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
+          interpretation: buildInterpretationLines(),
+        },
       })
-
     );
-
   } catch (err) {
-
     console.error("[monitor] Failed to write session-summary.json:", err);
-
   }
-
   process.exit(0);
-
 }
 
-
-
 function onPaperTradeClosed(trade: SimulatedTrade): void {
-
+  runtimeStats.observeClosedTrade(trade);
   try {
-
     persistence.appendTradeLine(trade);
-
   } catch (err) {
-
     console.error("[monitor] Failed to append trades.jsonl:", err);
-
   }
-
-
 
   logPaperTradeClosedBlock(trade);
 
-
-
   const closedCount = simulation.getTradeHistory().length;
-
   if (closedCount > 0 && closedCount % 10 === 0) {
-
     printPeriodicRuntimeSummary(
-
       `Runtime stats (${closedCount} closed trades)`,
-
       {
-
         ticksObserved: runtimeStats.ticksObserved,
-
         btcFetchFailures: runtimeStats.btcFetchFailures,
-
         spikeEventsDetected: runtimeStats.spikeEventsDetected,
-
         candidateOpportunities: runtimeStats.candidateOpportunities,
-
         validOpportunities: runtimeStats.validOpportunities,
-
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
-
+        strongSpikeSignals: runtimeStats.strongSpikeSignals,
+        strongSpikeEntries: runtimeStats.strongSpikeEntries,
+        noSignalMoves: runtimeStats.noSignalMoves,
+        borderlineMoves: runtimeStats.borderlineMoves,
+        strongSpikeMoves: runtimeStats.strongSpikeMoves,
+        borderlineSignals: runtimeStats.borderlineSignals,
+        borderlineCandidatesCreated: runtimeStats.borderlineCandidatesCreated,
+        borderlinePromotions: runtimeStats.borderlinePromotions,
+        borderlineCancellations: runtimeStats.borderlineCancellations,
+        borderlineExpirations: runtimeStats.borderlineExpirations,
+        blockedByCooldown: runtimeStats.blockedByCooldown,
+        blockedByActivePosition: runtimeStats.blockedByActivePosition,
+        blockedByInvalidQuotes: runtimeStats.blockedByInvalidQuotes,
+        blockedByNoisyRange: runtimeStats.blockedByNoisyRange,
+        blockedByWidePriorRange: runtimeStats.blockedByWidePriorRange,
+        blockedByHardRejectUnstableContext:
+          runtimeStats.blockedByHardRejectUnstableContext,
+        rejectedByWeakSpikeQuality: runtimeStats.rejectedByWeakSpikeQuality,
+        rejectedByPriorRangeTooWide: runtimeStats.rejectedByPriorRangeTooWide,
+        rejectedByHardUnstableContext: runtimeStats.rejectedByHardUnstableContext,
+        rejectedByStrongSpikeContinuation:
+          runtimeStats.rejectedByStrongSpikeContinuation,
+        rejectedByBorderlineContinuation:
+          runtimeStats.rejectedByBorderlineContinuation,
+        rejectedByExpensiveOppositeSide: runtimeStats.rejectedByExpensiveOppositeSide,
+        exceptionalSpikeSignals: runtimeStats.exceptionalSpikeSignals,
+        exceptionalSpikeEntries: runtimeStats.exceptionalSpikeEntries,
+        cooldownOverridesUsed: runtimeStats.cooldownOverridesUsed,
+        blockedByExpensiveOppositeSide: runtimeStats.blockedByExpensiveOppositeSide,
+        blockedByNeutralQuotes: runtimeStats.blockedByNeutralQuotes,
+        borderlineTradesClosed: runtimeStats.borderlineTradesClosed,
+        borderlineWinRate: runtimeStats.borderlineWinRate,
+        borderlinePnL: runtimeStats.borderlinePnL,
       },
-
       simulation
-
     );
-
   }
-
 }
 
-
-
 async function runMonitorTick(ctx: BotContext): Promise<void> {
-
   const tick = await runStrategyTick(ctx);
-
   const sim = ctx.simulation;
-
-
+  const now = Date.now();
 
   runtimeStats.observeTick(tick);
 
+  console.log(formatMonitorTickLine(tick, sim, MIN_SAMPLES_FOR_STRATEGY));
 
-
-  console.log(
-
-    formatMonitorTickLine(tick, sim, MIN_SAMPLES_FOR_STRATEGY)
-
+  const spikeSnap = spikeDebug.observeTick(
+    tick,
+    ctx.config.spikeThreshold,
+    ctx.config.borderlineMinRatio,
   );
-
-
+  if (debugMonitor) {
+    if (spikeSnap !== null) {
+      console.log(SpikeDebugTracker.formatTickDebugLine(spikeSnap));
+    }
+    if (tick.kind === "ready") {
+      console.log(
+        formatDebugTickExtras(
+          tick.prices,
+          ctx.config.rangeThreshold,
+          ctx.config.spikeThreshold,
+          ctx.config.tradableSpikeMinPercent,
+          ctx.config.maxPriorRangeForNormalEntry,
+          ctx.config.hardRejectPriorRangePercent,
+          ctx.config.maxOppositeSideEntryPrice,
+          ctx.config.neutralQuoteBandMin,
+          ctx.config.neutralQuoteBandMax,
+          tick.entry.windowSpike
+            ? {
+                classification: tick.entry.windowSpike.classification,
+                thresholdRatio: tick.entry.windowSpike.thresholdRatio,
+                sourceWindowLabel: tick.entry.windowSpike.sourceWindowLabel,
+              }
+            : undefined,
+        ),
+      );
+    }
+  }
+  if (spikeDebug.shouldPrintSummary()) {
+    console.log(spikeDebug.formatSummary());
+  }
 
   if (tick.kind !== "ready") {
-
+    const pipeline = runStrategyDecisionPipeline({
+      now,
+      tick,
+      manager: borderlineManager,
+      strongSpikeManager,
+      simulation: sim,
+      config: {
+        rangeThreshold: ctx.config.rangeThreshold,
+        stableRangeSoftToleranceRatio: ctx.config.stableRangeSoftToleranceRatio,
+        strongSpikeHardRejectPoorRange: ctx.config.strongSpikeHardRejectPoorRange,
+        spikeThreshold: ctx.config.spikeThreshold,
+        tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+        maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+        hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
+        strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
+        exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
+        exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
+        entryPrice: ctx.config.entryPrice,
+        maxOppositeSideEntryPrice: ctx.config.maxOppositeSideEntryPrice,
+        neutralQuoteBandMin: ctx.config.neutralQuoteBandMin,
+        neutralQuoteBandMax: ctx.config.neutralQuoteBandMax,
+        entryCooldownMs: ctx.config.entryCooldownMs,
+        borderlineRequirePause: ctx.config.borderlineRequirePause,
+        borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
+        borderlineContinuationThreshold:
+          ctx.config.borderlineContinuationThreshold,
+        borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
+        borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
+      },
+    });
+    for (const msg of pipeline.strongSpikeLifecycleMessages ?? []) {
+      console.log(msg);
+    }
+    for (const ev of pipeline.borderlineLifecycleEvents) {
+      logBorderlineLifecycleBlock(ev);
+    }
+    if (pipeline.decision.action !== "none") {
+      console.log(formatStrategyDecisionLog(pipeline.decision));
+    }
     return;
-
   }
 
-
-
-  const now = Date.now();
-
-  sim.onTick({
-
+  const pipeline = runStrategyDecisionPipeline({
     now,
-
-    entry: tick.entry,
-
-    sides: tick.sides,
-
+    tick,
+    manager: borderlineManager,
+    strongSpikeManager,
+    simulation: sim,
     config: {
-
-      exitPrice: ctx.config.exitPrice,
-
-      stopLoss: ctx.config.stopLoss,
-
-      exitTimeoutMs: ctx.config.exitTimeoutMs,
-
+      rangeThreshold: ctx.config.rangeThreshold,
+      stableRangeSoftToleranceRatio: ctx.config.stableRangeSoftToleranceRatio,
+      strongSpikeHardRejectPoorRange: ctx.config.strongSpikeHardRejectPoorRange,
+      spikeThreshold: ctx.config.spikeThreshold,
+      tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+      maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+      hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
+      strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
+      exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
+      exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
+      entryPrice: ctx.config.entryPrice,
+      maxOppositeSideEntryPrice: ctx.config.maxOppositeSideEntryPrice,
+      neutralQuoteBandMin: ctx.config.neutralQuoteBandMin,
+      neutralQuoteBandMax: ctx.config.neutralQuoteBandMax,
       entryCooldownMs: ctx.config.entryCooldownMs,
-
-      riskPercentPerTrade: ctx.config.riskPercentPerTrade,
-
+      borderlineRequirePause: ctx.config.borderlineRequirePause,
+      borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
+      borderlineContinuationThreshold: ctx.config.borderlineContinuationThreshold,
+      borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
+      borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
     },
-
   });
+  for (const ev of pipeline.borderlineLifecycleEvents) {
+    logBorderlineLifecycleBlock(ev);
+    runtimeStats.observeBorderlineLifecycleEventType(ev.type);
+    const tracked = ctx.opportunityTracker.recordBorderlineLifecycleEvent({
+      timestamp: now,
+      event: ev,
+      tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+      maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+    });
+    runtimeStats.observeOpportunityRecord(tracked);
+    try {
+      persistence.appendOpportunityLine(tracked);
+    } catch (err) {
+      console.error(
+        "[monitor] Failed to append opportunities.jsonl (borderline lifecycle):",
+        err
+      );
+    }
+  }
+  for (const msg of pipeline.strongSpikeLifecycleMessages ?? []) {
+    if (
+      msg.includes("promoted") ||
+      msg.includes("cancelled") ||
+      msg.includes("classification=") ||
+      msg.includes("exceptional spike override activated")
+    ) {
+      console.log(msg);
+    }
+  }
+  if (pipeline.decision.action !== "none") {
+    console.log(formatStrategyDecisionLog(pipeline.decision));
+  } else if (debugMonitor) {
+    console.log(formatStrategyDecisionLog(pipeline.decision));
+  }
 
-
+  const entryForSimulation = pipeline.entryForSimulation ?? tick.entry;
+  const entryPath =
+    pipeline.decision.action === "promote_borderline_candidate"
+      ? "borderline_delayed"
+      : "strong_spike_immediate";
+  sim.onTick({
+    now,
+    entry: entryForSimulation,
+    entryPath,
+    sides: tick.sides,
+    config: {
+      exitPrice: ctx.config.exitPrice,
+      stopLoss: ctx.config.stopLoss,
+      exitTimeoutMs: ctx.config.exitTimeoutMs,
+      entryCooldownMs: ctx.config.entryCooldownMs,
+      riskPercentPerTrade: ctx.config.riskPercentPerTrade,
+    },
+  });
 
   const recorded = ctx.opportunityTracker.recordFromReadyTick({
-
     timestamp: now,
-
     btcPrice: tick.btc,
-
     prices: tick.prices,
-
     previousPrice: tick.prev,
-
     currentPrice: tick.last,
-
     sides: tick.sides,
-
-    entry: tick.entry,
-
-    config: ctx.config,
-
+    entry: entryForSimulation,
+    tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+    maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+    decision: pipeline.decision,
   });
-
-  if (recorded?.entryAllowed) {
-
-    logValidOpportunityBlock(recorded);
-
+  if (recorded !== null) {
+    if (recorded.status === "valid") {
+      logValidOpportunityBlock(recorded);
+    } else if (debugMonitor) {
+      logOpportunityBlock(recorded);
+    }
   }
-
-
 
   runtimeStats.observeOpportunityRecord(recorded);
 
-
-
   if (recorded !== null) {
-
     try {
-
       persistence.appendOpportunityLine(recorded);
-
     } catch (err) {
-
       console.error("[monitor] Failed to append opportunities.jsonl:", err);
-
     }
-
   }
-
 }
-
-
 
 function startLiveMonitor(ctx: BotContext): void {
-
   monitorStartedAtMs = Date.now();
-
   persistence.ensureReady();
-
   logConfig();
-
   printLiveMonitorBanner({
-
     quotesDetail: isPolymarketGammaEnabled()
-
       ? "Polymarket Gamma YES/NO"
-
       : "UP_SIDE_PRICE / DOWN_SIDE_PRICE (env)",
-
     tickIntervalSec: BOT_TICK_INTERVAL_MS / 1000,
-
     bufferSlots: config.priceBufferSize,
-
     minSamples: MIN_SAMPLES_FOR_STRATEGY,
-
+    spikeThreshold: config.spikeThreshold,
+    tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+    maxPriorRangeForNormalEntry: config.maxPriorRangeForNormalEntry,
+    hardRejectPriorRangePercent: config.hardRejectPriorRangePercent,
+    strongSpikeConfirmationTicks: config.strongSpikeConfirmationTicks,
+    exceptionalSpikePercent: config.exceptionalSpikePercent,
+    exceptionalSpikeOverridesCooldown: config.exceptionalSpikeOverridesCooldown,
+    maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
+    neutralQuoteBandMin: config.neutralQuoteBandMin,
+    neutralQuoteBandMax: config.neutralQuoteBandMax,
     persistPath: `${persistence.getOutputDir()} (JSONL + session-summary on exit)`,
-
+    debugMode: debugMonitor,
   });
 
-
-
   statsTimer = setInterval(() => {
-
     printPeriodicRuntimeSummary(
-
       "Runtime stats (5 min)",
-
       {
-
         ticksObserved: runtimeStats.ticksObserved,
-
         btcFetchFailures: runtimeStats.btcFetchFailures,
-
         spikeEventsDetected: runtimeStats.spikeEventsDetected,
-
         candidateOpportunities: runtimeStats.candidateOpportunities,
-
         validOpportunities: runtimeStats.validOpportunities,
-
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
-
+        strongSpikeSignals: runtimeStats.strongSpikeSignals,
+        strongSpikeEntries: runtimeStats.strongSpikeEntries,
+        noSignalMoves: runtimeStats.noSignalMoves,
+        borderlineMoves: runtimeStats.borderlineMoves,
+        strongSpikeMoves: runtimeStats.strongSpikeMoves,
+        borderlineSignals: runtimeStats.borderlineSignals,
+        borderlineCandidatesCreated: runtimeStats.borderlineCandidatesCreated,
+        borderlinePromotions: runtimeStats.borderlinePromotions,
+        borderlineCancellations: runtimeStats.borderlineCancellations,
+        borderlineExpirations: runtimeStats.borderlineExpirations,
+        blockedByCooldown: runtimeStats.blockedByCooldown,
+        blockedByActivePosition: runtimeStats.blockedByActivePosition,
+        blockedByInvalidQuotes: runtimeStats.blockedByInvalidQuotes,
+        blockedByNoisyRange: runtimeStats.blockedByNoisyRange,
+        blockedByWidePriorRange: runtimeStats.blockedByWidePriorRange,
+        blockedByHardRejectUnstableContext:
+          runtimeStats.blockedByHardRejectUnstableContext,
+        rejectedByWeakSpikeQuality: runtimeStats.rejectedByWeakSpikeQuality,
+        rejectedByPriorRangeTooWide: runtimeStats.rejectedByPriorRangeTooWide,
+        rejectedByHardUnstableContext: runtimeStats.rejectedByHardUnstableContext,
+        rejectedByStrongSpikeContinuation:
+          runtimeStats.rejectedByStrongSpikeContinuation,
+        rejectedByBorderlineContinuation:
+          runtimeStats.rejectedByBorderlineContinuation,
+        rejectedByExpensiveOppositeSide: runtimeStats.rejectedByExpensiveOppositeSide,
+        exceptionalSpikeSignals: runtimeStats.exceptionalSpikeSignals,
+        exceptionalSpikeEntries: runtimeStats.exceptionalSpikeEntries,
+        cooldownOverridesUsed: runtimeStats.cooldownOverridesUsed,
+        blockedByExpensiveOppositeSide: runtimeStats.blockedByExpensiveOppositeSide,
+        blockedByNeutralQuotes: runtimeStats.blockedByNeutralQuotes,
+        borderlineTradesClosed: runtimeStats.borderlineTradesClosed,
+        borderlineWinRate: runtimeStats.borderlineWinRate,
+        borderlinePnL: runtimeStats.borderlinePnL,
       },
-
       ctx.simulation
-
     );
-
+    console.log(
+      `[quality] weak=${runtimeStats.qualityWeak} strong=${runtimeStats.qualityStrong} exceptional=${runtimeStats.qualityExceptional} | top-rejections ${formatTopRejectionReasons()}`
+    );
   }, 5 * 60 * 1000);
-
   void runMonitorTick(ctx);
-
   tickTimer = setInterval(() => {
-
     void runMonitorTick(ctx);
-
   }, BOT_TICK_INTERVAL_MS);
-
   process.once("SIGINT", gracefulShutdown);
-
   process.once("SIGTERM", gracefulShutdown);
-
 }
 
-
-
 const simulation = new SimulationEngine({
-
   silent: true,
-
   initialEquity: config.initialCapital,
-
   onTradeClosed: onPaperTradeClosed,
-
 });
 
-
-
 const ctx: BotContext = {
-
   priceBuffer: new RollingPriceBuffer(config.priceBufferSize),
-
   simulation,
-
   opportunityTracker: new OpportunityTracker(),
-
   config,
-
 };
 
-
-
 startLiveMonitor(ctx);
-
-

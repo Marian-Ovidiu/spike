@@ -24,11 +24,30 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
     currentPrice: o.currentPrice,
     spikeDirection: o.spikeDirection,
     spikePercent: o.spikePercent,
+    spikeSource: o.spikeSource,
+    spikeReferencePrice: o.spikeReferencePrice,
     priorRangePercent: o.priorRangePercent,
     upSidePrice: o.upSidePrice,
     downSidePrice: o.downSidePrice,
     stableRangeDetected: o.stableRangeDetected,
+    stableRangeQuality: o.stableRangeQuality,
     spikeDetected: o.spikeDetected,
+    movementClassification: o.movementClassification,
+    movementThresholdRatio: o.movementThresholdRatio,
+    tradableSpikeMinPercent: o.tradableSpikeMinPercent,
+    qualityProfile: o.qualityProfile,
+    cooldownOverridden: o.cooldownOverridden ?? false,
+    overrideReason: o.overrideReason ?? null,
+    opportunityType: o.opportunityType,
+    opportunityOutcome: o.opportunityOutcome,
+    thresholdRatio: o.thresholdRatio,
+    watchTicksConfigured: o.watchTicksConfigured,
+    watchTicksObserved: o.watchTicksObserved,
+    postMoveClassification: o.postMoveClassification,
+    promotionReason: o.promotionReason,
+    cancellationReason: o.cancellationReason,
+    expirationReason: o.expirationReason,
+    borderlineCandidateId: o.borderlineCandidateId,
     entryAllowed: o.entryAllowed,
     entryRejectionReasons: [...o.entryRejectionReasons],
     status: o.status,
@@ -45,6 +64,7 @@ export function tradeToJsonlRecord(t: SimulatedTrade): Record<string, unknown> {
     exitPrice: t.exitPrice,
     profitLoss: t.profitLoss,
     riskAtEntry: t.riskAtEntry,
+    entryPath: t.entryPath,
     exitReason: t.exitReason,
     openedAt: new Date(t.openedAt).toISOString(),
     closedAt: new Date(t.closedAt).toISOString(),
@@ -65,11 +85,59 @@ export function buildMonitorSessionSummary(input: {
   validOpportunities: number;
   rejectedOpportunities: number;
   perf: SimulationPerformanceStats;
+  extended?: {
+    strongSpikeSignals: number;
+    strongSpikeEntries: number;
+    noSignalMoves: number;
+    borderlineMoves: number;
+    strongSpikeMoves: number;
+    borderlineSignals: number;
+    borderlineCandidatesCreated: number;
+    borderlinePromotions: number;
+    borderlineCancellations: number;
+    borderlineExpirations: number;
+    blockedByCooldown: number;
+    blockedByActivePosition: number;
+    blockedByInvalidQuotes: number;
+    blockedByNoisyRange: number;
+    blockedByWidePriorRange: number;
+    blockedByHardRejectUnstableContext: number;
+    rejectedByWeakSpikeQuality: number;
+    rejectedByPriorRangeTooWide: number;
+    rejectedByHardUnstableContext: number;
+    rejectedByStrongSpikeContinuation: number;
+    rejectedByBorderlineContinuation: number;
+    rejectedByExpensiveOppositeSide: number;
+    exceptionalSpikeSignals: number;
+    exceptionalSpikeEntries: number;
+    cooldownOverridesUsed: number;
+    blockedByExpensiveOppositeSide: number;
+    blockedByNeutralQuotes: number;
+    borderlineTradesClosed: number;
+    borderlineWins: number;
+    borderlineLosses: number;
+    borderlinePnL: number;
+    averageBorderlinePnL: number;
+    strongSpikeTradesClosed: number;
+    strongSpikeWins: number;
+    strongSpikeLosses: number;
+    strongSpikePnL: number;
+    averageStrongSpikePnL: number;
+    strongSpikeWinRate: number;
+    delayedBorderlineWinRate: number;
+    borderlineNetImpact: "positive" | "negative" | "flat";
+    verdict: "helpful" | "neutral" | "harmful";
+    qualityWeak?: number;
+    qualityStrong?: number;
+    qualityExceptional?: number;
+    topRejectionReasons?: Array<{ reason: string; count: number }>;
+    interpretation: string[];
+  };
 }): MonitorSessionSummary {
   const opportunitiesFound =
     input.validOpportunities + input.rejectedOpportunities;
   const runtimeMs = Math.max(0, input.endedAtMs - input.startedAtMs);
-  return {
+  const summary: MonitorSessionSummary = {
     sessionStartedAt: new Date(input.startedAtMs).toISOString(),
     sessionEndedAt: new Date(input.endedAtMs).toISOString(),
     runtimeMs,
@@ -96,6 +164,10 @@ export function buildMonitorSessionSummary(input: {
       initialEquity: input.perf.initialEquity,
     },
   };
+  if (input.extended !== undefined) {
+    summary.extended = input.extended;
+  }
+  return summary;
 }
 
 export type MonitorSessionSummary = {
@@ -123,6 +195,54 @@ export type MonitorSessionSummary = {
     maxEquityDrawdown: number;
     currentEquity: number;
     initialEquity: number;
+  };
+  extended?: {
+    strongSpikeSignals: number;
+    strongSpikeEntries: number;
+    noSignalMoves: number;
+    borderlineMoves: number;
+    strongSpikeMoves: number;
+    borderlineSignals: number;
+    borderlineCandidatesCreated: number;
+    borderlinePromotions: number;
+    borderlineCancellations: number;
+    borderlineExpirations: number;
+    blockedByCooldown: number;
+    blockedByActivePosition: number;
+    blockedByInvalidQuotes: number;
+    blockedByNoisyRange: number;
+    blockedByWidePriorRange: number;
+    blockedByHardRejectUnstableContext: number;
+    rejectedByWeakSpikeQuality: number;
+    rejectedByPriorRangeTooWide: number;
+    rejectedByHardUnstableContext: number;
+    rejectedByStrongSpikeContinuation: number;
+    rejectedByBorderlineContinuation: number;
+    rejectedByExpensiveOppositeSide: number;
+    exceptionalSpikeSignals: number;
+    exceptionalSpikeEntries: number;
+    cooldownOverridesUsed: number;
+    blockedByExpensiveOppositeSide: number;
+    blockedByNeutralQuotes: number;
+    borderlineTradesClosed: number;
+    borderlineWins: number;
+    borderlineLosses: number;
+    borderlinePnL: number;
+    averageBorderlinePnL: number;
+    strongSpikeTradesClosed: number;
+    strongSpikeWins: number;
+    strongSpikeLosses: number;
+    strongSpikePnL: number;
+    averageStrongSpikePnL: number;
+    strongSpikeWinRate: number;
+    delayedBorderlineWinRate: number;
+    borderlineNetImpact: "positive" | "negative" | "flat";
+    verdict: "helpful" | "neutral" | "harmful";
+    qualityWeak?: number;
+    qualityStrong?: number;
+    qualityExceptional?: number;
+    topRejectionReasons?: Array<{ reason: string; count: number }>;
+    interpretation: string[];
   };
 };
 

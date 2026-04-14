@@ -27,30 +27,39 @@ describe("maxDrawdownFromTrades", () => {
       {
         id: 1,
         direction: "UP",
+        contracts: 1,
         entryPrice: 0,
         exitPrice: 0,
         profitLoss: 10,
+        riskAtEntry: 0,
         exitReason: "profit",
+        entryPath: "strong_spike_immediate",
         openedAt: 0,
         closedAt: 1,
       },
       {
         id: 2,
         direction: "UP",
+        contracts: 1,
         entryPrice: 0,
         exitPrice: 0,
         profitLoss: -25,
+        riskAtEntry: 0,
         exitReason: "stop",
+        entryPath: "strong_spike_immediate",
         openedAt: 0,
         closedAt: 1,
       },
       {
         id: 3,
         direction: "UP",
+        contracts: 1,
         entryPrice: 0,
         exitPrice: 0,
         profitLoss: 5,
+        riskAtEntry: 0,
         exitReason: "profit",
+        entryPath: "strong_spike_immediate",
         openedAt: 0,
         closedAt: 1,
       },
@@ -66,8 +75,26 @@ describe("runBacktestReplay", () => {
     const r = runBacktestReplay(prices, {
       config: {
         spikeThreshold: 0.004,
+        tradableSpikeMinPercent: 0.0015,
+        maxPriorRangeForNormalEntry: 0.0015,
+        hardRejectPriorRangePercent: 0.002,
+        strongSpikeConfirmationTicks: 1,
+        exceptionalSpikePercent: 0.0025,
+        exceptionalSpikeOverridesCooldown: true,
+        maxOppositeSideEntryPrice: 0.35,
+        neutralQuoteBandMin: 0.45,
+        neutralQuoteBandMax: 0.55,
         rangeThreshold: 0.0015,
+        stableRangeSoftToleranceRatio: 1.5,
+        strongSpikeHardRejectPoorRange: false,
         spikeMinRangeMultiple: 2.2,
+        borderlineMinRatio: 0.85,
+        borderlineWatchTicks: 2,
+        borderlineRequirePause: true,
+        borderlineRequireNoContinuation: true,
+        borderlineContinuationThreshold: 0.25,
+        borderlineReversionThreshold: 0.2,
+        borderlinePauseBandPercent: 0.00015,
         entryPrice: 0.25,
         exitPrice: 0.5,
         stopLoss: 0.1,
@@ -80,6 +107,105 @@ describe("runBacktestReplay", () => {
       sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
     });
     expect(r.totalTrades).toBeGreaterThanOrEqual(0);
+    expect(r.totalEntries).toBeGreaterThanOrEqual(0);
     expect(r.maxDrawdown).toBeGreaterThanOrEqual(0);
+    expect(r.strongSpike.signals).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.signals).toBeGreaterThanOrEqual(0);
+    expect(r.combined.tradesClosed).toBe(r.totalTrades);
+    expect(r.movement.noSignalMoves).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.blockedByInvalidQuotes).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByWeakSpikeQuality).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByPriorRangeTooWide).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByHardUnstableContext).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByStrongSpikeContinuation).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByBorderlineContinuation).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.rejectedByExpensiveOppositeSide).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.exceptionalSpikeSignals).toBeGreaterThanOrEqual(0);
+    expect(r.blockers.exceptionalSpikeEntries).toBeGreaterThanOrEqual(0);
+    expect(typeof r.evaluationNote).toBe("string");
+    expect(r.weakSpike.signals).toBeGreaterThanOrEqual(0);
+    expect(r.weakSpike.rejected).toBeGreaterThanOrEqual(0);
+    expect(r.weakSpike.rejectionRate).toBeGreaterThanOrEqual(0);
+    expect(Object.keys(r.rejectionReasonBreakdown).length).toBeGreaterThanOrEqual(0);
+    expect(r.comparison).toBeDefined();
+    expect(r.noiseComparison).toBeDefined();
+  });
+
+  it("tracks strong and borderline stats separately", () => {
+    const prices = [
+      100_000,
+      100_010,
+      100_020,
+      100_050,
+      100_093,
+      100_095,
+      100_120,
+      100_080,
+      100_130,
+      100_090,
+      100_150,
+      100_100,
+      100_160,
+      100_120,
+      100_170,
+      100_130,
+      100_180,
+      100_140,
+      100_190,
+      100_150,
+      100_200,
+      100_160,
+      100_210,
+      100_170,
+      100_220,
+    ];
+    const r = runBacktestReplay(prices, {
+      config: {
+        spikeThreshold: 0.001,
+        tradableSpikeMinPercent: 0.0015,
+        maxPriorRangeForNormalEntry: 0.0015,
+        hardRejectPriorRangePercent: 0.002,
+        strongSpikeConfirmationTicks: 1,
+        exceptionalSpikePercent: 0.0025,
+        exceptionalSpikeOverridesCooldown: true,
+        maxOppositeSideEntryPrice: 0.35,
+        neutralQuoteBandMin: 0.45,
+        neutralQuoteBandMax: 0.55,
+        rangeThreshold: 0.02,
+        stableRangeSoftToleranceRatio: 1.5,
+        strongSpikeHardRejectPoorRange: false,
+        spikeMinRangeMultiple: 1.0,
+        borderlineMinRatio: 0.85,
+        borderlineWatchTicks: 2,
+        borderlineRequirePause: true,
+        borderlineRequireNoContinuation: true,
+        borderlineContinuationThreshold: 0.25,
+        borderlineReversionThreshold: 0.2,
+        borderlinePauseBandPercent: 0.0002,
+        entryPrice: 0.25,
+        exitPrice: 0.5,
+        stopLoss: 0.1,
+        exitTimeoutMs: 60_000,
+        entryCooldownMs: 0,
+        initialCapital: 10_000,
+        riskPercentPerTrade: 1,
+        priceBufferSize: 20,
+      },
+      sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
+    });
+    expect(r.strongSpike.signals).toBeGreaterThanOrEqual(0);
+    expect(r.strongSpike.entries).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.signals).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.candidatesCreated).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.promotions).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.cancellations).toBeGreaterThanOrEqual(0);
+    expect(r.borderline.expirations).toBeGreaterThanOrEqual(0);
+    expect(
+      r.strongSpike.tradesClosed + r.borderline.tradesClosed
+    ).toBe(r.combined.tradesClosed);
+    expect(
+      r.movement.noSignalMoves + r.movement.borderlineMoves + r.movement.strongSpikeMoves
+    ).toBeGreaterThan(0);
+    expect(r.comparison?.relaxed.totalTrades).toBe(r.totalTrades);
   });
 });

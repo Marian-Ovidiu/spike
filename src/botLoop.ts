@@ -99,11 +99,17 @@ export async function runStrategyTick(
   const entry = evaluateEntryConditions({
     prices,
     rangeThreshold: config.rangeThreshold,
+    stableRangeSoftToleranceRatio: config.stableRangeSoftToleranceRatio,
+    strongSpikeHardRejectPoorRange: config.strongSpikeHardRejectPoorRange,
     previousPrice: prev,
     currentPrice: last,
     spikeThreshold: config.spikeThreshold,
     spikeMinRangeMultiple: config.spikeMinRangeMultiple,
+    borderlineMinRatio: config.borderlineMinRatio,
     entryPrice: config.entryPrice,
+    maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
+    neutralQuoteBandMin: config.neutralQuoteBandMin,
+    neutralQuoteBandMax: config.neutralQuoteBandMax,
     upSidePrice: sides.upSidePrice,
     downSidePrice: sides.downSidePrice,
   });
@@ -172,7 +178,8 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
     currentPrice: tick.last,
     sides,
     entry,
-    config: ctx.config,
+    tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+    maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
   });
   if (recorded?.entryAllowed) {
     logValidOpportunityBlock(recorded);
