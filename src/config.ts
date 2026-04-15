@@ -57,6 +57,8 @@ export const configDefaults = {
   initialCapital: 10_000,
   /** Max fraction of **current** equity at planned stop per trade (1 = 1%). */
   riskPercentPerTrade: 1,
+  /** Fixed USDC notional deployed per simulated trade (paper sizing). */
+  stakePerTrade: 30,
   /** Max hold time for a position before time-exit (ms). */
   exitTimeoutMs: 90_000,
   /** Min ms after a simulated exit before another entry (reduces churn). */
@@ -97,6 +99,7 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   stopLoss: "STOP_LOSS",
   initialCapital: "INITIAL_CAPITAL",
   riskPercentPerTrade: "RISK_PERCENT_PER_TRADE",
+  stakePerTrade: "STAKE_PER_TRADE",
   exitTimeoutMs: "EXIT_TIMEOUT_MS",
   entryCooldownMs: "ENTRY_COOLDOWN_MS",
   priceBufferSize: "PRICE_BUFFER_SIZE",
@@ -255,6 +258,10 @@ function loadConfig(): {
     "RISK_PERCENT_PER_TRADE",
     configDefaults.riskPercentPerTrade
   );
+  const stakePerTrade = parseEnvNumber(
+    "STAKE_PER_TRADE",
+    configDefaults.stakePerTrade
+  );
   const exitTimeoutMs = parseEnvNumber(
     "EXIT_TIMEOUT_MS",
     configDefaults.exitTimeoutMs
@@ -303,6 +310,7 @@ function loadConfig(): {
       stopLoss: stopLoss.value,
       initialCapital: Math.max(1, initialCapital.value),
       riskPercentPerTrade: Math.min(100, Math.max(0, riskPercentPerTrade.value)),
+      stakePerTrade: Math.max(0, stakePerTrade.value),
       exitTimeoutMs: Math.max(0, exitTimeoutMs.value),
       entryCooldownMs: Math.max(0, entryCooldownMs.value),
       priceBufferSize,
@@ -350,6 +358,7 @@ function loadConfig(): {
       stopLoss: { fromEnv: stopLoss.fromEnv },
       initialCapital: { fromEnv: initialCapital.fromEnv },
       riskPercentPerTrade: { fromEnv: riskPercentPerTrade.fromEnv },
+      stakePerTrade: { fromEnv: stakePerTrade.fromEnv },
       exitTimeoutMs: { fromEnv: exitTimeoutMs.fromEnv },
       entryCooldownMs: { fromEnv: entryCooldownMs.fromEnv },
       priceBufferSize: { fromEnv: priceBufferSizeRaw.fromEnv },
@@ -364,7 +373,9 @@ const _meta = loaded._meta;
 /**
  * When truthy (`1`, `true`, `yes`), the live monitor prints extra
  * per-tick strategy diagnostics: spike debug lines, rolling range %,
- * strongest recent move, and expanded blocks for rejected candidates.
+ * strongest recent move, expanded blocks for rejected candidates, and
+ * when `entry.spikeDetected`, a JSON **spike decision trace** (spike %,
+ * prior range, stable range, classification, entryAllowed, rejectionReasons).
  * Controlled by the `DEBUG_MONITOR` environment variable.
  */
 export const debugMonitor: boolean = (() => {

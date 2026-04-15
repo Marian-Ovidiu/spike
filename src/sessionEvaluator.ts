@@ -1,5 +1,8 @@
 import type { Opportunity } from "./opportunityTracker.js";
-import type { SimulatedTrade } from "./simulationEngine.js";
+import {
+  computeSimulationPerformance,
+  type SimulatedTrade,
+} from "./simulationEngine.js";
 
 export type SpikeQualityBin = {
   label: string;
@@ -34,8 +37,6 @@ export type SessionEvaluation = {
 export type SessionEvaluationInput = {
   opportunities: readonly Opportunity[];
   trades: readonly SimulatedTrade[];
-  totalProfit: number;
-  winRate: number;
 };
 
 function computeGrossPnL(trades: readonly SimulatedTrade[]): {
@@ -160,6 +161,8 @@ export function evaluateSession(input: SessionEvaluationInput): SessionEvaluatio
   const oppCount = opps.length;
   const tradeCount = trades.length;
 
+  const tradeStats = computeSimulationPerformance(trades);
+
   const { grossProfit, grossLoss } = computeGrossPnL(trades);
   const profitFactor = computeProfitFactor(
     grossProfit,
@@ -180,8 +183,8 @@ export function evaluateSession(input: SessionEvaluationInput): SessionEvaluatio
     grossProfit,
     grossLoss,
     totalTrades: tradeCount,
-    totalProfit: input.totalProfit,
-    winRate: input.winRate,
+    totalProfit: tradeStats.totalProfit,
+    winRate: tradeStats.winRate,
   };
 
   return {

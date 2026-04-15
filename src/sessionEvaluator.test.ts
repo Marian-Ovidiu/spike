@@ -31,12 +31,16 @@ function trade(pl: number): SimulatedTrade {
   return {
     id: 1,
     direction: "UP",
-    contracts: 1,
+    stake: 1,
+    shares: 1,
     entryPrice: 0.2,
     exitPrice: 0.5,
     profitLoss: pl,
+    equityBefore: 1000,
+    equityAfter: 1000 + pl,
     riskAtEntry: 0.05,
     exitReason: pl >= 0 ? "profit" : "stop",
+    entryPath: "strong_spike_immediate",
     openedAt: 1000,
     closedAt: 2000,
   };
@@ -49,11 +53,11 @@ describe("evaluateSession", () => {
     const e = evaluateSession({
       opportunities: opps,
       trades,
-      totalProfit: 0.5,
-      winRate: 100,
     });
     expect(e.rawOpportunityCount).toBe(2);
     expect(e.opportunityToTradeConversion).toBeCloseTo(0.5);
+    expect(e.totalProfit).toBe(0.5);
+    expect(e.winRate).toBe(100);
     expect(e.profitFactor).toBe(Number.POSITIVE_INFINITY);
     expect(e.grossProfit).toBe(0.5);
     expect(e.grossLoss).toBe(0);
@@ -64,8 +68,6 @@ describe("evaluateSession", () => {
     const e = evaluateSession({
       opportunities: opps,
       trades: [],
-      totalProfit: 0,
-      winRate: 0,
     });
     expect(e.avgMsBetweenOpportunities).toBe(3000);
   });
@@ -78,8 +80,6 @@ describe("evaluateSession", () => {
     const e = evaluateSession({
       opportunities: [opp(1, 0.5, "valid")],
       trades,
-      totalProfit: 0.5,
-      winRate: 50,
     });
     expect(e.profitFactor).toBeCloseTo(1 / 0.5);
     expect(e.grossProfit).toBe(1);
@@ -90,8 +90,6 @@ describe("evaluateSession", () => {
     const e = evaluateSession({
       opportunities: [opp(1, 0.5, "rejected")],
       trades: [],
-      totalProfit: 0,
-      winRate: 0,
     });
     expect(e.verdict).toBe("neutral");
   });

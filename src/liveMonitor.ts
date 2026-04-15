@@ -10,17 +10,22 @@ import {
   MonitorFilePersistence,
 } from "./monitorPersistence.js";
 import {
+  buildSpikeDecisionTracePayload,
   formatDebugTickExtras,
   logBorderlineLifecycleBlock,
   formatMonitorTickLine,
   logOpportunityBlock,
   logPaperTradeClosedBlock,
+  logSpikeDecisionTrace,
   logValidOpportunityBlock,
   printLiveMonitorBanner,
   printPeriodicRuntimeSummary,
   printShutdownReport,
 } from "./monitorConsole.js";
-import { MonitorRuntimeStats } from "./monitorRuntimeStats.js";
+import {
+  logReportCounterConsistency,
+  MonitorRuntimeStats,
+} from "./monitorRuntimeStats.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulatedTrade } from "./simulationEngine.js";
 import { SimulationEngine } from "./simulationEngine.js";
@@ -128,8 +133,11 @@ function gracefulShutdown(): void {
     monitorStartedAtMs,
     {
       ticksObserved: runtimeStats.ticksObserved,
+      spikeEventsDetected: runtimeStats.spikeEventsDetected,
+      candidateOpportunities: runtimeStats.candidateOpportunities,
       validOpportunities: runtimeStats.validOpportunities,
       rejectedOpportunities: runtimeStats.rejectedOpportunities,
+      tradesExecuted: runtimeStats.tradesExecuted,
     },
     simulation.getPerformanceStats(),
     {
@@ -156,17 +164,15 @@ function gracefulShutdown(): void {
     console.log(spikeDebug.formatSummary());
   }
 
-  const perfForEval = simulation.getPerformanceStats();
   printSessionEvaluationReport(
     evaluateSession({
       opportunities: ctx.opportunityTracker.getOpportunities(),
       trades: simulation.getTradeHistory(),
-      totalProfit: perfForEval.totalProfit,
-      winRate: perfForEval.winRate,
     })
   );
 
   const endedAt = Date.now();
+  logReportCounterConsistency(runtimeStats);
   try {
     persistence.writeSessionSummary(
       buildMonitorSessionSummary({
@@ -179,6 +185,7 @@ function gracefulShutdown(): void {
         candidateOpportunities: runtimeStats.candidateOpportunities,
         validOpportunities: runtimeStats.validOpportunities,
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
+        tradesExecuted: runtimeStats.tradesExecuted,
         perf: simulation.getPerformanceStats(),
         extended: {
           strongSpikeSignals: runtimeStats.strongSpikeSignals,
@@ -260,6 +267,7 @@ function onPaperTradeClosed(trade: SimulatedTrade): void {
         candidateOpportunities: runtimeStats.candidateOpportunities,
         validOpportunities: runtimeStats.validOpportunities,
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
+        tradesExecuted: runtimeStats.tradesExecuted,
         strongSpikeSignals: runtimeStats.strongSpikeSignals,
         strongSpikeEntries: runtimeStats.strongSpikeEntries,
         noSignalMoves: runtimeStats.noSignalMoves,
@@ -425,7 +433,6 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
     });
-    runtimeStats.observeOpportunityRecord(tracked);
     try {
       persistence.appendOpportunityLine(tracked);
     } catch (err) {
@@ -452,10 +459,22 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
   }
 
   const entryForSimulation = pipeline.entryForSimulation ?? tick.entry;
+  if (debugMonitor && tick.entry.spikeDetected) {
+    logSpikeDecisionTrace(
+      buildSpikeDecisionTracePayload({
+        entry: entryForSimulation,
+        decision: pipeline.decision,
+      })
+    );
+  }
   const entryPath =
     pipeline.decision.action === "promote_borderline_candidate"
       ? "borderline_delayed"
       : "strong_spike_immediate";
+  const hadOpenPosition = sim.getOpenPosition() !== null;
+  const action = pipeline.decision.action;
+  const enteringImmediate = action === "enter_immediate";
+  const promoting = action === "promote_borderline_candidate";
   sim.onTick({
     now,
     entry: entryForSimulation,
@@ -466,8 +485,27 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       stopLoss: ctx.config.stopLoss,
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
-      riskPercentPerTrade: ctx.config.riskPercentPerTrade,
+      stakePerTrade: ctx.config.stakePerTrade,
     },
+  });
+
+  const cls = tick.entry.movementClassification;
+  const spikeRawEvent =
+    tick.entry.spikeDetected === true || enteringImmediate || promoting;
+  const candidatePass =
+    spikeRawEvent &&
+    (cls === "strong_spike" ||
+      cls === "borderline" ||
+      enteringImmediate ||
+      promoting);
+  const validEntryApproved = enteringImmediate || promoting;
+  const positionOpenedThisTick =
+    !hadOpenPosition && sim.getOpenPosition() !== null;
+  runtimeStats.observeReadyTickFunnel({
+    spikeRawEvent,
+    candidatePass,
+    validEntryApproved,
+    positionOpenedThisTick,
   });
 
   const recorded = ctx.opportunityTracker.recordFromReadyTick({
@@ -536,6 +574,7 @@ function startLiveMonitor(ctx: BotContext): void {
         candidateOpportunities: runtimeStats.candidateOpportunities,
         validOpportunities: runtimeStats.validOpportunities,
         rejectedOpportunities: runtimeStats.rejectedOpportunities,
+        tradesExecuted: runtimeStats.tradesExecuted,
         strongSpikeSignals: runtimeStats.strongSpikeSignals,
         strongSpikeEntries: runtimeStats.strongSpikeEntries,
         noSignalMoves: runtimeStats.noSignalMoves,

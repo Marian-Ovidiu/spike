@@ -1,1 +1,5 @@
-export { StrategyStatsTracker as MonitorRuntimeStats } from "./strategyStatsTracker.js";
+export {
+  StrategyStatsTracker as MonitorRuntimeStats,
+  logReportCounterConsistency,
+  type ReadyTickFunnelSnapshot,
+} from "./strategyStatsTracker.js";

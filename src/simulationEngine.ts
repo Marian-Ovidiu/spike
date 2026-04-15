@@ -2,17 +2,22 @@ import type { AppConfig } from "./config.js";
 import type { EntryDirection, EntryEvaluation } from "./entryConditions.js";
 import { evaluateExitConditions } from "./exitConditions.js";
 import type { ExitReason } from "./exitConditions.js";
-import { contractsFromRiskBudget, riskPerContractAtStop } from "./riskSizing.js";
-
 export type SimulatedTrade = {
   id: number;
   direction: EntryDirection;
-  contracts: number;
+  /** Fixed notional deployed at entry (USDC). */
+  stake: number;
+  /** Position size in outcome shares: stake / entryPrice. */
+  shares: number;
   entryPrice: number;
   exitPrice: number;
-  /** Total P/L for the position (scaled by contracts). */
+  /** Total P/L for the position: shares × (exit − entry). */
   profitLoss: number;
-  /** Planned max loss at stop for this size (≤ risk budget). */
+  /** Account equity immediately before this trade’s P/L is applied. */
+  equityBefore: number;
+  /** Account equity immediately after this trade’s P/L is applied. */
+  equityAfter: number;
+  /** Unused in fixed-stake model; kept for persisted session shape. */
   riskAtEntry: number;
   exitReason: ExitReason;
   /** Which strategy path opened this trade. */
@@ -23,7 +28,8 @@ export type SimulatedTrade = {
 
 type OpenSimPosition = {
   direction: EntryDirection;
-  contracts: number;
+  stake: number;
+  shares: number;
   entryPrice: number;
   stopLoss: number;
   entryPath: "strong_spike_immediate" | "borderline_delayed";
@@ -43,7 +49,7 @@ export type SimulationTickInput = {
     | "stopLoss"
     | "exitTimeoutMs"
     | "entryCooldownMs"
-    | "riskPercentPerTrade"
+    | "stakePerTrade"
   >;
 };
 
@@ -63,6 +69,41 @@ export type SimulationPerformanceStats = SimulationTradeStats & {
   currentEquity: number;
   initialEquity: number;
 };
+
+/** One closed-trade record for console / JSONL (manual recheck: pnl ≈ shares×(exit−entry), equityAfter ≈ equityBefore+pnl). */
+export type TransparentTradeLog = {
+  tradeId: number;
+  /** ISO time at exit (close). */
+  timestamp: string;
+  direction: EntryDirection;
+  stake: number;
+  shares: number;
+  entryPrice: number;
+  exitPrice: number;
+  pnl: number;
+  equityBefore: number;
+  equityAfter: number;
+  /** Strategy path that opened the trade. */
+  reasonEntry: SimulatedTrade["entryPath"];
+  reasonExit: ExitReason;
+};
+
+export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog {
+  return {
+    tradeId: t.id,
+    timestamp: new Date(t.closedAt).toISOString(),
+    direction: t.direction,
+    stake: t.stake,
+    shares: t.shares,
+    entryPrice: t.entryPrice,
+    exitPrice: t.exitPrice,
+    pnl: t.profitLoss,
+    equityBefore: t.equityBefore,
+    equityAfter: t.equityAfter,
+    reasonEntry: t.entryPath,
+    reasonExit: t.exitReason,
+  };
+}
 
 const SUMMARY_EVERY_N_TRADES = 10;
 
@@ -85,8 +126,6 @@ export class SimulationEngine {
   private readonly onTradeClosed: ((trade: SimulatedTrade) => void) | undefined;
   private readonly initialEquity: number;
   private equity: number;
-  private peakEquity: number;
-  private maxEquityDrawdown: number;
   private nextId = 1;
   private position: OpenSimPosition | null = null;
   private lastExitAt: number | null = null;
@@ -101,8 +140,6 @@ export class SimulationEngine {
         ? start
         : DEFAULT_INITIAL_EQUITY;
     this.equity = this.initialEquity;
-    this.peakEquity = this.initialEquity;
-    this.maxEquityDrawdown = 0;
   }
 
   getTradeHistory(): readonly SimulatedTrade[] {
@@ -113,13 +150,15 @@ export class SimulationEngine {
   getOpenPosition(): Readonly<{
     direction: EntryDirection;
     entryPrice: number;
-    contracts: number;
+    stake: number;
+    shares: number;
   }> | null {
     if (!this.position) return null;
     return {
       direction: this.position.direction,
       entryPrice: this.position.entryPrice,
-      contracts: this.position.contracts,
+      stake: this.position.stake,
+      shares: this.position.shares,
     };
   }
 
@@ -135,15 +174,12 @@ export class SimulationEngine {
     return true;
   }
 
-  /** Cumulative stats including equity / drawdown (paper account). */
+  /**
+   * Full P/L summary from **closed trades only** (same numbers as summing
+   * `profitLoss` on {@link getTradeHistory} and replaying equity).
+   */
   getPerformanceStats(): SimulationPerformanceStats {
-    const base = computeSimulationPerformance(this.trades);
-    return {
-      ...base,
-      maxEquityDrawdown: this.maxEquityDrawdown,
-      currentEquity: this.equity,
-      initialEquity: this.initialEquity,
-    };
+    return computePerformanceFromClosedTrades(this.trades, this.initialEquity);
   }
 
   /**
@@ -185,8 +221,7 @@ export class SimulationEngine {
         return;
       }
 
-      const rpc = riskPerContractAtStop(fill, config.stopLoss);
-      if (!(rpc > 0)) {
+      if (!(fill > config.stopLoss)) {
         if (!this.silent) {
           console.log(
             `[SIM] Skip entry: stopLoss (${config.stopLoss}) must be below entry (${fill.toFixed(4)})`
@@ -195,32 +230,20 @@ export class SimulationEngine {
         return;
       }
 
-      const contracts = contractsFromRiskBudget(
-        this.equity,
-        config.riskPercentPerTrade,
-        rpc
-      );
-      if (contracts < 1) {
+      const stake = config.stakePerTrade;
+      if (!(stake > 0)) {
         if (!this.silent) {
-          console.log(
-            `[SIM] Skip entry: risk budget (${config.riskPercentPerTrade}% of ${this.equity.toFixed(2)}) < 1 contract at planned stop (rpc=${rpc.toFixed(4)})`
-          );
+          console.log(`[SIM] Skip entry: stakePerTrade must be > 0`);
         }
         return;
       }
 
-      const riskAtEntry = contracts * rpc;
-      const budget = (this.equity * config.riskPercentPerTrade) / 100;
-      if (riskAtEntry > budget + 1e-9) {
-        if (!this.silent) {
-          console.log(`[SIM] Skip entry: risk cap exceeded`);
-        }
-        return;
-      }
+      const shares = stake / fill;
 
       this.position = {
         direction: entry.direction,
-        contracts,
+        stake,
+        shares,
         entryPrice: fill,
         stopLoss: config.stopLoss,
         entryPath: input.entryPath ?? "strong_spike_immediate",
@@ -228,7 +251,7 @@ export class SimulationEngine {
       };
       if (!this.silent) {
         console.log(
-          `[SIM] Open ${entry.direction} ×${contracts} @ ${fill.toFixed(4)} | max risk ≈ ${riskAtEntry.toFixed(4)} (≤ ${budget.toFixed(2)})`
+          `[SIM] Open ${entry.direction} | stake=${stake.toFixed(2)} shares=${shares.toFixed(4)} @ ${fill.toFixed(4)}`
         );
       }
     }
@@ -241,28 +264,27 @@ export class SimulationEngine {
   ): void {
     if (!this.position) return;
 
-    const { direction, contracts, entryPrice, stopLoss, entryPath, openedAt } =
+    const { direction, stake, shares, entryPrice, entryPath, openedAt } =
       this.position;
     this.position = null;
 
-    const profitLoss = (exitPrice - entryPrice) * contracts;
-    const rpc = riskPerContractAtStop(entryPrice, stopLoss);
-    const riskAtEntry = Number.isFinite(rpc) && rpc > 0 ? contracts * rpc : 0;
+    const equityBefore = this.equity;
+    const profitLoss = shares * (exitPrice - entryPrice);
+    const equityAfter = equityBefore + profitLoss;
+    const riskAtEntry = 0;
 
-    this.equity += profitLoss;
-    this.peakEquity = Math.max(this.peakEquity, this.equity);
-    this.maxEquityDrawdown = Math.max(
-      this.maxEquityDrawdown,
-      this.peakEquity - this.equity
-    );
+    this.equity = equityAfter;
 
     const record: SimulatedTrade = {
       id: this.nextId++,
       direction,
-      contracts,
+      stake,
+      shares,
       entryPrice,
       exitPrice,
       profitLoss,
+      equityBefore,
+      equityAfter,
       riskAtEntry,
       exitReason,
       entryPath,
@@ -308,13 +330,9 @@ export class SimulationEngine {
 
   private printTradeResult(t: SimulatedTrade): void {
     if (this.silent) return;
-    const pnl =
-      t.profitLoss >= 0
-        ? `+${t.profitLoss.toFixed(4)}`
-        : t.profitLoss.toFixed(4);
-    console.log(
-      `[SIM] Trade #${t.id} | ${t.direction} ×${t.contracts} | entry=${t.entryPrice.toFixed(4)} exit=${t.exitPrice.toFixed(4)} | P/L=${pnl} | ${t.exitReason}`
-    );
+    const payload = buildTransparentTradeLog(t);
+    console.log("[SIM] Trade closed (full log):");
+    console.log(JSON.stringify(payload, null, 2));
   }
 }
 
@@ -332,7 +350,10 @@ function fillPriceForDirection(
   return markForDirection(direction, sides);
 }
 
-/** Aggregate performance from a list of completed simulated trades. */
+/**
+ * Win/loss counts, totals, and avg P/L from closed trades only
+ * (`profitLoss` sums to `totalProfit`).
+ */
 export function computeSimulationPerformance(
   trades: readonly SimulatedTrade[]
 ): SimulationTradeStats {
@@ -361,5 +382,30 @@ export function computeSimulationPerformance(
     winRate,
     totalProfit,
     averageProfitPerTrade,
+  };
+}
+
+/**
+ * Paper performance for reporting: everything is derived from `trades` + starting equity.
+ * Max drawdown = peak-to-trough of running account equity after each closed trade.
+ */
+export function computePerformanceFromClosedTrades(
+  trades: readonly SimulatedTrade[],
+  initialEquity: number
+): SimulationPerformanceStats {
+  const base = computeSimulationPerformance(trades);
+  let equity = initialEquity;
+  let peak = initialEquity;
+  let maxEquityDrawdown = 0;
+  for (const t of trades) {
+    equity += t.profitLoss;
+    peak = Math.max(peak, equity);
+    maxEquityDrawdown = Math.max(maxEquityDrawdown, peak - equity);
+  }
+  return {
+    ...base,
+    maxEquityDrawdown,
+    currentEquity: equity,
+    initialEquity,
   };
 }

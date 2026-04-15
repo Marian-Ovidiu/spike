@@ -161,13 +161,13 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
       stopLoss: ctx.config.stopLoss,
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
-      riskPercentPerTrade: ctx.config.riskPercentPerTrade,
+      stakePerTrade: ctx.config.stakePerTrade,
     },
   });
 
   const pos = ctx.simulation.getOpenPosition();
   const posStr = pos
-    ? `open ${pos.direction}×${pos.contracts}@${pos.entryPrice.toFixed(4)}`
+    ? `open ${pos.direction} stake=${pos.stake.toFixed(2)} sh=${pos.shares.toFixed(4)}@${pos.entryPrice.toFixed(4)}`
     : "flat";
 
   const recorded = ctx.opportunityTracker.recordFromReadyTick({

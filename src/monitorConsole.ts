@@ -1,8 +1,18 @@
 import type { StrategyTickResult } from "./botLoop.js";
-import { formatEntryReasonsForLog } from "./entryConditions.js";
+import {
+  formatEntryReasonsForLog,
+  type EntryEvaluation,
+} from "./entryConditions.js";
 import type { Opportunity } from "./opportunityTracker.js";
-import { SimulationEngine, type SimulatedTrade } from "./simulationEngine.js";
-import type { BorderlineLifecycleRenderEvent } from "./strategyDecisionPipeline.js";
+import {
+  SimulationEngine,
+  buildTransparentTradeLog,
+  type SimulatedTrade,
+} from "./simulationEngine.js";
+import type {
+  BorderlineLifecycleRenderEvent,
+  StrategyDecision,
+} from "./strategyDecisionPipeline.js";
 import {
   REJECTION_REASON_MESSAGES,
   type NormalizedRejectionReason,
@@ -118,7 +128,7 @@ export function formatMonitorTickLine(
   const no = fmtPrice(sides.downSidePrice);
   const pos = sim.getOpenPosition();
   const simHint = pos
-    ? `open ${pos.direction} ×${pos.contracts} @ ${fmtPrice(pos.entryPrice)}`
+    ? `open ${pos.direction} stake ${pos.stake.toFixed(2)} sh ${pos.shares.toFixed(4)} @ ${fmtPrice(pos.entryPrice)}`
     : "flat";
 
   let sig = "idle";
@@ -366,18 +376,30 @@ export function logBorderlineLifecycleBlock(
  */
 export function formatPaperTradeClosedBlock(trade: SimulatedTrade): string {
   const holdMs = trade.closedAt - trade.openedAt;
+  const log = buildTransparentTradeLog(trade);
   const lines = [
     "",
     TRADE_TOP,
     row("Trade id", `#${trade.id}`),
+    row("Timestamp (exit)", log.timestamp),
     row("Direction", trade.direction),
-    row("Contracts", String(trade.contracts)),
+    row("Stake", trade.stake.toFixed(2)),
+    row("Shares", trade.shares.toFixed(6)),
     row("Entry price", fmtPrice(trade.entryPrice)),
     row("Exit price", fmtPrice(trade.exitPrice)),
     row("P / L", formatPnl(trade.profitLoss)),
-    row("Exit reason", exitReasonLabel(trade.exitReason)),
+    row("Equity before", log.equityBefore.toFixed(4)),
+    row("Equity after", log.equityAfter.toFixed(4)),
+    row("Reason (entry)", log.reasonEntry),
+    row("Reason (exit)", exitReasonLabel(trade.exitReason)),
     row("Hold time", formatHoldDurationMs(holdMs)),
+    row("Opened at", new Date(trade.openedAt).toISOString()),
     row("Closed at", new Date(trade.closedAt).toISOString()),
+    "",
+    "  Full log (JSON, recalculable):",
+    ...JSON.stringify(log, null, 2)
+      .split("\n")
+      .map((line) => `  ${line}`),
     TRADE_BOT,
     "",
   ];
@@ -460,6 +482,8 @@ export function printPeriodicRuntimeSummary(
     candidateOpportunities: number;
     validOpportunities: number;
     rejectedOpportunities: number;
+    /** Funnel: positions opened (paper sim). */
+    tradesExecuted?: number;
     strongSpikeSignals?: number;
     strongSpikeEntries?: number;
     borderlineSignals?: number;
@@ -501,7 +525,7 @@ export function printPeriodicRuntimeSummary(
   console.log("");
   console.log(`── ${headline} ──`);
   console.log(
-    `${"Session".padEnd(10)} ticks ${counters.ticksObserved}  │  BTC fail ${counters.btcFetchFailures}  │  spikes ${counters.spikeEventsDetected}  │  cand ${counters.candidateOpportunities}  │  valid ${counters.validOpportunities}  │  rej ${counters.rejectedOpportunities}`
+    `${"Session".padEnd(10)} ticks ${counters.ticksObserved}  │  BTC fail ${counters.btcFetchFailures}  │  spikes ${counters.spikeEventsDetected}  │  cand ${counters.candidateOpportunities}  │  valid ${counters.validOpportunities}  │  trades ${counters.tradesExecuted ?? "—"}  │  rej ${counters.rejectedOpportunities}`
   );
   if (counters.strongSpikeSignals !== undefined) {
     console.log(
@@ -562,8 +586,11 @@ export function printShutdownReport(
   startedAtMs: number,
   counters: {
     ticksObserved: number;
+    spikeEventsDetected: number;
+    candidateOpportunities: number;
     validOpportunities: number;
     rejectedOpportunities: number;
+    tradesExecuted: number;
   },
   perf: {
     totalTrades: number;
@@ -597,8 +624,13 @@ export function printShutdownReport(
   console.log("════════ Live monitor — final report (shutdown) ══════════════");
   console.log(`${"Runtime".padEnd(14)} ${formatDurationMs(durationMs)}`);
   console.log(`${"Ticks".padEnd(14)} ${counters.ticksObserved}`);
-  console.log(`${"Opportunities".padEnd(14)} ${oppFound} (raw spike events)`);
-  console.log(`${"Trades (sim)".padEnd(14)} ${perf.totalTrades}`);
+  console.log(
+    `${"Funnel".padEnd(14)} spikes ${counters.spikeEventsDetected} → cand ${counters.candidateOpportunities} → valid ${counters.validOpportunities} → opened ${counters.tradesExecuted}`
+  );
+  console.log(
+    `${"Strong rows".padEnd(14)} ${oppFound} stored (valid+rej JSONL); rejected count is diagnostic rows`
+  );
+  console.log(`${"Trades closed".padEnd(14)} ${perf.totalTrades} (paper sim)`);
   console.log(`${"Win rate".padEnd(14)} ${wr}%`);
   console.log(`${"Total P/L".padEnd(14)} ${totalPl}`);
   console.log(`${"Max drawdown".padEnd(14)} ${perf.maxEquityDrawdown.toFixed(4)}`);
@@ -644,4 +676,64 @@ export function printShutdownReport(
   }
   console.log("══════════════════════════════════════════════════════════════");
   console.log("");
+}
+
+/** JSON-serializable spike snapshot for DEBUG_MONITOR decision tracing. */
+export type SpikeDecisionTracePayload = {
+  /** Strongest window move as percent (e.g. 0.42 = 0.42%). */
+  spikePercent: number;
+  /** Prior-window relative range percent (context chop). */
+  priorRange: number;
+  /** Whether pre-spike range passed stability detection. */
+  stableRange: boolean;
+  classification: EntryEvaluation["movementClassification"];
+  /** Strategy would enter on this tick (immediate or borderline promotion). */
+  entryAllowed: boolean;
+  /** Non-empty when entry is blocked; normalized / entry codes. */
+  rejectionReasons: readonly string[];
+};
+
+function collectSpikeTraceRejectionReasons(
+  entry: EntryEvaluation,
+  decision: StrategyDecision
+): string[] {
+  if (decision.reasons && decision.reasons.length > 0) {
+    return [...decision.reasons];
+  }
+  if (!entry.shouldEnter && entry.reasons.length > 0) {
+    return [...entry.reasons];
+  }
+  if (decision.reason.trim().length > 0) {
+    return [decision.reason];
+  }
+  return [];
+}
+
+/**
+ * Build a single object when a spike is detected: context, classification,
+ * and why entry was allowed or rejected (use with DEBUG_MONITOR=1).
+ */
+export function buildSpikeDecisionTracePayload(input: {
+  entry: EntryEvaluation;
+  decision: StrategyDecision;
+}): SpikeDecisionTracePayload {
+  const { entry, decision } = input;
+  const entryAllowed =
+    decision.action === "enter_immediate" ||
+    decision.action === "promote_borderline_candidate";
+  return {
+    spikePercent: entry.movement.strongestMovePercent * 100,
+    priorRange: entry.priorRangePercent,
+    stableRange: entry.stableRangeDetected,
+    classification: entry.movementClassification,
+    entryAllowed,
+    rejectionReasons: entryAllowed
+      ? []
+      : collectSpikeTraceRejectionReasons(entry, decision),
+  };
+}
+
+export function logSpikeDecisionTrace(payload: SpikeDecisionTracePayload): void {
+  console.log("[debug] spike decision trace");
+  console.log(JSON.stringify(payload, null, 2));
 }

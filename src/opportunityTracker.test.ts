@@ -224,7 +224,7 @@ describe("OpportunityTracker", () => {
         stopLoss: cfg.stopLoss,
         exitTimeoutMs: cfg.exitTimeoutMs,
         entryCooldownMs: 120_000,
-        riskPercentPerTrade: cfg.riskPercentPerTrade,
+        stakePerTrade: cfg.stakePerTrade,
       },
     });
     const pipeline = runStrategyDecisionPipeline({

@@ -412,7 +412,7 @@ export function runBacktestReplay(
         stopLoss: config.stopLoss,
         exitTimeoutMs: config.exitTimeoutMs,
         entryCooldownMs: config.entryCooldownMs,
-        riskPercentPerTrade: config.riskPercentPerTrade,
+        stakePerTrade: config.stakePerTrade,
       },
     });
   }

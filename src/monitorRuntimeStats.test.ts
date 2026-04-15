@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { printPeriodicRuntimeSummary, printShutdownReport } from "./monitorConsole.js";
-import { MonitorRuntimeStats } from "./monitorRuntimeStats.js";
+import {
+  logReportCounterConsistency,
+  MonitorRuntimeStats,
+} from "./monitorRuntimeStats.js";
 import { SimulationEngine } from "./simulationEngine.js";
 
 describe("MonitorRuntimeStats", () => {
@@ -65,7 +68,6 @@ describe("MonitorRuntimeStats", () => {
         },
       },
     });
-    expect(s.candidateOpportunities).toBe(1);
     expect(s.strongSpikeSignals).toBe(1);
     expect(s.strongSpikeCount).toBe(1);
 
@@ -134,6 +136,12 @@ describe("MonitorRuntimeStats", () => {
     expect(s.borderlineCount).toBe(1);
     expect(s.noSignalCount).toBe(1);
 
+    s.observeReadyTickFunnel({
+      spikeRawEvent: true,
+      candidatePass: true,
+      validEntryApproved: true,
+      positionOpenedThisTick: false,
+    });
     s.observeOpportunityRecord({
       timestamp: 0,
       btcPrice: 1,
@@ -175,6 +183,8 @@ describe("MonitorRuntimeStats", () => {
     expect(s.rejectedOpportunities).toBe(0);
     expect(s.cooldownOverridesUsed).toBe(1);
     expect(s.exceptionalSpikeEntries).toBe(0);
+    expect(s.candidateOpportunities).toBe(1);
+    expect(s.tradesExecuted).toBe(0);
 
     s.observeBorderlineLifecycleEventType("created");
     s.observeBorderlineLifecycleEventType("promoted");
@@ -190,6 +200,12 @@ describe("MonitorRuntimeStats", () => {
     expect(s.strongSpikeLosses).toBe(1);
     expect(s.strongSpikeAveragePnL).toBeCloseTo(-0.1, 6);
 
+    s.observeReadyTickFunnel({
+      spikeRawEvent: true,
+      candidatePass: true,
+      validEntryApproved: false,
+      positionOpenedThisTick: false,
+    });
     s.observeOpportunityRecord({
       timestamp: 0,
       btcPrice: 1,
@@ -233,6 +249,12 @@ describe("MonitorRuntimeStats", () => {
     expect(s.rejectedByPriorRangeTooWide).toBe(1);
     expect(s.rejectedByWeakSpikeQuality).toBe(1);
 
+    s.observeReadyTickFunnel({
+      spikeRawEvent: true,
+      candidatePass: true,
+      validEntryApproved: false,
+      positionOpenedThisTick: false,
+    });
     s.observeOpportunityRecord({
       timestamp: 0,
       btcPrice: 1,
@@ -272,6 +294,12 @@ describe("MonitorRuntimeStats", () => {
     expect(s.blockedByHardRejectUnstableContext).toBe(1);
     expect(s.rejectedByHardUnstableContext).toBe(1);
 
+    s.observeReadyTickFunnel({
+      spikeRawEvent: true,
+      candidatePass: true,
+      validEntryApproved: false,
+      positionOpenedThisTick: false,
+    });
     s.observeOpportunityRecord({
       timestamp: 0,
       btcPrice: 1,
@@ -315,6 +343,24 @@ describe("MonitorRuntimeStats", () => {
     expect(s.rejectedByStrongSpikeContinuation).toBe(1);
     expect(s.rejectedByBorderlineContinuation).toBe(1);
     expect(s.rejectedByExpensiveOppositeSide).toBe(1);
+
+    expect(s.spikeEventsDetected).toBe(4);
+    expect(s.candidateOpportunities).toBe(4);
+    expect(s.validOpportunities).toBe(1);
+    expect(s.rejectedOpportunities).toBe(3);
+    logReportCounterConsistency(s);
+  });
+
+  it("logReportCounterConsistency logs when trades exceed valid", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    logReportCounterConsistency({
+      tradesExecuted: 2,
+      validOpportunities: 1,
+      candidateOpportunities: 3,
+      spikeEventsDetected: 5,
+    });
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
   });
 });
 
@@ -332,6 +378,7 @@ describe("monitorConsole periodic / shutdown", () => {
         candidateOpportunities: s.candidateOpportunities,
         validOpportunities: s.validOpportunities,
         rejectedOpportunities: s.rejectedOpportunities,
+        tradesExecuted: s.tradesExecuted,
       },
       sim
     );
@@ -347,8 +394,11 @@ describe("monitorConsole periodic / shutdown", () => {
       t0,
       {
         ticksObserved: 3,
+        spikeEventsDetected: 2,
+        candidateOpportunities: 2,
         validOpportunities: 1,
         rejectedOpportunities: 0,
+        tradesExecuted: 1,
       },
       sim.getPerformanceStats()
     );

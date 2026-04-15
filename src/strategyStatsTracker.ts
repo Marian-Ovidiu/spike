@@ -1,6 +1,25 @@
 import type { StrategyTickResult } from "./botLoop.js";
 import type { Opportunity } from "./opportunityTracker.js";
 
+/** Funnel levels (increment only via {@link StrategyStatsTracker.observeReadyTickFunnel}). */
+export type ReadyTickFunnelSnapshot = {
+  /**
+   * Level 1 — raw spike context: detector fired, or a borderline promotion tick
+   * (counts as one spike for reporting consistency).
+   */
+  spikeRawEvent: boolean;
+  /**
+   * Level 2 — passes base movement filter: strong_spike or borderline path (subset of level 1).
+   */
+  candidatePass: boolean;
+  /**
+   * Level 3 — strategy approves entry (`enter_immediate` or `promote_borderline_candidate`).
+   */
+  validEntryApproved: boolean;
+  /** Level 4 — paper sim actually opened a position this tick. */
+  positionOpenedThisTick: boolean;
+};
+
 export class StrategyStatsTracker {
   private readonly exceptionalSpikePercent: number;
 
@@ -12,13 +31,16 @@ export class StrategyStatsTracker {
 
   ticksObserved = 0;
   btcFetchFailures = 0;
+  /** Level 1 — raw spike events (see {@link ReadyTickFunnelSnapshot.spikeRawEvent}). */
   spikeEventsDetected = 0;
-  /** Ready ticks: entry direction set but strategy does not enter (e.g. opposite leg too expensive). */
+  /** Level 2 — candidate opportunities (base filters). */
   candidateOpportunities = 0;
-  /** Raw spike events where strategy would enter (`Opportunity.status === "valid"`). */
+  /** Level 3 — strategy-approved entries. */
   validOpportunities = 0;
-  /** Raw spike events where strategy does not enter (`Opportunity.status === "rejected"`). */
+  /** Strong-spike rows stored with `status === "rejected"` (diagnostics; see funnel for totals). */
   rejectedOpportunities = 0;
+  /** Level 4 — positions opened by the simulation (incremented once per open). */
+  tradesExecuted = 0;
 
   strongSpikeSignals = 0;
   strongSpikeEntries = 0;
@@ -84,16 +106,42 @@ export class StrategyStatsTracker {
     } else {
       this.noSignalMoves += 1;
     }
-    if (entry.direction !== null && !entry.shouldEnter) {
-      this.candidateOpportunities += 1;
+  }
+
+  /**
+   * Single place to increment funnel counters for one ready tick.
+   * Call once per monitor tick after pipeline + {@link SimulationEngine.onTick}.
+   */
+  observeReadyTickFunnel(s: ReadyTickFunnelSnapshot): void {
+    if (s.spikeRawEvent) this.spikeEventsDetected += 1;
+    if (s.candidatePass) this.candidateOpportunities += 1;
+    if (s.validEntryApproved) this.validOpportunities += 1;
+    if (s.positionOpenedThisTick) this.tradesExecuted += 1;
+
+    if (s.positionOpenedThisTick && !s.validEntryApproved) {
+      console.error(
+        "[monitor] Report invariant: position opened without valid entry approval"
+      );
+    }
+    if (s.validEntryApproved && !s.candidatePass) {
+      console.error(
+        "[monitor] Report invariant: valid entry without candidate pass"
+      );
+    }
+    if (s.candidatePass && !s.spikeRawEvent) {
+      console.error(
+        "[monitor] Report invariant: candidate without raw spike event"
+      );
     }
   }
 
+  /**
+   * Per-tick diagnostics from the strong-spike {@link Opportunity} row (if any).
+   * Does not increment funnel totals — use {@link observeReadyTickFunnel} for those.
+   */
   observeOpportunityRecord(recorded: Opportunity | null): void {
     if (recorded === null) return;
-    this.spikeEventsDetected += 1;
     if (recorded.status === "valid") {
-      this.validOpportunities += 1;
       if (recorded.cooldownOverridden === true) {
         this.cooldownOverridesUsed += 1;
       }
@@ -214,5 +262,29 @@ export class StrategyStatsTracker {
     return this.strongSpikeTradesClosed > 0
       ? (this.strongSpikeWins / this.strongSpikeTradesClosed) * 100
       : 0;
+  }
+}
+
+/** Call on shutdown: funnel totals must satisfy trades ≤ valid ≤ candidate ≤ spikes. */
+export function logReportCounterConsistency(s: {
+  tradesExecuted: number;
+  validOpportunities: number;
+  candidateOpportunities: number;
+  spikeEventsDetected: number;
+}): void {
+  if (s.tradesExecuted > s.validOpportunities) {
+    console.error(
+      `[monitor] Report consistency error: tradesExecuted (${s.tradesExecuted}) > validOpportunities (${s.validOpportunities})`
+    );
+  }
+  if (s.validOpportunities > s.candidateOpportunities) {
+    console.error(
+      `[monitor] Report consistency error: validOpportunities (${s.validOpportunities}) > candidateOpportunities (${s.candidateOpportunities})`
+    );
+  }
+  if (s.candidateOpportunities > s.spikeEventsDetected) {
+    console.error(
+      `[monitor] Report consistency error: candidateOpportunities (${s.candidateOpportunities}) > spikeEventsDetected (${s.spikeEventsDetected})`
+    );
   }
 }

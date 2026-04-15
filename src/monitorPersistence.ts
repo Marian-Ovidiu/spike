@@ -2,9 +2,10 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Opportunity } from "./opportunityTracker.js";
-import type {
-  SimulationPerformanceStats,
-  SimulatedTrade,
+import type { SimulationPerformanceStats } from "./simulationEngine.js";
+import {
+  buildTransparentTradeLog,
+  type SimulatedTrade,
 } from "./simulationEngine.js";
 
 const DEFAULT_OUTPUT_DIR = "output/monitor";
@@ -54,23 +55,18 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
   };
 }
 
-/** One JSON object per line for closed paper trades. */
+/** One JSON object per line for closed paper trades (core fields match {@link buildTransparentTradeLog}). */
 export function tradeToJsonlRecord(t: SimulatedTrade): Record<string, unknown> {
+  const closedAtIso = new Date(t.closedAt).toISOString();
   return {
-    id: t.id,
-    direction: t.direction,
-    contracts: t.contracts,
-    entryPrice: t.entryPrice,
-    exitPrice: t.exitPrice,
-    profitLoss: t.profitLoss,
-    riskAtEntry: t.riskAtEntry,
-    entryPath: t.entryPath,
-    exitReason: t.exitReason,
+    ...buildTransparentTradeLog(t),
     openedAt: new Date(t.openedAt).toISOString(),
-    closedAt: new Date(t.closedAt).toISOString(),
+    /** Same instant as `timestamp` (exit time). */
+    closedAt: closedAtIso,
     openedAtMs: t.openedAt,
     closedAtMs: t.closedAt,
     holdDurationMs: t.closedAt - t.openedAt,
+    riskAtEntry: t.riskAtEntry,
   };
 }
 
@@ -84,6 +80,8 @@ export function buildMonitorSessionSummary(input: {
   candidateOpportunities: number;
   validOpportunities: number;
   rejectedOpportunities: number;
+  /** Positions opened by paper sim (funnel level 4). */
+  tradesExecuted: number;
   perf: SimulationPerformanceStats;
   extended?: {
     strongSpikeSignals: number;
@@ -149,17 +147,18 @@ export function buildMonitorSessionSummary(input: {
       candidateOpportunities: input.candidateOpportunities,
       validOpportunities: input.validOpportunities,
       rejectedOpportunities: input.rejectedOpportunities,
+      tradesExecuted: input.tradesExecuted,
       opportunitiesFound,
     },
     simulation: {
-      tradesSimulated: input.perf.totalTrades,
+      totalTrades: input.perf.totalTrades,
       wins: input.perf.wins,
       losses: input.perf.losses,
       breakeven: input.perf.breakeven,
       winRatePercent: input.perf.winRate,
-      totalProfit: input.perf.totalProfit,
-      averageProfitPerTrade: input.perf.averageProfitPerTrade,
-      maxEquityDrawdown: input.perf.maxEquityDrawdown,
+      totalPnl: input.perf.totalProfit,
+      avgPnl: input.perf.averageProfitPerTrade,
+      maxDrawdown: input.perf.maxEquityDrawdown,
       currentEquity: input.perf.currentEquity,
       initialEquity: input.perf.initialEquity,
     },
@@ -182,17 +181,19 @@ export type MonitorSessionSummary = {
     candidateOpportunities: number;
     validOpportunities: number;
     rejectedOpportunities: number;
+    tradesExecuted: number;
     opportunitiesFound: number;
   };
   simulation: {
-    tradesSimulated: number;
+    totalTrades: number;
     wins: number;
     losses: number;
     breakeven: number;
     winRatePercent: number;
-    totalProfit: number;
-    averageProfitPerTrade: number;
-    maxEquityDrawdown: number;
+    /** Sum of closed-trade `profitLoss` (matches trades JSONL). */
+    totalPnl: number;
+    avgPnl: number;
+    maxDrawdown: number;
     currentEquity: number;
     initialEquity: number;
   };

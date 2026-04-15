@@ -1027,7 +1027,7 @@ describe("strategyDecisionPipeline", () => {
         stopLoss: 0.1,
         exitTimeoutMs: 60_000,
         entryCooldownMs: 120_000,
-        riskPercentPerTrade: 1,
+        stakePerTrade: 5,
       },
     });
 
@@ -1232,7 +1232,12 @@ describe("strategyDecisionPipeline", () => {
   it("does not override cooldown when exceptional spike has open position", () => {
     const sim = {
       canOpenNewPosition: () => false,
-      getOpenPosition: () => ({ direction: "DOWN", entryPrice: 0.2, contracts: 1 }),
+      getOpenPosition: () => ({
+        direction: "DOWN",
+        entryPrice: 0.2,
+        stake: 5,
+        shares: 25,
+      }),
     } as unknown as SimulationEngine;
     const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
     const strongSpikeManager = new StrongSpikeCandidateStore({
