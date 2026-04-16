@@ -14,6 +14,7 @@ import {
 import type { OpportunityTracker } from "./opportunityTracker.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulationEngine } from "./simulationEngine.js";
+import { classifySpikeQuality } from "./spikeQualityClassifier.js";
 
 /** Live / backtest cadence (ms). */
 export const BOT_TICK_INTERVAL_MS = 5_000;
@@ -152,9 +153,23 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
 
   const { entry, sides } = tick;
 
+  const entryQualityProfile = ctx.config.allowWeakQualityEntries
+    ? classifySpikeQuality(entry, {
+        tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
+        exceptionalSpikeMinPercent: ctx.config.exceptionalSpikePercent,
+        maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+        allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+        allowWeakQualityOnlyForStrongSpikes:
+          ctx.config.allowWeakQualityOnlyForStrongSpikes,
+      }).qualityProfile
+    : undefined;
+
   ctx.simulation.onTick({
     now,
     entry,
+    ...(entryQualityProfile !== undefined
+      ? { entryQualityProfile }
+      : {}),
     sides,
     config: {
       exitPrice: ctx.config.exitPrice,
@@ -162,6 +177,11 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
       stakePerTrade: ctx.config.stakePerTrade,
+      allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+      weakQualitySizeMultiplier: ctx.config.weakQualitySizeMultiplier,
+      strongQualitySizeMultiplier: ctx.config.strongQualitySizeMultiplier,
+      exceptionalQualitySizeMultiplier:
+        ctx.config.exceptionalQualitySizeMultiplier,
     },
   });
 
@@ -180,6 +200,10 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
     entry,
     tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
     maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+    exceptionalSpikeMinPercent: ctx.config.exceptionalSpikePercent,
+    allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+    allowWeakQualityOnlyForStrongSpikes:
+      ctx.config.allowWeakQualityOnlyForStrongSpikes,
   });
   if (recorded?.entryAllowed) {
     logValidOpportunityBlock(recorded);

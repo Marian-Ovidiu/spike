@@ -10,6 +10,8 @@ export function classifySpikeQuality(
     tradableSpikeMinPercent?: number;
     exceptionalSpikeMinPercent?: number;
     maxPriorRangeForNormalEntry?: number;
+    allowWeakQualityEntries?: boolean;
+    allowWeakQualityOnlyForStrongSpikes?: boolean;
   }
 ): PreEntryQualityGateResult {
   return evaluatePreEntryQualityGate(entry, options);

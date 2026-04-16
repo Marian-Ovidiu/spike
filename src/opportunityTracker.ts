@@ -5,11 +5,15 @@ import type {
 import type { PostMoveClassification } from "./borderlineCandidate.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 import { type MovementClassification, type WindowSpikeSource } from "./strategy.js";
-import type { StrategyDecision } from "./strategyDecisionPipeline.js";
+import type {
+  PipelineQualityModifier,
+  StrategyDecision,
+} from "./strategyDecisionPipeline.js";
 import { normalizeBorderlineLifecycleRejection } from "./decisionReasonBuilder.js";
 import {
   DEFAULT_TRADABLE_SPIKE_MIN_PERCENT,
   evaluatePreEntryQualityGate,
+  type QualityGateDiagnostics,
   type QualityProfile,
 } from "./preEntryQualityGate.js";
 
@@ -67,6 +71,9 @@ export type Opportunity = {
   borderlineCandidateId?: string;
   tradableSpikeMinPercent: number;
   qualityProfile: QualityProfile;
+  /** Rule-trace from pre-entry gate; use with {@link pipelineQualityModifier}. */
+  qualityGateDiagnostics?: QualityGateDiagnostics;
+  pipelineQualityModifier?: PipelineQualityModifier;
   cooldownOverridden?: boolean;
   overrideReason?: string | null;
   entryAllowed: boolean;
@@ -85,9 +92,18 @@ export type RecordReadyTickInput = {
   entry: EntryEvaluation;
   tradableSpikeMinPercent?: number;
   maxPriorRangeForNormalEntry?: number;
+  exceptionalSpikeMinPercent?: number;
+  allowWeakQualityEntries?: boolean;
+  allowWeakQualityOnlyForStrongSpikes?: boolean;
   decision?: Pick<
     StrategyDecision,
-    "action" | "reasons" | "qualityProfile" | "cooldownOverridden" | "overrideReason"
+    | "action"
+    | "reasons"
+    | "qualityProfile"
+    | "cooldownOverridden"
+    | "overrideReason"
+    | "qualityGateDiagnostics"
+    | "pipelineQualityModifier"
   >;
 };
 
@@ -146,16 +162,30 @@ export function buildOpportunityFromReadyTick(
   const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
     ? Math.max(0, input.tradableSpikeMinPercent ?? DEFAULT_TRADABLE_SPIKE_MIN_PERCENT)
     : DEFAULT_TRADABLE_SPIKE_MIN_PERCENT;
-  const qualityGateOptions =
-    input.maxPriorRangeForNormalEntry !== undefined
+  const qualityGateOptions = {
+    tradableSpikeMinPercent,
+    ...(input.maxPriorRangeForNormalEntry !== undefined
+      ? { maxPriorRangeForNormalEntry: input.maxPriorRangeForNormalEntry }
+      : {}),
+    ...(input.exceptionalSpikeMinPercent !== undefined
+      ? { exceptionalSpikeMinPercent: input.exceptionalSpikeMinPercent }
+      : {}),
+    ...(input.allowWeakQualityEntries !== undefined
+      ? { allowWeakQualityEntries: input.allowWeakQualityEntries }
+      : {}),
+    ...(input.allowWeakQualityOnlyForStrongSpikes !== undefined
       ? {
-          tradableSpikeMinPercent,
-          maxPriorRangeForNormalEntry: input.maxPriorRangeForNormalEntry,
+          allowWeakQualityOnlyForStrongSpikes:
+            input.allowWeakQualityOnlyForStrongSpikes,
         }
-      : { tradableSpikeMinPercent };
+      : {}),
+  };
+  const gateEval = evaluatePreEntryQualityGate(entry, qualityGateOptions);
   const qualityProfile =
-    decision?.qualityProfile ??
-    evaluatePreEntryQualityGate(entry, qualityGateOptions).qualityProfile;
+    decision?.qualityProfile ?? gateEval.qualityProfile;
+  const qualityGateDiagnostics =
+    decision?.qualityGateDiagnostics ?? gateEval.diagnostics;
+  const pipelineQualityModifier = decision?.pipelineQualityModifier;
 
   return {
     timestamp,
@@ -184,6 +214,10 @@ export function buildOpportunityFromReadyTick(
     opportunityOutcome: entryAllowed ? "entered_immediate" : "rejected",
     tradableSpikeMinPercent,
     qualityProfile,
+    qualityGateDiagnostics,
+    ...(pipelineQualityModifier !== undefined
+      ? { pipelineQualityModifier }
+      : {}),
     cooldownOverridden: decision?.cooldownOverridden ?? false,
     overrideReason: decision?.overrideReason ?? null,
     entryAllowed,

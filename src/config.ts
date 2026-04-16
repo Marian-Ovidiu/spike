@@ -65,11 +65,43 @@ export const configDefaults = {
   entryCooldownMs: 120_000,
   /** Max number of recent prices to retain in the rolling buffer. */
   priceBufferSize: 20,
+  /**
+   * When true, `weak` pre-entry quality profiles may pass the quality gate (for testing).
+   * Downstream filters (quotes, cooldown, etc.) unchanged.
+   */
+  allowWeakQualityEntries: false,
+  /**
+   * When true (default), weak-quality bypass applies only to `strong_spike` moves,
+   * not to `borderline` moves with a weak profile.
+   */
+  allowWeakQualityOnlyForStrongSpikes: true,
+  /** Stake multiplier when quality is weak (only used if allowWeakQualityEntries). */
+  weakQualitySizeMultiplier: 0.5,
+  /** Stake multiplier for strong / acceptable quality when weak entries are enabled. */
+  strongQualitySizeMultiplier: 1,
+  /** Stake multiplier for exceptional quality when weak entries are enabled. */
+  exceptionalQualitySizeMultiplier: 1,
+  /**
+   * `hard`: unstable pre-spike context triggers immediate pipeline hard reject (default).
+   * `soft`: same detection is logged and annotated on the gate, but later gates may still run.
+   */
+  unstableContextMode: "hard" as "hard" | "soft",
+  /**
+   * When true, applies an explicit diagnostic preset (weak strong-spike entries, labeled logs).
+   * Does not change defaults unless TEST_MODE=true — see loadConfig preset logic.
+   */
+  testMode: false,
 } as const;
 
+type ConfigKey = keyof typeof configDefaults;
+type NumericOrBoolConfigKey = Exclude<ConfigKey, "unstableContextMode">;
+
 export type AppConfig = {
-  [K in keyof typeof configDefaults]:
-    (typeof configDefaults)[K] extends boolean ? boolean : number;
+  [K in NumericOrBoolConfigKey]: (typeof configDefaults)[K] extends boolean
+    ? boolean
+    : number;
+} & {
+  unstableContextMode: "hard" | "soft";
 };
 
 const ENV_KEYS: { [K in keyof AppConfig]: string } = {
@@ -103,6 +135,14 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   exitTimeoutMs: "EXIT_TIMEOUT_MS",
   entryCooldownMs: "ENTRY_COOLDOWN_MS",
   priceBufferSize: "PRICE_BUFFER_SIZE",
+  allowWeakQualityEntries: "ALLOW_WEAK_QUALITY_ENTRIES",
+  allowWeakQualityOnlyForStrongSpikes:
+    "ALLOW_WEAK_QUALITY_ONLY_FOR_STRONG_SPIKES",
+  weakQualitySizeMultiplier: "WEAK_QUALITY_SIZE_MULTIPLIER",
+  strongQualitySizeMultiplier: "STRONG_QUALITY_SIZE_MULTIPLIER",
+  exceptionalQualitySizeMultiplier: "EXCEPTIONAL_QUALITY_SIZE_MULTIPLIER",
+  unstableContextMode: "UNSTABLE_CONTEXT_MODE",
+  testMode: "TEST_MODE",
 };
 
 function parseEnvNumber(
@@ -150,6 +190,27 @@ function parseEnvBoolean(
   }
   console.warn(
     `[config] ${envVar}="${raw}" is not a valid boolean; using default ${defaultValue}`
+  );
+  return { value: defaultValue, fromEnv: false };
+}
+
+function parseEnvUnstableContextMode(
+  envVar: string,
+  defaultValue: "hard" | "soft"
+): { value: "hard" | "soft"; fromEnv: boolean } {
+  const raw = process.env[envVar];
+  if (raw === undefined) {
+    return { value: defaultValue, fromEnv: false };
+  }
+  const t = raw.trim().toLowerCase();
+  if (t === "") {
+    return { value: defaultValue, fromEnv: false };
+  }
+  if (t === "hard" || t === "soft") {
+    return { value: t, fromEnv: true };
+  }
+  console.warn(
+    `[config] ${envVar}="${raw}" must be "hard" or "soft"; using default "${defaultValue}"`
   );
   return { value: defaultValue, fromEnv: false };
 }
@@ -275,9 +336,42 @@ function loadConfig(): {
     configDefaults.priceBufferSize
   );
   const priceBufferSize = Math.max(1, Math.trunc(priceBufferSizeRaw.value));
+  const allowWeakQualityEntries = parseEnvBoolean(
+    "ALLOW_WEAK_QUALITY_ENTRIES",
+    configDefaults.allowWeakQualityEntries
+  );
+  const allowWeakQualityOnlyForStrongSpikes = parseEnvBoolean(
+    "ALLOW_WEAK_QUALITY_ONLY_FOR_STRONG_SPIKES",
+    configDefaults.allowWeakQualityOnlyForStrongSpikes
+  );
+  const weakQualitySizeMultiplier = parseEnvNumber(
+    "WEAK_QUALITY_SIZE_MULTIPLIER",
+    configDefaults.weakQualitySizeMultiplier
+  );
+  const strongQualitySizeMultiplier = parseEnvNumber(
+    "STRONG_QUALITY_SIZE_MULTIPLIER",
+    configDefaults.strongQualitySizeMultiplier
+  );
+  const exceptionalQualitySizeMultiplier = parseEnvNumber(
+    "EXCEPTIONAL_QUALITY_SIZE_MULTIPLIER",
+    configDefaults.exceptionalQualitySizeMultiplier
+  );
+  const unstableContextMode = parseEnvUnstableContextMode(
+    "UNSTABLE_CONTEXT_MODE",
+    configDefaults.unstableContextMode
+  );
+  const testModeParsed = parseEnvBoolean("TEST_MODE", configDefaults.testMode);
+  const testModeSoftUnstable = parseEnvBoolean(
+    "TEST_MODE_SOFT_UNSTABLE",
+    false
+  );
+  if (testModeSoftUnstable.value && !testModeParsed.value) {
+    console.warn(
+      "[config] TEST_MODE_SOFT_UNSTABLE is ignored unless TEST_MODE=true"
+    );
+  }
 
-  return {
-    config: {
+  let config: AppConfig = {
       spikeThreshold: spikeThreshold.value,
       tradableSpikeMinPercent: Math.max(0, tradableSpikeMinPercent.value),
       rangeThreshold: rangeThreshold.value,
@@ -314,7 +408,45 @@ function loadConfig(): {
       exitTimeoutMs: Math.max(0, exitTimeoutMs.value),
       entryCooldownMs: Math.max(0, entryCooldownMs.value),
       priceBufferSize,
-    },
+      allowWeakQualityEntries: allowWeakQualityEntries.value,
+      allowWeakQualityOnlyForStrongSpikes:
+        allowWeakQualityOnlyForStrongSpikes.value,
+      weakQualitySizeMultiplier: Math.max(0, weakQualitySizeMultiplier.value),
+      strongQualitySizeMultiplier: Math.max(0, strongQualitySizeMultiplier.value),
+      exceptionalQualitySizeMultiplier: Math.max(
+        0,
+        exceptionalQualitySizeMultiplier.value
+      ),
+      unstableContextMode: unstableContextMode.value,
+      testMode: testModeParsed.value,
+  };
+
+  if (config.testMode) {
+    if (!config.allowWeakQualityEntries) {
+      console.log(
+        "[config] TEST_MODE=true: overriding allowWeakQualityEntries false → true (diagnostic preset; not production)"
+      );
+    }
+    if (!config.allowWeakQualityOnlyForStrongSpikes) {
+      console.log(
+        "[config] TEST_MODE=true: overriding allowWeakQualityOnlyForStrongSpikes false → true (weak entries limited to strong_spike path)"
+      );
+    }
+    config.allowWeakQualityEntries = true;
+    config.allowWeakQualityOnlyForStrongSpikes = true;
+    console.log(
+      `[config] TEST_MODE preset: weak-profile strong_spike entries allowed; weak stake uses WEAK_QUALITY_SIZE_MULTIPLIER=${config.weakQualitySizeMultiplier} (explicit, not silent)`
+    );
+    if (testModeSoftUnstable.value) {
+      config.unstableContextMode = "soft";
+      console.log(
+        "[config] TEST_MODE=true: TEST_MODE_SOFT_UNSTABLE=1 → unstableContextMode=soft (optional diagnostic; UNSTABLE_CONTEXT_MODE from env was overridden)"
+      );
+    }
+  }
+
+  return {
+    config,
     _meta: {
       spikeThreshold: { fromEnv: spikeThreshold.fromEnv },
       tradableSpikeMinPercent: { fromEnv: tradableSpikeMinPercent.fromEnv },
@@ -362,6 +494,19 @@ function loadConfig(): {
       exitTimeoutMs: { fromEnv: exitTimeoutMs.fromEnv },
       entryCooldownMs: { fromEnv: entryCooldownMs.fromEnv },
       priceBufferSize: { fromEnv: priceBufferSizeRaw.fromEnv },
+      allowWeakQualityEntries: { fromEnv: allowWeakQualityEntries.fromEnv },
+      allowWeakQualityOnlyForStrongSpikes: {
+        fromEnv: allowWeakQualityOnlyForStrongSpikes.fromEnv,
+      },
+      weakQualitySizeMultiplier: { fromEnv: weakQualitySizeMultiplier.fromEnv },
+      strongQualitySizeMultiplier: {
+        fromEnv: strongQualitySizeMultiplier.fromEnv,
+      },
+      exceptionalQualitySizeMultiplier: {
+        fromEnv: exceptionalQualitySizeMultiplier.fromEnv,
+      },
+      unstableContextMode: { fromEnv: unstableContextMode.fromEnv },
+      testMode: { fromEnv: testModeParsed.fromEnv },
     },
   };
 }
@@ -385,6 +530,11 @@ export const debugMonitor: boolean = (() => {
 
 /** Pretty-print current config (call once at startup). */
 export function logConfig(): void {
+  if (config.testMode) {
+    console.log(
+      "!!!!!!!!!! TEST MODE ACTIVE — DIAGNOSTIC RUN — NOT PRODUCTION BASELINE !!!!!!!!!!"
+    );
+  }
   const keys = Object.keys(configDefaults) as (keyof AppConfig)[];
   const labelW = Math.max(...keys.map((k) => k.length));
 
@@ -403,7 +553,8 @@ export function logConfig(): void {
   console.log(lines.join("\n"));
 }
 
-function formatConfigValue(v: number | boolean): string {
+function formatConfigValue(v: number | boolean | "hard" | "soft"): string {
+  if (v === "hard" || v === "soft") return v;
   if (typeof v === "boolean") return String(v);
   const n = v;
   if (!Number.isFinite(n)) return String(n);

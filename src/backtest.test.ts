@@ -113,6 +113,11 @@ describe("runBacktestReplay", () => {
         riskPercentPerTrade: 1,
         stakePerTrade: 5,
         priceBufferSize: 20,
+        allowWeakQualityEntries: false,
+        allowWeakQualityOnlyForStrongSpikes: true,
+        weakQualitySizeMultiplier: 0.5,
+        strongQualitySizeMultiplier: 1,
+        exceptionalQualitySizeMultiplier: 1,
       },
       sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
     });
@@ -201,6 +206,11 @@ describe("runBacktestReplay", () => {
         riskPercentPerTrade: 1,
         stakePerTrade: 5,
         priceBufferSize: 20,
+        allowWeakQualityEntries: false,
+        allowWeakQualityOnlyForStrongSpikes: true,
+        weakQualitySizeMultiplier: 0.5,
+        strongQualitySizeMultiplier: 1,
+        exceptionalQualitySizeMultiplier: 1,
       },
       sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
     });

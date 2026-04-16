@@ -25,10 +25,16 @@ import {
 import {
   DEFAULT_MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY,
   DEFAULT_TRADABLE_SPIKE_MIN_PERCENT,
+  type PreEntryQualityGateResult,
+  type QualityGateDiagnostics,
   type QualityProfile,
 } from "./preEntryQualityGate.js";
 import { classifySpikeQuality } from "./spikeQualityClassifier.js";
-import { evaluateHardRejectContext } from "./hardRejectEngine.js";
+import {
+  applyUnstableSoftOverlayOnQualityGate,
+  evaluateHardRejectContext,
+  type HardRejectResult,
+} from "./hardRejectEngine.js";
 import {
   shouldOverrideCooldownForExceptional,
   shouldOverrideCooldownForExceptionalCandidate,
@@ -43,6 +49,14 @@ export type StrategyAction =
   | "cancel_borderline_candidate"
   | "expire_borderline_candidate";
 
+export type PipelineQualityModifier = {
+  /** Profile reflected on this decision (may differ from pre-entry gate alone). */
+  effectiveQualityProfile: QualityProfile;
+  reason: string;
+  /** Gate profile before pipeline-specific overrides (e.g. hard reject). */
+  preModifierGateProfile?: QualityProfile;
+};
+
 export type StrategyDecision = {
   action: StrategyAction;
   direction: "UP" | "DOWN" | null;
@@ -51,8 +65,15 @@ export type StrategyDecision = {
   qualityGatePassed?: boolean;
   qualityGateReasons?: string[];
   qualityProfile?: QualityProfile;
+  /** Rule-trace from {@link evaluatePreEntryQualityGate} (same tick as ready entry). */
+  qualityGateDiagnostics?: QualityGateDiagnostics;
+  /** When set, explains why `qualityProfile` differs from gate-only evaluation. */
+  pipelineQualityModifier?: PipelineQualityModifier;
   hardRejectApplied?: boolean;
   hardRejectReason?: string | null;
+  unstablePreSpikeContextDetected?: boolean;
+  unstableContextHandling?: HardRejectResult["unstableContextHandling"];
+  unstablePreSpikeContextMetrics?: HardRejectResult["unstablePreSpikeContextMetrics"];
   cooldownOverridden?: boolean;
   overrideReason?: string | null;
   spikeDetected: boolean;
@@ -75,6 +96,10 @@ function withNormalizedReasons(input: {
   tick: StrategyTickResult;
   simulation: SimulationEngine;
   tradableSpikeMinPercent?: number;
+  /** Full gate from {@link runStrategyDecisionPipeline} config (preferred over recomputing). */
+  pipelineQualityGate?: PreEntryQualityGateResult;
+  /** When set (ready-tick path), attaches unstable-context diagnostics to the decision. */
+  hardRejectContext?: HardRejectResult;
 }): StrategyDecision {
   const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
     ? Math.max(
@@ -82,7 +107,7 @@ function withNormalizedReasons(input: {
         input.tradableSpikeMinPercent ?? DEFAULT_TRADABLE_SPIKE_MIN_PERCENT
       )
     : DEFAULT_TRADABLE_SPIKE_MIN_PERCENT;
-  const qualityGate =
+  const fallbackGate =
     input.tick.kind === "ready"
       ? classifySpikeQuality(input.tick.entry, {
           tradableSpikeMinPercent,
@@ -92,7 +117,50 @@ function withNormalizedReasons(input: {
           qualityGatePassed: false,
           qualityGateReasons: ["missing_ready_tick_data"],
           qualityProfile: "weak" as const,
+          diagnostics: {
+            classification: "rule_based" as const,
+            effectiveThresholds: {
+              tradableSpikeMinPercent,
+              exceptionalSpikeMinPercent: 0,
+              maxPriorRangeForNormalEntry: DEFAULT_MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY,
+            },
+            inputs: {
+              movementClassification: "no_signal" as const,
+              strongestMovePercent: 0,
+              spikePercent: 0,
+              thresholdRatio: 0,
+              priorRangePercent: 0,
+              stableRangeDetected: false,
+              stableRangeQuality: "poor" as const,
+              entryReasonCodes: [],
+            },
+            profileAfterSpikeSizeTier: "weak" as const,
+            ruleChecks: [],
+            downgradeChain: [],
+            finalProfile: "weak" as const,
+            qualityGatePassed: false,
+            weakPrimaryReasons: ["missing_ready_tick_data"],
+          },
         };
+  const qualityGate = input.pipelineQualityGate ?? fallbackGate;
+  const qualityGateDiagnostics: QualityGateDiagnostics | undefined =
+    input.decision.qualityGateDiagnostics ??
+    (input.tick.kind === "ready" ? qualityGate.diagnostics : undefined);
+  const diagSpread =
+    qualityGateDiagnostics !== undefined
+      ? { qualityGateDiagnostics }
+      : {};
+  const hr = input.hardRejectContext;
+  const unstableSpread =
+    hr?.unstablePreSpikeContextDetected === true
+      ? {
+          unstablePreSpikeContextDetected: true as const,
+          unstableContextHandling: hr.unstableContextHandling,
+          ...(hr.unstablePreSpikeContextMetrics !== undefined
+            ? { unstablePreSpikeContextMetrics: hr.unstablePreSpikeContextMetrics }
+            : {}),
+        }
+      : {};
   if (input.tick.kind !== "ready") {
     return {
       ...input.decision,
@@ -101,10 +169,12 @@ function withNormalizedReasons(input: {
       qualityGateReasons:
         input.decision.qualityGateReasons ?? qualityGate.qualityGateReasons,
       qualityProfile: input.decision.qualityProfile ?? qualityGate.qualityProfile,
+      ...diagSpread,
       hardRejectApplied: input.decision.hardRejectApplied ?? false,
       hardRejectReason: input.decision.hardRejectReason ?? null,
       cooldownOverridden: input.decision.cooldownOverridden ?? false,
       overrideReason: input.decision.overrideReason ?? null,
+      ...unstableSpread,
       reasons: normalizeDecisionRejectionReasons({
         decision: input.decision,
       }),
@@ -117,10 +187,12 @@ function withNormalizedReasons(input: {
     qualityGateReasons:
       input.decision.qualityGateReasons ?? qualityGate.qualityGateReasons,
     qualityProfile: input.decision.qualityProfile ?? qualityGate.qualityProfile,
+    ...diagSpread,
     hardRejectApplied: input.decision.hardRejectApplied ?? false,
     hardRejectReason: input.decision.hardRejectReason ?? null,
     cooldownOverridden: input.decision.cooldownOverridden ?? false,
     overrideReason: input.decision.overrideReason ?? null,
+    ...unstableSpread,
     reasons: normalizeDecisionRejectionReasons({
       decision: input.decision,
       entry: {
@@ -180,9 +252,69 @@ type PipelineInput = {
     | "borderlineReversionThreshold"
     | "borderlinePauseBandPercent"
     | "strongSpikeHardRejectPoorRange"
+    | "allowWeakQualityEntries"
+    | "allowWeakQualityOnlyForStrongSpikes"
+    | "unstableContextMode"
   >;
 };
 
+function appendWeakQualityGateLogLines(
+  messages: string[],
+  gate: { qualityGateReasons: readonly string[] }
+): void {
+  const r = gate.qualityGateReasons;
+  if (r.includes("weak_quality_entry_allowed_by_config")) {
+    messages.push(
+      "[quality-gate] ALLOW_WEAK_QUALITY_ENTRIES: weak profile PASSED the pre-entry gate (controlled testing)"
+    );
+  }
+  if (r.includes("weak_quality_entries_disabled_by_config")) {
+    messages.push(
+      "[quality-gate] ALLOW_WEAK_QUALITY_ENTRIES=false: weak profile rejected at pre-entry gate"
+    );
+  }
+  if (r.includes("weak_quality_borderline_blocked_by_config")) {
+    messages.push(
+      "[quality-gate] weak borderline rejected (ALLOW_WEAK_QUALITY_ONLY_FOR_STRONG_SPIKES=true)"
+    );
+  }
+  if (r.includes("weak_quality_blocked_prior_or_unstable_context")) {
+    messages.push(
+      "[quality-gate] weak bypass blocked: prior range wide or unstable/noisy context (unchanged)"
+    );
+  }
+  if (r.includes("weak_quality_no_signal_blocked_by_config")) {
+    messages.push(
+      "[quality-gate] weak no_signal rejected (allow-weak applies only to strong_spike/borderline when configured)"
+    );
+  }
+}
+
+function appendUnstableContextLogs(
+  messages: string[],
+  hardReject: HardRejectResult,
+  mode: "hard" | "soft"
+): void {
+  if (hardReject.unstableContextHandling === "hard_reject") {
+    const m = hardReject.unstablePreSpikeContextMetrics;
+    messages.push(
+      `[unstable-context] mode=${mode} unstable pre-spike context matched; hard_reject applied reason=${hardReject.hardRejectReason ?? "hard_reject_unstable_pre_spike_context"}` +
+        (m
+          ? ` | priorRange=${m.priorRangePercent} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
+          : "")
+    );
+    return;
+  }
+  if (hardReject.unstableContextHandling === "soft_deferred") {
+    const m = hardReject.unstablePreSpikeContextMetrics;
+    messages.push(
+      `[unstable-context] mode=${mode} unstable pre-spike context matched; downgraded to soft handling (downstream gates decide)` +
+        (m
+          ? ` | priorRange=${m.priorRangePercent} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
+          : "")
+    );
+  }
+}
 
 function lifecycleToDecision(
   event: BorderlineLifecycleEvent
@@ -495,22 +627,36 @@ export function runStrategyDecisionPipeline(
     if (r !== null) renderEvents.push(r);
   }
   const lifecycleDecision = fromLastMeaningfulLifecycle(lifecycleEvents);
-  const qualityGate = classifySpikeQuality(tick.entry, {
+  const qualityGateBase = classifySpikeQuality(tick.entry, {
     tradableSpikeMinPercent: config.tradableSpikeMinPercent,
     exceptionalSpikeMinPercent: config.exceptionalSpikePercent,
     maxPriorRangeForNormalEntry: config.maxPriorRangeForNormalEntry,
+    allowWeakQualityEntries: config.allowWeakQualityEntries,
+    allowWeakQualityOnlyForStrongSpikes:
+      config.allowWeakQualityOnlyForStrongSpikes,
   });
+  appendWeakQualityGateLogLines(strongSpikeLifecycleMessages, qualityGateBase);
   const hardReject = evaluateHardRejectContext({
     entry: tick.entry,
     hardRejectPriorRangePercent: config.hardRejectPriorRangePercent,
+    unstableContextMode: config.unstableContextMode,
   });
+  appendUnstableContextLogs(
+    strongSpikeLifecycleMessages,
+    hardReject,
+    config.unstableContextMode
+  );
+  const nrm = (
+    args: Omit<Parameters<typeof withNormalizedReasons>[0], "hardRejectContext">
+  ) => withNormalizedReasons({ ...args, hardRejectContext: hardReject });
 
   if (hardReject.hardRejectApplied) {
     return {
-      decision: withNormalizedReasons({
+      decision: nrm({
         tick,
         simulation,
         tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+        pipelineQualityGate: qualityGateBase,
         decision: {
           action: "none",
           direction: null,
@@ -519,11 +665,16 @@ export function runStrategyDecisionPipeline(
           qualityGatePassed: false,
           qualityGateReasons: [
             ...new Set([
-              ...qualityGate.qualityGateReasons,
+              ...qualityGateBase.qualityGateReasons,
               "hard_reject_unstable_pre_spike_context",
             ]),
           ],
           qualityProfile: "weak",
+          pipelineQualityModifier: {
+            effectiveQualityProfile: "weak",
+            reason: "hard_reject_unstable_pre_spike_context",
+            preModifierGateProfile: qualityGateBase.qualityProfile,
+          },
           hardRejectApplied: true,
           hardRejectReason: hardReject.hardRejectReason,
           cooldownOverridden: false,
@@ -539,6 +690,11 @@ export function runStrategyDecisionPipeline(
       strongSpikeLifecycleMessages,
     };
   }
+
+  const qualityGate = applyUnstableSoftOverlayOnQualityGate(
+    qualityGateBase,
+    hardReject
+  );
 
   const activeStrong = strongSpikeManager.getActive();
   if (
@@ -580,10 +736,11 @@ export function runStrategyDecisionPipeline(
     );
     if (strongDecision.action === "promote") {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
             action: "enter_immediate",
             direction: strongDecision.direction,
@@ -611,10 +768,11 @@ export function runStrategyDecisionPipeline(
       };
     }
     return {
-      decision: withNormalizedReasons({
+      decision: nrm({
         tick,
         simulation,
         tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+        pipelineQualityGate: qualityGate,
         decision: {
           action: "none",
           direction: null,
@@ -623,6 +781,11 @@ export function runStrategyDecisionPipeline(
           qualityGatePassed: false,
           qualityGateReasons: [`confirmation_${postMoveClassification}`],
           qualityProfile: "weak",
+          pipelineQualityModifier: {
+            effectiveQualityProfile: "weak",
+            reason: `strong_spike_confirmation_${strongDecision.reason}`,
+            preModifierGateProfile: qualityGate.qualityProfile,
+          },
           hardRejectApplied: false,
           hardRejectReason: null,
           cooldownOverridden: false,
@@ -651,10 +814,11 @@ export function runStrategyDecisionPipeline(
     }
     if (!qualityGate.qualityGatePassed) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
             action: "none",
             direction: null,
@@ -691,10 +855,11 @@ export function runStrategyDecisionPipeline(
         ...strongSpikeManager.createFromTick(now, tick).map((ev) => ev.message)
       );
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
             action: "none",
             direction: null,
@@ -718,10 +883,11 @@ export function runStrategyDecisionPipeline(
     }
     if (!Number.isFinite(tick.sides.upSidePrice) || !Number.isFinite(tick.sides.downSidePrice)) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "none",
           direction: null,
@@ -769,10 +935,11 @@ export function runStrategyDecisionPipeline(
         )}]`
       );
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
             action: "none",
             direction: null,
@@ -781,6 +948,11 @@ export function runStrategyDecisionPipeline(
             qualityGatePassed: qualityGate.qualityGatePassed,
             qualityGateReasons: qualityGate.qualityGateReasons,
             qualityProfile: qualityGate.qualityProfile,
+            pipelineQualityModifier: {
+              effectiveQualityProfile: qualityGate.qualityProfile,
+              reason: `post_gate_quote_filter:${pricingBlocker}`,
+              preModifierGateProfile: qualityGate.qualityProfile,
+            },
             hardRejectApplied: false,
             hardRejectReason: null,
             cooldownOverridden: false,
@@ -809,10 +981,11 @@ export function runStrategyDecisionPipeline(
       });
     if (!canOpenNewPosition && !exceptionalCooldownOverride) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "none",
           direction: null,
@@ -849,10 +1022,11 @@ export function runStrategyDecisionPipeline(
       qualityGate.qualityProfile !== "exceptional"
     ) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "none",
           direction: null,
@@ -878,10 +1052,11 @@ export function runStrategyDecisionPipeline(
     }
     if (tick.entry.direction !== null && tick.entry.shouldEnter) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "enter_immediate",
           direction: tick.entry.direction,
@@ -950,10 +1125,11 @@ export function runStrategyDecisionPipeline(
     if (watchDecision.action === "promote") {
       if (!qualityGate.qualityGatePassed) {
         return {
-          decision: withNormalizedReasons({
+          decision: nrm({
             tick,
             simulation,
             tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+            pipelineQualityGate: qualityGate,
             decision: {
               action: "cancel_borderline_candidate",
               direction: null,
@@ -981,10 +1157,11 @@ export function runStrategyDecisionPipeline(
         };
       }
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "promote_borderline_candidate",
           direction: watchDecision.direction,
@@ -1010,10 +1187,11 @@ export function runStrategyDecisionPipeline(
     }
     if (watchDecision.action === "cancel") {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "cancel_borderline_candidate",
           direction: null,
@@ -1036,10 +1214,11 @@ export function runStrategyDecisionPipeline(
     }
     if (watchDecision.action === "expire") {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
           tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "expire_borderline_candidate",
           direction: null,
@@ -1064,7 +1243,13 @@ export function runStrategyDecisionPipeline(
       const d = lifecycleToDecision(applied);
       if (d !== null) {
         return {
-          decision: withNormalizedReasons({ decision: d, tick, simulation, tradableSpikeMinPercent: config.tradableSpikeMinPercent }),
+          decision: nrm({
+            decision: d,
+            tick,
+            simulation,
+            tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+            pipelineQualityGate: qualityGate,
+          }),
           borderlineLifecycleEvents: renderEvents,
           strongSpikeLifecycleMessages,
         };
@@ -1080,9 +1265,11 @@ export function runStrategyDecisionPipeline(
   ) {
     if (simulation.canOpenNewPosition(now, config.entryCooldownMs)) {
       return {
-        decision: withNormalizedReasons({
+        decision: nrm({
           tick,
           simulation,
+          tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
           decision: {
           action: "enter_immediate",
           direction: tick.entry.direction,
@@ -1105,10 +1292,11 @@ export function runStrategyDecisionPipeline(
       };
     }
     return {
-      decision: withNormalizedReasons({
+      decision: nrm({
         tick,
         simulation,
         tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+        pipelineQualityGate: qualityGate,
         decision: {
         action: "none",
         direction: null,
@@ -1133,11 +1321,12 @@ export function runStrategyDecisionPipeline(
 
   if (lifecycleDecision !== null) {
     return {
-      decision: withNormalizedReasons({
+      decision: nrm({
         decision: lifecycleDecision,
         tick,
         simulation,
         tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+        pipelineQualityGate: qualityGate,
       }),
       entryForSimulation: tick.entry,
       borderlineLifecycleEvents: renderEvents,
@@ -1146,10 +1335,11 @@ export function runStrategyDecisionPipeline(
   }
 
   return {
-    decision: withNormalizedReasons({
+    decision: nrm({
       tick,
       simulation,
       tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+      pipelineQualityGate: qualityGate,
       decision: {
       action: "none",
       direction: null,
@@ -1195,10 +1385,14 @@ export function formatStrategyDecisionLog(decision: StrategyDecision): string {
     decision.hardRejectApplied === true
       ? ` | HARD_REJECT=${decision.hardRejectReason ?? "hard_reject_unstable_pre_spike_context"}`
       : "";
+  const unstableCtx =
+    decision.unstablePreSpikeContextDetected === true
+      ? ` | unstableCtx=${decision.unstableContextHandling ?? "?"}`
+      : "";
   const qGateExtra =
     decision.qualityGateReasons && decision.qualityGateReasons.length > 0
       ? ` | qgate=${decision.qualityGateReasons.join("+")}`
       : "";
-  return `[strategy] action=${decision.action}${id} | dir=${dir} | cls=${decision.movementClassification} | gate=${qGate}/${qProfile}${hardReject}${override}${qGateExtra} | spike=${decision.spikeDetected} | fast=${decision.fastPathUsed} | range=${decision.stableRangeQuality}${blocker} | ${decision.reason}${extra}`;
+  return `[strategy] action=${decision.action}${id} | dir=${dir} | cls=${decision.movementClassification} | gate=${qGate}/${qProfile}${hardReject}${unstableCtx}${override}${qGateExtra} | spike=${decision.spikeDetected} | fast=${decision.fastPathUsed} | range=${decision.stableRangeQuality}${blocker} | ${decision.reason}${extra}`;
 }
 

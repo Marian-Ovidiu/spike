@@ -26,6 +26,7 @@ import {
   logReportCounterConsistency,
   MonitorRuntimeStats,
 } from "./monitorRuntimeStats.js";
+import { computeStrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulatedTrade } from "./simulationEngine.js";
 import { SimulationEngine } from "./simulationEngine.js";
@@ -129,6 +130,11 @@ function gracefulShutdown(): void {
   if (statsTimer !== undefined) clearInterval(statsTimer);
   if (tickTimer !== undefined) clearInterval(tickTimer);
 
+  const gateFunnel = computeStrongSpikeGateFunnel({
+    opportunities: ctx.opportunityTracker.getOpportunities(),
+    borderlineCandidatesCreated: runtimeStats.borderlineCandidatesCreated,
+    tradesExecuted: runtimeStats.tradesExecuted,
+  });
   printShutdownReport(
     monitorStartedAtMs,
     {
@@ -154,6 +160,8 @@ function gracefulShutdown(): void {
       qualityExceptional: runtimeStats.qualityExceptional,
       topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
       verdict: borderlineImpactVerdict(),
+      gateFunnel,
+      testMode: config.testMode,
     }
   );
   for (const line of buildInterpretationLines()) {
@@ -168,7 +176,8 @@ function gracefulShutdown(): void {
     evaluateSession({
       opportunities: ctx.opportunityTracker.getOpportunities(),
       trades: simulation.getTradeHistory(),
-    })
+    }),
+    { testMode: config.testMode }
   );
 
   const endedAt = Date.now();
@@ -237,6 +246,11 @@ function gracefulShutdown(): void {
           qualityExceptional: runtimeStats.qualityExceptional,
           topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
           interpretation: buildInterpretationLines(),
+          gateFunnel,
+          testMode: config.testMode,
+          ...(config.testMode
+            ? { testModeLabel: "TEST MODE ACTIVE" as const }
+            : {}),
         },
       })
     );
@@ -302,7 +316,8 @@ function onPaperTradeClosed(trade: SimulatedTrade): void {
         borderlineWinRate: runtimeStats.borderlineWinRate,
         borderlinePnL: runtimeStats.borderlinePnL,
       },
-      simulation
+      simulation,
+      config.testMode
     );
   }
 }
@@ -381,6 +396,10 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
           ctx.config.borderlineContinuationThreshold,
         borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
         borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
+        allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+        allowWeakQualityOnlyForStrongSpikes:
+          ctx.config.allowWeakQualityOnlyForStrongSpikes,
+        unstableContextMode: ctx.config.unstableContextMode,
       },
     });
     for (const msg of pipeline.strongSpikeLifecycleMessages ?? []) {
@@ -422,6 +441,10 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       borderlineContinuationThreshold: ctx.config.borderlineContinuationThreshold,
       borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
       borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
+      allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+      allowWeakQualityOnlyForStrongSpikes:
+        ctx.config.allowWeakQualityOnlyForStrongSpikes,
+      unstableContextMode: ctx.config.unstableContextMode,
     },
   });
   for (const ev of pipeline.borderlineLifecycleEvents) {
@@ -447,7 +470,9 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       msg.includes("promoted") ||
       msg.includes("cancelled") ||
       msg.includes("classification=") ||
-      msg.includes("exceptional spike override activated")
+      msg.includes("exceptional spike override activated") ||
+      msg.includes("[quality-gate]") ||
+      msg.includes("[unstable-context]")
     ) {
       console.log(msg);
     }
@@ -479,6 +504,9 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
     now,
     entry: entryForSimulation,
     entryPath,
+    ...(pipeline.decision.qualityProfile !== undefined
+      ? { entryQualityProfile: pipeline.decision.qualityProfile }
+      : {}),
     sides: tick.sides,
     config: {
       exitPrice: ctx.config.exitPrice,
@@ -486,6 +514,11 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
       stakePerTrade: ctx.config.stakePerTrade,
+      allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+      weakQualitySizeMultiplier: ctx.config.weakQualitySizeMultiplier,
+      strongQualitySizeMultiplier: ctx.config.strongQualitySizeMultiplier,
+      exceptionalQualitySizeMultiplier:
+        ctx.config.exceptionalQualitySizeMultiplier,
     },
   });
 
@@ -518,6 +551,10 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
     entry: entryForSimulation,
     tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
     maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
+    exceptionalSpikeMinPercent: ctx.config.exceptionalSpikePercent,
+    allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
+    allowWeakQualityOnlyForStrongSpikes:
+      ctx.config.allowWeakQualityOnlyForStrongSpikes,
     decision: pipeline.decision,
   });
   if (recorded !== null) {
@@ -562,6 +599,7 @@ function startLiveMonitor(ctx: BotContext): void {
     neutralQuoteBandMax: config.neutralQuoteBandMax,
     persistPath: `${persistence.getOutputDir()} (JSONL + session-summary on exit)`,
     debugMode: debugMonitor,
+    testMode: config.testMode,
   });
 
   statsTimer = setInterval(() => {
@@ -609,10 +647,11 @@ function startLiveMonitor(ctx: BotContext): void {
         borderlineWinRate: runtimeStats.borderlineWinRate,
         borderlinePnL: runtimeStats.borderlinePnL,
       },
-      ctx.simulation
+      ctx.simulation,
+      config.testMode
     );
     console.log(
-      `[quality] weak=${runtimeStats.qualityWeak} strong=${runtimeStats.qualityStrong} exceptional=${runtimeStats.qualityExceptional} | top-rejections ${formatTopRejectionReasons()}`
+      `${config.testMode ? "[TEST MODE] " : ""}[quality] weak=${runtimeStats.qualityWeak} strong=${runtimeStats.qualityStrong} exceptional=${runtimeStats.qualityExceptional} | top-rejections ${formatTopRejectionReasons()}`
     );
   }, 5 * 60 * 1000);
   void runMonitorTick(ctx);

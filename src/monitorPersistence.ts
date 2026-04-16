@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { StrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
 import type { Opportunity } from "./opportunityTracker.js";
 import type { SimulationPerformanceStats } from "./simulationEngine.js";
 import {
@@ -37,6 +38,10 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
     movementThresholdRatio: o.movementThresholdRatio,
     tradableSpikeMinPercent: o.tradableSpikeMinPercent,
     qualityProfile: o.qualityProfile,
+    qualityGateDiagnostics: o.qualityGateDiagnostics,
+    ...(o.pipelineQualityModifier !== undefined
+      ? { pipelineQualityModifier: o.pipelineQualityModifier }
+      : {}),
     cooldownOverridden: o.cooldownOverridden ?? false,
     overrideReason: o.overrideReason ?? null,
     opportunityType: o.opportunityType,
@@ -66,7 +71,6 @@ export function tradeToJsonlRecord(t: SimulatedTrade): Record<string, unknown> {
     openedAtMs: t.openedAt,
     closedAtMs: t.closedAt,
     holdDurationMs: t.closedAt - t.openedAt,
-    riskAtEntry: t.riskAtEntry,
   };
 }
 
@@ -130,6 +134,11 @@ export function buildMonitorSessionSummary(input: {
     qualityExceptional?: number;
     topRejectionReasons?: Array<{ reason: string; count: number }>;
     interpretation: string[];
+    gateFunnel?: StrongSpikeGateFunnel;
+    /** True when TEST_MODE=1 — session is diagnostic, not production baseline. */
+    testMode?: boolean;
+    /** Fixed label for UIs/logs when testMode is true. */
+    testModeLabel?: "TEST MODE ACTIVE";
   };
 }): MonitorSessionSummary {
   const opportunitiesFound =
@@ -244,6 +253,9 @@ export type MonitorSessionSummary = {
     qualityExceptional?: number;
     topRejectionReasons?: Array<{ reason: string; count: number }>;
     interpretation: string[];
+    gateFunnel?: StrongSpikeGateFunnel;
+    testMode?: boolean;
+    testModeLabel?: "TEST MODE ACTIVE";
   };
 };
 

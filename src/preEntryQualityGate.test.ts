@@ -89,6 +89,33 @@ describe("evaluatePreEntryQualityGate", () => {
     expect(out.qualityGatePassed).toBe(false);
     expect(out.qualityProfile).toBe("weak");
     expect(out.qualityGateReasons).toContain("pre_spike_range_poor_quality");
+    expect(out.diagnostics.profileAfterSpikeSizeTier).toBe("weak");
+  });
+
+  it("diagnostics show downgrade chain when strong tier hits poor pre-spike range", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "poor",
+        movement: {
+          strongestMovePercent: 0.002,
+          strongestMoveAbsolute: 200,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 2.0,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      })
+    );
+    expect(out.diagnostics.profileAfterSpikeSizeTier).toBe("strong");
+    expect(out.qualityProfile).toBe("weak");
+    expect(
+      out.diagnostics.downgradeChain.some(
+        (s) => s.reasonCode === "pre_spike_range_poor_quality"
+      )
+    ).toBe(true);
   });
 
   it("keeps exceptional profile when poor range is overridden", () => {
@@ -134,6 +161,108 @@ describe("evaluatePreEntryQualityGate", () => {
     );
     expect(out.qualityGatePassed).toBe(true);
     expect(out.qualityProfile).toBe("exceptional");
+  });
+
+  it("with default options adds disabled reason for weak profile (same as env OFF)", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "good",
+        movement: {
+          strongestMovePercent: 0.0014,
+          strongestMoveAbsolute: 140,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 1.4,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      })
+    );
+    expect(out.qualityProfile).toBe("weak");
+    expect(out.qualityGatePassed).toBe(false);
+    expect(out.qualityGateReasons).toContain("weak_quality_entries_disabled_by_config");
+  });
+
+  it("allows weak strong_spike through gate when ALLOW_WEAK flags on (testing)", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "poor",
+        priorRangePercent: 0.0004,
+        movement: {
+          strongestMovePercent: 0.002,
+          strongestMoveAbsolute: 200,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 2,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      }),
+      {
+        allowWeakQualityEntries: true,
+        allowWeakQualityOnlyForStrongSpikes: true,
+      }
+    );
+    expect(out.qualityProfile).toBe("weak");
+    expect(out.qualityGatePassed).toBe(true);
+    expect(out.qualityGateReasons).toContain("weak_quality_entry_allowed_by_config");
+  });
+
+  it("does not allow weak bypass when prior range too wide even if ALLOW_WEAK on", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "good",
+        priorRangePercent: 0.002,
+        movement: {
+          strongestMovePercent: 0.002,
+          strongestMoveAbsolute: 200,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 2,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      }),
+      {
+        allowWeakQualityEntries: true,
+        maxPriorRangeForNormalEntry: 0.0015,
+      }
+    );
+    expect(out.qualityProfile).toBe("weak");
+    expect(out.qualityGatePassed).toBe(false);
+    expect(out.qualityGateReasons).toContain("weak_quality_blocked_prior_or_unstable_context");
+  });
+
+  it("blocks weak borderline when only strong spikes may use weak bypass", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "borderline",
+        spikeDetected: false,
+        stableRangeQuality: "good",
+        movement: {
+          strongestMovePercent: 0.0014,
+          strongestMoveAbsolute: 140,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 1.4,
+          classification: "borderline",
+          sourceWindowLabel: "tick-1",
+        },
+      }),
+      {
+        allowWeakQualityEntries: true,
+        allowWeakQualityOnlyForStrongSpikes: true,
+      }
+    );
+    expect(out.qualityProfile).toBe("weak");
+    expect(out.qualityGatePassed).toBe(false);
+    expect(out.qualityGateReasons).toContain("weak_quality_borderline_blocked_by_config");
   });
 
   it("fails strict gate when priorRangePercent exceeds maxPriorRangeForNormalEntry", () => {

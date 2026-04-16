@@ -199,6 +199,12 @@ export function runBacktestReplay(
     includeStrictComparison = true,
   } = options;
 
+  if (config.testMode) {
+    console.log(
+      "TEST MODE ACTIVE — backtest uses diagnostic preset (not production baseline)"
+    );
+  }
+
   const simulation = new SimulationEngine({
     silent: true,
     initialEquity: config.initialCapital,
@@ -329,6 +335,10 @@ export function runBacktestReplay(
         borderlineContinuationThreshold: config.borderlineContinuationThreshold,
         borderlineReversionThreshold: config.borderlineReversionThreshold,
         borderlinePauseBandPercent: config.borderlinePauseBandPercent,
+        allowWeakQualityEntries: config.allowWeakQualityEntries,
+        allowWeakQualityOnlyForStrongSpikes:
+          config.allowWeakQualityOnlyForStrongSpikes,
+        unstableContextMode: config.unstableContextMode,
       },
     });
     const normalizedReasons = pipeline.decision.reasons ?? [];
@@ -406,6 +416,9 @@ export function runBacktestReplay(
       now,
       entry: entryForSimulation,
       entryPath,
+      ...(pipeline.decision.qualityProfile !== undefined
+        ? { entryQualityProfile: pipeline.decision.qualityProfile }
+        : {}),
       sides,
       config: {
         exitPrice: config.exitPrice,
@@ -413,6 +426,11 @@ export function runBacktestReplay(
         exitTimeoutMs: config.exitTimeoutMs,
         entryCooldownMs: config.entryCooldownMs,
         stakePerTrade: config.stakePerTrade,
+        allowWeakQualityEntries: config.allowWeakQualityEntries,
+        weakQualitySizeMultiplier: config.weakQualitySizeMultiplier,
+        strongQualitySizeMultiplier: config.strongQualitySizeMultiplier,
+        exceptionalQualitySizeMultiplier:
+          config.exceptionalQualitySizeMultiplier,
       },
     });
   }

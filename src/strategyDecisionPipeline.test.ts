@@ -61,6 +61,9 @@ const pipelineConfig = {
   borderlineContinuationThreshold: 0.25,
   borderlineReversionThreshold: 0.2,
   borderlinePauseBandPercent: 0.00015,
+  allowWeakQualityEntries: false,
+  allowWeakQualityOnlyForStrongSpikes: true,
+  unstableContextMode: "hard" as const,
 } as const;
 
 describe("strategyDecisionPipeline", () => {
@@ -1028,6 +1031,10 @@ describe("strategyDecisionPipeline", () => {
         exitTimeoutMs: 60_000,
         entryCooldownMs: 120_000,
         stakePerTrade: 5,
+        allowWeakQualityEntries: false,
+        weakQualitySizeMultiplier: 0.5,
+        strongQualitySizeMultiplier: 1,
+        exceptionalQualitySizeMultiplier: 1,
       },
     });
 
@@ -1547,6 +1554,134 @@ describe("strategyDecisionPipeline", () => {
     });
     expect(result.decision.action).toBe("none");
     expect(result.decision.reason).toBe("market_quotes_too_neutral");
+  });
+
+  it("unstable pre-spike context: hard mode keeps immediate hard reject", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      stableRangeDetected: false,
+      priorRangePercent: 0.01,
+      stableRangeQuality: "acceptable",
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const t = readyTick(entry);
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: t,
+      manager,
+      simulation: sim,
+      config: { ...pipelineConfig, unstableContextMode: "hard" },
+    });
+    expect(result.decision.hardRejectApplied).toBe(true);
+    expect(result.decision.reason).toBe("hard_reject_unstable_pre_spike_context");
+    expect(result.decision.unstableContextHandling).toBe("hard_reject");
+    expect(
+      result.strongSpikeLifecycleMessages?.some((m) =>
+        m.includes("hard_reject applied")
+      )
+    ).toBe(true);
+  });
+
+  it("unstable pre-spike context: soft mode defers hard reject and surfaces handling", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      stableRangeDetected: false,
+      priorRangePercent: 0.01,
+      stableRangeQuality: "acceptable",
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const t = readyTick(entry);
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: t,
+      manager,
+      simulation: sim,
+      config: { ...pipelineConfig, unstableContextMode: "soft" },
+    });
+    expect(result.decision.hardRejectApplied).toBe(false);
+    expect(result.decision.unstableContextHandling).toBe("soft_deferred");
+    expect(
+      result.strongSpikeLifecycleMessages?.some((m) =>
+        m.includes("downgraded to soft handling")
+      )
+    ).toBe(true);
+    expect(
+      result.decision.qualityGateReasons?.includes(
+        "unstable_pre_spike_context_soft_handling"
+      )
+    ).toBe(true);
   });
 });
 

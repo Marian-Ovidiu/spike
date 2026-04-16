@@ -1,5 +1,7 @@
 import type { AppConfig } from "./config.js";
 import type { EntryDirection, EntryEvaluation } from "./entryConditions.js";
+import type { QualityProfile } from "./preEntryQualityGate.js";
+import { resolveQualityStakeMultiplier } from "./stakeSizing.js";
 import { evaluateExitConditions } from "./exitConditions.js";
 import type { ExitReason } from "./exitConditions.js";
 export type SimulatedTrade = {
@@ -17,8 +19,13 @@ export type SimulatedTrade = {
   equityBefore: number;
   /** Account equity immediately after this trade’s P/L is applied. */
   equityAfter: number;
-  /** Unused in fixed-stake model; kept for persisted session shape. */
+  /** Deployed notional at entry (same as stake in fixed-stake model). */
   riskAtEntry: number;
+  /** Config base stake before quality multiplier (if sizing applied). */
+  baseStakePerTrade?: number;
+  /** Effective multiplier from {@link resolveQualityStakeMultiplier}. */
+  qualityStakeMultiplier?: number;
+  entryQualityProfile?: QualityProfile;
   exitReason: ExitReason;
   /** Which strategy path opened this trade. */
   entryPath: "strong_spike_immediate" | "borderline_delayed";
@@ -34,6 +41,9 @@ type OpenSimPosition = {
   stopLoss: number;
   entryPath: "strong_spike_immediate" | "borderline_delayed";
   openedAt: number;
+  baseStakePerTrade: number;
+  qualityStakeMultiplier: number;
+  entryQualityProfile?: QualityProfile;
 };
 
 export type SimulationTickInput = {
@@ -41,6 +51,8 @@ export type SimulationTickInput = {
   entry: EntryEvaluation;
   /** Optional source tagging for attribution stats. */
   entryPath?: "strong_spike_immediate" | "borderline_delayed";
+  /** From strategy decision / gate; drives stake multiplier when enabled. */
+  entryQualityProfile?: QualityProfile;
   sides: { upSidePrice: number; downSidePrice: number };
   /** Exit, stop, sizing, cooldown. */
   config: Pick<
@@ -50,6 +62,10 @@ export type SimulationTickInput = {
     | "exitTimeoutMs"
     | "entryCooldownMs"
     | "stakePerTrade"
+    | "allowWeakQualityEntries"
+    | "weakQualitySizeMultiplier"
+    | "strongQualitySizeMultiplier"
+    | "exceptionalQualitySizeMultiplier"
   >;
 };
 
@@ -86,6 +102,10 @@ export type TransparentTradeLog = {
   /** Strategy path that opened the trade. */
   reasonEntry: SimulatedTrade["entryPath"];
   reasonExit: ExitReason;
+  baseStakePerTrade?: number;
+  qualityStakeMultiplier?: number;
+  entryQualityProfile?: QualityProfile;
+  riskAtEntry?: number;
 };
 
 export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog {
@@ -102,6 +122,16 @@ export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog
     equityAfter: t.equityAfter,
     reasonEntry: t.entryPath,
     reasonExit: t.exitReason,
+    ...(t.baseStakePerTrade !== undefined
+      ? { baseStakePerTrade: t.baseStakePerTrade }
+      : {}),
+    ...(t.qualityStakeMultiplier !== undefined
+      ? { qualityStakeMultiplier: t.qualityStakeMultiplier }
+      : {}),
+    ...(t.entryQualityProfile !== undefined
+      ? { entryQualityProfile: t.entryQualityProfile }
+      : {}),
+    ...(t.riskAtEntry !== undefined ? { riskAtEntry: t.riskAtEntry } : {}),
   };
 }
 
@@ -230,10 +260,17 @@ export class SimulationEngine {
         return;
       }
 
-      const stake = config.stakePerTrade;
+      const baseStake = config.stakePerTrade;
+      const qualityMult = resolveQualityStakeMultiplier(
+        input.entryQualityProfile,
+        config
+      );
+      const stake = baseStake * qualityMult;
       if (!(stake > 0)) {
         if (!this.silent) {
-          console.log(`[SIM] Skip entry: stakePerTrade must be > 0`);
+          console.log(
+            `[SIM] Skip entry: effective stake must be > 0 (base=${baseStake.toFixed(2)} mult=${qualityMult.toFixed(4)})`
+          );
         }
         return;
       }
@@ -248,10 +285,16 @@ export class SimulationEngine {
         stopLoss: config.stopLoss,
         entryPath: input.entryPath ?? "strong_spike_immediate",
         openedAt: now,
+        baseStakePerTrade: baseStake,
+        qualityStakeMultiplier: qualityMult,
+        ...(input.entryQualityProfile !== undefined
+          ? { entryQualityProfile: input.entryQualityProfile }
+          : {}),
       };
       if (!this.silent) {
+        const prof = input.entryQualityProfile ?? "—";
         console.log(
-          `[SIM] Open ${entry.direction} | stake=${stake.toFixed(2)} shares=${shares.toFixed(4)} @ ${fill.toFixed(4)}`
+          `[SIM] Open ${entry.direction} | sizing base=${baseStake.toFixed(2)} profile=${prof} mult=${qualityMult.toFixed(4)} → stake=${stake.toFixed(2)} riskAtEntry=${stake.toFixed(2)} shares=${shares.toFixed(6)} @ ${fill.toFixed(4)}`
         );
       }
     }
@@ -264,14 +307,23 @@ export class SimulationEngine {
   ): void {
     if (!this.position) return;
 
-    const { direction, stake, shares, entryPrice, entryPath, openedAt } =
-      this.position;
+    const {
+      direction,
+      stake,
+      shares,
+      entryPrice,
+      entryPath,
+      openedAt,
+      baseStakePerTrade,
+      qualityStakeMultiplier,
+      entryQualityProfile,
+    } = this.position;
     this.position = null;
 
     const equityBefore = this.equity;
     const profitLoss = shares * (exitPrice - entryPrice);
     const equityAfter = equityBefore + profitLoss;
-    const riskAtEntry = 0;
+    const riskAtEntry = stake;
 
     this.equity = equityAfter;
 
@@ -286,6 +338,11 @@ export class SimulationEngine {
       equityBefore,
       equityAfter,
       riskAtEntry,
+      baseStakePerTrade,
+      qualityStakeMultiplier,
+      ...(entryQualityProfile !== undefined
+        ? { entryQualityProfile }
+        : {}),
       exitReason,
       entryPath,
       openedAt,

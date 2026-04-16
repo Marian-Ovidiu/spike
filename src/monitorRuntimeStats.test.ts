@@ -406,4 +406,36 @@ describe("monitorConsole periodic / shutdown", () => {
     expect(combined).toContain("final report");
     log.mockRestore();
   });
+
+  it("printShutdownReport labels TEST MODE when extended.testMode", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 1000 });
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    printShutdownReport(
+      Date.now() - 1000,
+      {
+        ticksObserved: 1,
+        spikeEventsDetected: 1,
+        candidateOpportunities: 1,
+        validOpportunities: 0,
+        rejectedOpportunities: 1,
+        tradesExecuted: 0,
+      },
+      sim.getPerformanceStats(),
+      {
+        strongSpikeWinRate: 0,
+        delayedBorderlineWinRate: 0,
+        averageStrongSpikePnL: 0,
+        averageBorderlinePnL: 0,
+        borderlinePnL: 0,
+        borderlineNetImpact: "flat",
+        borderlinePromotions: 0,
+        borderlineSignals: 0,
+        verdict: "neutral",
+        testMode: true,
+      }
+    );
+    const combined = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(combined).toContain("TEST MODE ACTIVE");
+    log.mockRestore();
+  });
 });

@@ -216,8 +216,14 @@ function fmtPf(pf: number | null): string {
 /**
  * Human-readable session interpretation (stdout).
  */
-export function printSessionEvaluationReport(evaluation: SessionEvaluation): void {
+export function printSessionEvaluationReport(
+  evaluation: SessionEvaluation,
+  options?: { testMode?: boolean }
+): void {
   const e = evaluation;
+  if (options?.testMode === true) {
+    console.log("TEST MODE ACTIVE — session evaluation is diagnostic (not production baseline)");
+  }
   const conv =
     e.opportunityToTradeConversion !== null && e.rawOpportunityCount > 0
       ? `${(e.opportunityToTradeConversion * 100).toFixed(1)}%  (${e.totalTrades} trades / ${e.rawOpportunityCount} opportunities)`

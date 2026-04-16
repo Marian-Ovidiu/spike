@@ -121,6 +121,22 @@ export function normalizeEntryReasons(
   return dedupeAndOrder(reasons);
 }
 
+/**
+ * Normalize raw rejection strings (e.g. from {@link Opportunity.entryRejectionReasons})
+ * using the same mapping as decision/entry normalization.
+ */
+export function normalizeOpportunityRejectionReasons(input: {
+  rawReasons: readonly string[];
+  movementClassification: EntryEvaluation["movementClassification"];
+}): NormalizedRejectionReason[] {
+  const reasons: NormalizedRejectionReason[] = [];
+  for (const r of input.rawReasons) {
+    const n = normalizeRawReason(r, input.movementClassification);
+    if (n !== null) reasons.push(n);
+  }
+  return dedupeAndOrder(reasons);
+}
+
 export function normalizeDecisionRejectionReasons(input: {
   decision: StrategyDecision;
   entry?: Pick<EntryEvaluation, "movementClassification" | "reasons">;

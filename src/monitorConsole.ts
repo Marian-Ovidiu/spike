@@ -17,6 +17,16 @@ import {
   REJECTION_REASON_MESSAGES,
   type NormalizedRejectionReason,
 } from "./decisionReasonBuilder.js";
+import {
+  formatGateFunnelSection,
+  type StrongSpikeGateFunnel,
+} from "./monitorFunnelDiagnostics.js";
+import type { QualityGateDiagnostics } from "./preEntryQualityGate.js";
+
+function formatQualityGateDiagSummary(d: QualityGateDiagnostics): string {
+  const dd = d.downgradeChain.map((s) => s.reasonCode).join(" → ");
+  return `size_tier=${d.profileAfterSpikeSizeTier} final=${d.finalProfile} gate_passed=${d.qualityGatePassed} downgrades=${dd || "—"} weak_hints=${d.weakPrimaryReasons.join(",")}`;
+}
 
 /** Fixed label width for boxed rows (label + two spaces before value). */
 const LW = 14;
@@ -250,6 +260,19 @@ function opportunityDetailRows(o: Opportunity): string[] {
     row("YES / NO", `${fmtPrice(o.upSidePrice)} / ${fmtPrice(o.downSidePrice)}`),
     row("Stable prior", o.stableRangeDetected ? "yes" : "no"),
     row("Ctx spike", o.spikeDetected ? "yes" : "no"),
+    ...(o.qualityGateDiagnostics
+      ? [
+          row("Quality gate", formatQualityGateDiagSummary(o.qualityGateDiagnostics)),
+        ]
+      : []),
+    ...(o.pipelineQualityModifier
+      ? [
+          row(
+            "Pipeline note",
+            `${o.pipelineQualityModifier.reason} (profile ${o.pipelineQualityModifier.preModifierGateProfile ?? "?"} → effective ${o.pipelineQualityModifier.effectiveQualityProfile})`,
+          ),
+        ]
+      : []),
   ];
 }
 
@@ -427,10 +450,15 @@ export function printLiveMonitorBanner(params: {
   neutralQuoteBandMax: number;
   persistPath: string;
   debugMode?: boolean;
+  /** When true, prints an explicit diagnostic banner (TEST_MODE=1). */
+  testMode?: boolean;
 }): void {
   const L = 13;
   console.log("");
   console.log("════════ Live monitor (observation + paper sim) ══════════════");
+  if (params.testMode === true) {
+    console.log(`${"Mode".padEnd(L)} TEST MODE ACTIVE — diagnostic preset (not production)`);
+  }
   console.log(`${"Quotes".padEnd(L)} ${params.quotesDetail}`);
   console.log(`${"Tick".padEnd(L)} every ${params.tickIntervalSec}s`);
   console.log(
@@ -515,7 +543,8 @@ export function printPeriodicRuntimeSummary(
     borderlineWinRate?: number;
     borderlinePnL?: number;
   },
-  sim: SimulationEngine
+  sim: SimulationEngine,
+  testMode?: boolean
 ): void {
   const perf = sim.getPerformanceStats();
   const bestWorst = bestWorstTradeSummary(sim);
@@ -523,6 +552,9 @@ export function printPeriodicRuntimeSummary(
   const totalPl = formatPnl(perf.totalProfit);
   const avgPl = formatPnl(perf.averageProfitPerTrade);
   console.log("");
+  if (testMode === true) {
+    console.log("TEST MODE ACTIVE — diagnostic stats (not production baseline)");
+  }
   console.log(`── ${headline} ──`);
   console.log(
     `${"Session".padEnd(10)} ticks ${counters.ticksObserved}  │  BTC fail ${counters.btcFetchFailures}  │  spikes ${counters.spikeEventsDetected}  │  cand ${counters.candidateOpportunities}  │  valid ${counters.validOpportunities}  │  trades ${counters.tradesExecuted ?? "—"}  │  rej ${counters.rejectedOpportunities}`
@@ -614,6 +646,9 @@ export function printShutdownReport(
     qualityExceptional?: number;
     topRejectionReasons?: Array<{ reason: string; count: number }>;
     verdict: "helpful" | "neutral" | "harmful";
+    gateFunnel?: StrongSpikeGateFunnel;
+    /** When true, every shutdown report line is clearly marked as diagnostic. */
+    testMode?: boolean;
   }
 ): void {
   const durationMs = Math.max(0, Date.now() - startedAtMs);
@@ -622,6 +657,9 @@ export function printShutdownReport(
   const oppFound = counters.validOpportunities + counters.rejectedOpportunities;
   console.log("");
   console.log("════════ Live monitor — final report (shutdown) ══════════════");
+  if (extended?.testMode === true) {
+    console.log(`${"!!".padEnd(14)} TEST MODE ACTIVE — diagnostic run (not production)`);
+  }
   console.log(`${"Runtime".padEnd(14)} ${formatDurationMs(durationMs)}`);
   console.log(`${"Ticks".padEnd(14)} ${counters.ticksObserved}`);
   console.log(
@@ -673,6 +711,11 @@ export function printShutdownReport(
       }
     }
     console.log(`${"Border verdict".padEnd(14)} ${extended.verdict.toUpperCase()}`);
+    if (extended.gateFunnel !== undefined) {
+      for (const ln of formatGateFunnelSection(extended.gateFunnel)) {
+        console.log(ln);
+      }
+    }
   }
   console.log("══════════════════════════════════════════════════════════════");
   console.log("");

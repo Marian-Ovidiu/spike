@@ -137,6 +137,10 @@ describe("SimulationEngine.onTradeClosed", () => {
       exitTimeoutMs: 90_000,
       entryCooldownMs: 0,
       stakePerTrade: 5,
+      allowWeakQualityEntries: false,
+      weakQualitySizeMultiplier: 0.5,
+      strongQualitySizeMultiplier: 1,
+      exceptionalQualitySizeMultiplier: 1,
     };
     const sim = new SimulationEngine({
       silent: true,
@@ -217,6 +221,10 @@ describe("SimulationEngine.onTradeClosed", () => {
       exitTimeoutMs: 90_000,
       entryCooldownMs: 0,
       stakePerTrade: 5,
+      allowWeakQualityEntries: false,
+      weakQualitySizeMultiplier: 0.5,
+      strongQualitySizeMultiplier: 1,
+      exceptionalQualitySizeMultiplier: 1,
     };
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     const entryBase = {
@@ -278,5 +286,82 @@ describe("SimulationEngine.onTradeClosed", () => {
     expect(trades[0]!.stake).toBe(5);
     expect(trades[0]!.shares).toBeCloseTo(5 / 0.48, 10);
     expect(trades[0]!.profitLoss).toBeCloseTo((5 / 0.48) * (0.52 - 0.48), 6);
+  });
+
+  it("halves stake when weak quality and allow-weak sizing is enabled", () => {
+    const tickConfig = {
+      exitPrice: 0.52,
+      stopLoss: 0.1,
+      exitTimeoutMs: 90_000,
+      entryCooldownMs: 0,
+      stakePerTrade: 10,
+      allowWeakQualityEntries: true,
+      weakQualitySizeMultiplier: 0.5,
+      strongQualitySizeMultiplier: 1,
+      exceptionalQualitySizeMultiplier: 1,
+    };
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const entryBase = {
+      shouldEnter: true,
+      direction: "UP" as const,
+      reasons: [] as string[],
+      stableRangeDetected: true,
+      priorRangePercent: 0.1,
+      stableRangeQuality: "good" as const,
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike" as const,
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.01,
+        strongestMoveAbsolute: 0.2,
+        strongestMoveDirection: "UP" as const,
+        thresholdPercent: 0.005,
+        thresholdRatio: 2,
+        classification: "strong_spike" as const,
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: undefined,
+    };
+    sim.onTick({
+      now: 1_000,
+      entry: entryBase,
+      entryQualityProfile: "weak",
+      sides: { upSidePrice: 0.48, downSidePrice: 0.52 },
+      config: tickConfig,
+    });
+    expect(sim.getOpenPosition()?.stake).toBe(5);
+    expect(sim.getOpenPosition()?.shares).toBeCloseTo(5 / 0.48, 10);
+    sim.onTick({
+      now: 2_000,
+      entry: {
+        shouldEnter: false,
+        direction: null,
+        reasons: ["market_not_stable"],
+        stableRangeDetected: false,
+        priorRangePercent: 1.2,
+        stableRangeQuality: "poor",
+        rangeDecisionNote: "test",
+        movementClassification: "no_signal",
+        spikeDetected: false,
+        movement: {
+          strongestMovePercent: 0,
+          strongestMoveAbsolute: 0,
+          strongestMoveDirection: null,
+          thresholdPercent: 0.005,
+          thresholdRatio: 0,
+          classification: "no_signal",
+          sourceWindowLabel: null,
+        },
+        windowSpike: undefined,
+      },
+      sides: { upSidePrice: 0.52, downSidePrice: 0.48 },
+      config: tickConfig,
+    });
+    const trades = sim.getTradeHistory();
+    expect(trades[0]!.stake).toBe(5);
+    expect(trades[0]!.baseStakePerTrade).toBe(10);
+    expect(trades[0]!.qualityStakeMultiplier).toBe(0.5);
+    expect(trades[0]!.entryQualityProfile).toBe("weak");
+    expect(trades[0]!.riskAtEntry).toBe(5);
   });
 });

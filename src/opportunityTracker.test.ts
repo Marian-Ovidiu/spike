@@ -225,6 +225,11 @@ describe("OpportunityTracker", () => {
         exitTimeoutMs: cfg.exitTimeoutMs,
         entryCooldownMs: 120_000,
         stakePerTrade: cfg.stakePerTrade,
+        allowWeakQualityEntries: cfg.allowWeakQualityEntries,
+        weakQualitySizeMultiplier: cfg.weakQualitySizeMultiplier,
+        strongQualitySizeMultiplier: cfg.strongQualitySizeMultiplier,
+        exceptionalQualitySizeMultiplier:
+          cfg.exceptionalQualitySizeMultiplier,
       },
     });
     const pipeline = runStrategyDecisionPipeline({
@@ -263,6 +268,10 @@ describe("OpportunityTracker", () => {
         borderlineContinuationThreshold: cfg.borderlineContinuationThreshold,
         borderlineReversionThreshold: cfg.borderlineReversionThreshold,
         borderlinePauseBandPercent: cfg.borderlinePauseBandPercent,
+        allowWeakQualityEntries: cfg.allowWeakQualityEntries,
+        allowWeakQualityOnlyForStrongSpikes:
+          cfg.allowWeakQualityOnlyForStrongSpikes,
+        unstableContextMode: cfg.unstableContextMode,
       },
     });
     const o = tracker.recordFromReadyTick({
