@@ -63,6 +63,16 @@ export class BinanceSpotFeed {
   private lastError: string | null = null;
   private closedByUser = false;
 
+  /** Count of bookTicker payloads applied (bid/ask updated). */
+  private bookTickerUpdates = 0;
+  /** Last mid after a book update (for debug / flat-feed warning). */
+  private lastMidAfterBook: number | null = null;
+  /** Consecutive book updates with unchanged mid (8 dp). */
+  private unchangedMidStreak = 0;
+  private warnedFlatMid = false;
+  /** Previous book mid (full precision) for debug delta line. */
+  private previousBookMid: number | null = null;
+
   constructor(options?: {
     symbol?: string;
     /** default: bookTicker + aggTrade for last price */
@@ -71,6 +81,16 @@ export class BinanceSpotFeed {
     const sym = (options?.symbol ?? process.env.BINANCE_SYMBOL ?? "BTCUSDT").trim().toUpperCase();
     this.symbolLower = sym.toLowerCase();
     this.streams = options?.streams ?? [`${this.symbolLower}@bookTicker`, `${this.symbolLower}@aggTrade`];
+  }
+
+  /** @internal tests */
+  _applyBookTickerPayloadForTest(payload: Record<string, unknown>): void {
+    this.applyBookTickerPayload(payload);
+  }
+
+  /** @internal tests */
+  _applyAggTradePayloadForTest(payload: Record<string, unknown>): void {
+    this.applyAggTradePayload(payload);
   }
 
   getSymbol(): string {
@@ -193,26 +213,34 @@ export class BinanceSpotFeed {
           stream?: string;
           data?: Record<string, unknown>;
         };
-        const payload = raw.data ?? (raw as unknown as Record<string, unknown>);
-        const ev = (payload["e"] as string | undefined) ?? "";
-        if (ev === "bookTicker") {
-          const bid = Number(payload["b"]);
-          const ask = Number(payload["a"]);
-          if (Number.isFinite(bid) && Number.isFinite(ask) && ask >= bid) {
-            this.bestBid = bid;
-            this.bestAsk = ask;
-            this.bestBidQty = Number(payload["B"] ?? 0);
-            this.bestAskQty = Number(payload["A"] ?? 0);
-            const et = Number(payload["E"]);
-            this.lastEventTimeMs = Number.isFinite(et) ? et : Date.now();
-          }
-        } else if (ev === "aggTrade") {
-          const p = Number(payload["p"]);
-          if (Number.isFinite(p)) {
-            this.lastTradePrice = p;
-            const et = Number(payload["E"]);
-            if (Number.isFinite(et)) this.lastEventTimeMs = et;
-          }
+        const streamName = typeof raw.stream === "string" ? raw.stream : "";
+        const payload = (raw.data ?? raw) as Record<string, unknown>;
+        const ev = payload["e"] as string | undefined;
+
+        // aggTrade first — has e === "aggTrade"
+        if (ev === "aggTrade") {
+          this.applyAggTradePayload(payload);
+          return;
+        }
+
+        /**
+         * Binance `<symbol>@bookTicker` payloads do NOT include event type `e`
+         * (only u, s, b, B, a, A). Combined streams wrap as { stream, data }.
+         * @see https://binance-docs.github.io/apidocs/spot/en/#individual-symbol-book-ticker-streams
+         */
+        const fromBookTickerStream = streamName.includes("@bookTicker");
+        const bookTickerByEvent = ev === "bookTicker";
+        const bRaw = payload["b"];
+        const aRaw = payload["a"];
+        const bookTickerShape =
+          bRaw != null &&
+          aRaw != null &&
+          !Array.isArray(bRaw) &&
+          !Array.isArray(aRaw) &&
+          ev !== "depthUpdate";
+
+        if (fromBookTickerStream || bookTickerByEvent || bookTickerShape) {
+          this.applyBookTickerPayload(payload);
         }
       } catch {
         /* ignore malformed */
@@ -228,6 +256,78 @@ export class BinanceSpotFeed {
     this.ws.on("error", (err: Error) => {
       this.lastError = err.message;
     });
+  }
+
+  private applyAggTradePayload(payload: Record<string, unknown>): void {
+    const p = Number(payload["p"]);
+    if (Number.isFinite(p)) {
+      this.lastTradePrice = p;
+      const et = Number(payload["E"]);
+      if (Number.isFinite(et)) this.lastEventTimeMs = et;
+    }
+  }
+
+  private applyBookTickerPayload(payload: Record<string, unknown>): void {
+    const bid = Number(payload["b"]);
+    const ask = Number(payload["a"]);
+    if (!Number.isFinite(bid) || !Number.isFinite(ask) || ask < bid) {
+      return;
+    }
+    this.bestBid = bid;
+    this.bestAsk = ask;
+    this.bestBidQty = Number(payload["B"] ?? 0);
+    this.bestAskQty = Number(payload["A"] ?? 0);
+    const et = Number(payload["E"]);
+    this.lastEventTimeMs = Number.isFinite(et) ? et : Date.now();
+
+    this.bookTickerUpdates += 1;
+    const mid = (bid + ask) / 2;
+    const midKey = Math.round(mid * 1e8) / 1e8;
+    const deltaVsPrevBook =
+      this.previousBookMid !== null && Number.isFinite(this.previousBookMid)
+        ? mid - this.previousBookMid
+        : null;
+    this.previousBookMid = mid;
+
+    if (this.lastMidAfterBook !== null && midKey === this.lastMidAfterBook) {
+      this.unchangedMidStreak += 1;
+    } else {
+      this.unchangedMidStreak = 0;
+      this.warnedFlatMid = false;
+    }
+    this.lastMidAfterBook = midKey;
+
+    this.maybeDebugLogBook(bid, ask, mid, deltaVsPrevBook);
+    this.maybeWarnFlatMid();
+  }
+
+  private maybeDebugLogBook(
+    bid: number,
+    ask: number,
+    mid: number,
+    deltaVsPrevBook: number | null
+  ): void {
+    const every = Number.parseInt(process.env.BINANCE_FEED_DEBUG_LOG_EVERY_N ?? "", 10);
+    if (!Number.isFinite(every) || every <= 0) return;
+    if (this.bookTickerUpdates % every !== 0) return;
+    const deltaStr =
+      deltaVsPrevBook !== null ? ` deltaVsPrevBook=${deltaVsPrevBook.toFixed(8)}` : "";
+    console.log(
+      `[binance-feed] bookTicker#${this.bookTickerUpdates} bid=${bid} ask=${ask} mid=${mid}${deltaStr} wsMsgsTotal=${this.messagesTotal}`
+    );
+  }
+
+  private maybeWarnFlatMid(): void {
+    const threshold = Number.parseInt(
+      process.env.BINANCE_FEED_WARN_UNCHANGED_MID_AFTER ?? "5000",
+      10
+    );
+    if (!Number.isFinite(threshold) || threshold <= 0) return;
+    if (this.unchangedMidStreak < threshold || this.warnedFlatMid) return;
+    this.warnedFlatMid = true;
+    console.warn(
+      `[binance-feed] mid unchanged for ${this.unchangedMidStreak} consecutive bookTicker updates (bid/ask may be static). lastMid=${this.lastMidAfterBook}`
+    );
   }
 
   private scheduleReconnect(): void {
