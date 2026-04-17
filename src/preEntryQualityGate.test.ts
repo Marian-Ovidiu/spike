@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { EntryEvaluation } from "./entryConditions.js";
-import { evaluatePreEntryQualityGate } from "./preEntryQualityGate.js";
+import {
+  ACCEPTABLE_QUALITY_STRONG_SPIKE_GATE_REASON,
+  evaluatePreEntryQualityGate,
+} from "./preEntryQualityGate.js";
 
 function makeEntry(overrides: Partial<EntryEvaluation>): EntryEvaluation {
   return {
@@ -8,7 +11,7 @@ function makeEntry(overrides: Partial<EntryEvaluation>): EntryEvaluation {
     direction: null,
     reasons: [],
     stableRangeDetected: true,
-    priorRangePercent: 0.0004,
+    priorRangeFraction: 0.0004,
     stableRangeQuality: "good",
     rangeDecisionNote: "test",
     movementClassification: "no_signal",
@@ -191,7 +194,7 @@ describe("evaluatePreEntryQualityGate", () => {
         movementClassification: "strong_spike",
         spikeDetected: true,
         stableRangeQuality: "poor",
-        priorRangePercent: 0.0004,
+        priorRangeFraction: 0.0004,
         movement: {
           strongestMovePercent: 0.002,
           strongestMoveAbsolute: 200,
@@ -218,7 +221,7 @@ describe("evaluatePreEntryQualityGate", () => {
         movementClassification: "strong_spike",
         spikeDetected: true,
         stableRangeQuality: "good",
-        priorRangePercent: 0.002,
+        priorRangeFraction: 0.002,
         movement: {
           strongestMovePercent: 0.002,
           strongestMoveAbsolute: 200,
@@ -265,12 +268,12 @@ describe("evaluatePreEntryQualityGate", () => {
     expect(out.qualityGateReasons).toContain("weak_quality_borderline_blocked_by_config");
   });
 
-  it("fails strict gate when priorRangePercent exceeds maxPriorRangeForNormalEntry", () => {
+  it("fails strict gate when priorRangeFraction exceeds maxPriorRangeForNormalEntry", () => {
     const out = evaluatePreEntryQualityGate(
       makeEntry({
         movementClassification: "strong_spike",
         spikeDetected: true,
-        priorRangePercent: 0.0016,
+        priorRangeFraction: 0.0016,
         movement: {
           strongestMovePercent: 0.0020,
           strongestMoveAbsolute: 200,
@@ -286,6 +289,93 @@ describe("evaluatePreEntryQualityGate", () => {
     expect(out.qualityGatePassed).toBe(false);
     expect(out.qualityProfile).toBe("weak");
     expect(out.qualityGateReasons).toContain(
+      "prior_range_too_wide_for_mean_reversion"
+    );
+  });
+
+  it("does not pass acceptable capped strong_spike when allow flag is false", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "acceptable",
+        priorRangeFraction: 0.0004,
+        movement: {
+          strongestMovePercent: 0.0016,
+          strongestMoveAbsolute: 160,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 1.6,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      }),
+      { allowAcceptableQualityStrongSpikes: false }
+    );
+    expect(out.qualityProfile).toBe("acceptable");
+    expect(out.qualityGatePassed).toBe(false);
+    expect(out.diagnostics.acceptableStrongSpikePolicy?.overrideApplied).toBe(
+      false
+    );
+  });
+
+  it("passes acceptable capped strong_spike when allow flag is true", () => {
+    const out = evaluatePreEntryQualityGate(
+      makeEntry({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        stableRangeQuality: "acceptable",
+        priorRangeFraction: 0.0004,
+        movement: {
+          strongestMovePercent: 0.0016,
+          strongestMoveAbsolute: 160,
+          strongestMoveDirection: "UP",
+          thresholdPercent: 0.001,
+          thresholdRatio: 1.6,
+          classification: "strong_spike",
+          sourceWindowLabel: "tick-1",
+        },
+      }),
+      { allowAcceptableQualityStrongSpikes: true }
+    );
+    expect(out.qualityProfile).toBe("acceptable");
+    expect(out.qualityGatePassed).toBe(true);
+    expect(out.qualityGateReasons).toContain(
+      ACCEPTABLE_QUALITY_STRONG_SPIKE_GATE_REASON
+    );
+    expect(out.diagnostics.acceptableStrongSpikePolicy?.overrideApplied).toBe(
+      true
+    );
+  });
+
+  it("maxPriorRangeForNormalEntry as fraction 0.02 allows prior 0.019 and blocks 0.021", () => {
+    const base = makeEntry({
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.002,
+        strongestMoveAbsolute: 200,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+    });
+    const under = evaluatePreEntryQualityGate(
+      { ...base, priorRangeFraction: 0.019 },
+      { maxPriorRangeForNormalEntry: 0.02 }
+    );
+    expect(under.qualityGatePassed).toBe(true);
+    expect(under.qualityGateReasons).not.toContain(
+      "prior_range_too_wide_for_mean_reversion"
+    );
+    const over = evaluatePreEntryQualityGate(
+      { ...base, priorRangeFraction: 0.021 },
+      { maxPriorRangeForNormalEntry: 0.02 }
+    );
+    expect(over.qualityGatePassed).toBe(false);
+    expect(over.qualityGateReasons).toContain(
       "prior_range_too_wide_for_mean_reversion"
     );
   });

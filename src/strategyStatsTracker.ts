@@ -159,7 +159,11 @@ export class StrategyStatsTracker {
       }
       if (reasons.has("entry_cooldown_active")) this.blockedByCooldown += 1;
       if (reasons.has("active_position_open")) this.blockedByActivePosition += 1;
-      if (reasons.has("invalid_market_prices") || reasons.has("missing_quote_data")) {
+      if (
+        reasons.has("invalid_market_prices") ||
+        reasons.has("missing_quote_data") ||
+        reasons.has("spread_too_wide")
+      ) {
         this.blockedByInvalidQuotes += 1;
       }
       if (reasons.has("pre_spike_range_too_noisy")) this.blockedByNoisyRange += 1;

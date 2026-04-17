@@ -27,6 +27,7 @@ function makeReadyTick(
       windowSpike: undefined,
       ...overrides,
     },
+    quoteFeed: { quoteSource: "env" },
   };
 }
 
@@ -52,6 +53,7 @@ function makeReadyTickWithHistory(
       windowSpike: undefined,
       ...overrides,
     },
+    quoteFeed: { quoteSource: "env" },
   };
 }
 

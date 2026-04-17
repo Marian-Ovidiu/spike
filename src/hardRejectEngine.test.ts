@@ -14,7 +14,7 @@ function baseEntry(over: Partial<EntryEvaluation>): EntryEvaluation {
     movementClassification: "strong_spike",
     spikeDetected: true,
     stableRangeDetected: false,
-    priorRangePercent: 0.01,
+    priorRangeFraction: 0.01,
     stableRangeQuality: "acceptable",
     rangeDecisionNote: "t",
     windowSpike: undefined,
@@ -47,7 +47,7 @@ const stubGate: PreEntryQualityGateResult = {
       strongestMovePercent: 0.002,
       spikePercent: 0.2,
       thresholdRatio: 2,
-      priorRangePercent: 0.01,
+      priorRangeFraction: 0.01,
       stableRangeDetected: false,
       stableRangeQuality: "acceptable",
       entryReasonCodes: [],
@@ -72,7 +72,7 @@ describe("evaluateHardRejectContext", () => {
     expect(r.hardRejectReason).toBe("hard_reject_unstable_pre_spike_context");
     expect(r.unstablePreSpikeContextDetected).toBe(true);
     expect(r.unstableContextHandling).toBe("hard_reject");
-    expect(r.unstablePreSpikeContextMetrics?.priorRangePercent).toBe(0.01);
+    expect(r.unstablePreSpikeContextMetrics?.priorRangeFraction).toBe(0.01);
   });
 
   it("soft mode: defers hard reject but records detection", () => {

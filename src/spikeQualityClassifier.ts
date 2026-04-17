@@ -12,6 +12,7 @@ export function classifySpikeQuality(
     maxPriorRangeForNormalEntry?: number;
     allowWeakQualityEntries?: boolean;
     allowWeakQualityOnlyForStrongSpikes?: boolean;
+    allowAcceptableQualityStrongSpikes?: boolean;
   }
 ): PreEntryQualityGateResult {
   return evaluatePreEntryQualityGate(entry, options);

@@ -2,13 +2,17 @@ import { detectStableRangePriorToLast } from "./strategy.js";
 
 export type StableRangeQuality = "good" | "acceptable" | "poor";
 
+/**
+ * Prior-window (max−min)/min as a **fraction** (e.g. 0.0016 = 0.16% relative range).
+ * Used for all threshold comparisons; multiply by 100 only for display.
+ */
 export type StableRangeAssessment = {
   stableRangeDetected: boolean;
-  priorRangePercent: number;
+  priorRangeFraction: number;
   stableRangeQuality: StableRangeQuality;
 };
 
-function priorRangeFraction(prices: readonly number[]): number {
+function computePriorRangeFraction(prices: readonly number[]): number {
   const priorWindow = prices.slice(0, -1);
   if (priorWindow.length < 2) return 0;
   const max = Math.max(...priorWindow);
@@ -31,7 +35,7 @@ export function assessStableRangeQuality(input: {
   stableRangeSoftToleranceRatio: number;
   goodClearBelowRatio?: number;
 }): StableRangeAssessment {
-  const priorFraction = priorRangeFraction(input.prices);
+  const priorFraction = computePriorRangeFraction(input.prices);
   const stable = detectStableRangePriorToLast(input.prices, input.rangeThreshold);
   const clearBelowRatio = input.goodClearBelowRatio ?? 0.8;
   const goodCap = input.rangeThreshold * Math.max(0, clearBelowRatio);
@@ -47,7 +51,7 @@ export function assessStableRangeQuality(input: {
 
   return {
     stableRangeDetected: stable,
-    priorRangePercent: Number.isFinite(priorFraction) ? priorFraction * 100 : 0,
+    priorRangeFraction: Number.isFinite(priorFraction) ? priorFraction : 0,
     stableRangeQuality: quality,
   };
 }

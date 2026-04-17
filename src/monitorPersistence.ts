@@ -3,11 +3,13 @@ import { join } from "node:path";
 
 import type { StrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
 import type { Opportunity } from "./opportunityTracker.js";
+import type { HoldExitAuditSummary } from "./holdExitAudit.js";
 import type { SimulationPerformanceStats } from "./simulationEngine.js";
 import {
   buildTransparentTradeLog,
   type SimulatedTrade,
 } from "./simulationEngine.js";
+import type { BinanceFeedHealth } from "./adapters/binanceSpotFeed.js";
 
 const DEFAULT_OUTPUT_DIR = "output/monitor";
 
@@ -28,9 +30,11 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
     spikePercent: o.spikePercent,
     spikeSource: o.spikeSource,
     spikeReferencePrice: o.spikeReferencePrice,
-    priorRangePercent: o.priorRangePercent,
-    upSidePrice: o.upSidePrice,
-    downSidePrice: o.downSidePrice,
+    priorRangeFraction: o.priorRangeFraction,
+    bestBid: o.bestBid,
+    bestAsk: o.bestAsk,
+    midPrice: o.midPrice,
+    spreadBps: o.spreadBps,
     stableRangeDetected: o.stableRangeDetected,
     stableRangeQuality: o.stableRangeQuality,
     spikeDetected: o.spikeDetected,
@@ -65,6 +69,7 @@ export function tradeToJsonlRecord(t: SimulatedTrade): Record<string, unknown> {
   const closedAtIso = new Date(t.closedAt).toISOString();
   return {
     ...buildTransparentTradeLog(t),
+    ...(t.holdExitAudit !== undefined ? { holdExitAudit: t.holdExitAudit } : {}),
     openedAt: new Date(t.openedAt).toISOString(),
     /** Same instant as `timestamp` (exit time). */
     closedAt: closedAtIso,
@@ -139,6 +144,14 @@ export function buildMonitorSessionSummary(input: {
     testMode?: boolean;
     /** Fixed label for UIs/logs when testMode is true. */
     testModeLabel?: "TEST MODE ACTIVE";
+    /** Aggregated EXIT_PRICE / STOP_LOSS realism vs observed marks (closed trades). */
+    exitThresholdAudit?: HoldExitAuditSummary | null;
+    /** Binance WebSocket health snapshot (live monitor shutdown). */
+    binanceFeedDiagnostics?: {
+      symbol: string;
+      health: BinanceFeedHealth;
+      lastMessageAgeMs: number;
+    };
   };
 }): MonitorSessionSummary {
   const opportunitiesFound =
@@ -256,6 +269,12 @@ export type MonitorSessionSummary = {
     gateFunnel?: StrongSpikeGateFunnel;
     testMode?: boolean;
     testModeLabel?: "TEST MODE ACTIVE";
+    exitThresholdAudit?: HoldExitAuditSummary | null;
+    binanceFeedDiagnostics?: {
+      symbol: string;
+      health: BinanceFeedHealth;
+      lastMessageAgeMs: number;
+    };
   };
 };
 

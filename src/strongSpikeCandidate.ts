@@ -5,7 +5,7 @@ import {
   analyzePostSpikeConfirmation,
   type PostSpikeMoveClassification,
 } from "./postSpikeConfirmationEngine.js";
-import { evaluateQuoteQuality } from "./quoteQualityFilter.js";
+import { evaluateSpotBookPipeline } from "./spotSpreadFilter.js";
 export type StrongSpikePostMoveClassification = PostSpikeMoveClassification;
 
 export type StrongSpikeCandidateStatus = "watching" | "promoted" | "cancelled" | "expired";
@@ -222,10 +222,7 @@ export function evaluateStrongSpikeWatchDecision(input: {
   tick: Extract<StrategyTickResult, { kind: "ready" }>;
   config: Pick<
     AppConfig,
-    | "entryPrice"
-    | "maxOppositeSideEntryPrice"
-    | "neutralQuoteBandMin"
-    | "neutralQuoteBandMax"
+    | "maxEntrySpreadBps"
     | "borderlineContinuationThreshold"
     | "borderlineReversionThreshold"
     | "borderlinePauseBandPercent"
@@ -242,12 +239,19 @@ export function evaluateStrongSpikeWatchDecision(input: {
   const pauseBandPercent = Number.isFinite(input.config.borderlinePauseBandPercent)
     ? Math.max(0, input.config.borderlinePauseBandPercent)
     : 0.00015;
-  if (
-    !Number.isFinite(input.tick.sides.upSidePrice) ||
-    !Number.isFinite(input.tick.sides.downSidePrice)
-  ) {
+  const bookGate = evaluateSpotBookPipeline(
+    input.tick.sides,
+    input.config.maxEntrySpreadBps
+  );
+  if (bookGate === "invalid_book") {
     return {
       decision: { action: "cancel", reason: "invalid_market_prices" },
+      postMoveClassification: "noisy_unclear",
+    };
+  }
+  if (bookGate === "spread_too_wide") {
+    return {
+      decision: { action: "cancel", reason: "spread_too_wide" },
       postMoveClassification: "noisy_unclear",
     };
   }
@@ -279,27 +283,6 @@ export function evaluateStrongSpikeWatchDecision(input: {
       postMoveClassification,
     };
   }
-  const quoteBlocker = evaluateQuoteQuality({
-    upSidePrice: input.tick.sides.upSidePrice,
-    downSidePrice: input.tick.sides.downSidePrice,
-    direction: input.candidate.suggestedContrarianDirection,
-    entryPrice: input.config.entryPrice,
-    maxOppositeSideEntryPrice: input.config.maxOppositeSideEntryPrice,
-    neutralQuoteBandMin: input.config.neutralQuoteBandMin,
-    neutralQuoteBandMax: input.config.neutralQuoteBandMax,
-  });
-  if (quoteBlocker === "market_quotes_too_neutral") {
-    return {
-      decision: { action: "cancel", reason: "market_quotes_too_neutral" },
-      postMoveClassification,
-    };
-  }
-  if (quoteBlocker === "opposite_side_price_too_high") {
-    return {
-      decision: { action: "cancel", reason: "opposite_side_too_expensive" },
-      postMoveClassification,
-    };
-  }
   if (input.cooldownBlocked) {
     return {
       decision: { action: "cancel", reason: "cooldown_blocked" },
@@ -325,7 +308,7 @@ export function buildPromotedStrongSpikeEntryEvaluation(
     direction: candidate.suggestedContrarianDirection,
     reasons: [],
     stableRangeDetected: baseEntry.stableRangeDetected,
-    priorRangePercent: baseEntry.priorRangePercent,
+    priorRangeFraction: baseEntry.priorRangeFraction,
     stableRangeQuality: baseEntry.stableRangeQuality,
     rangeDecisionNote: baseEntry.rangeDecisionNote,
     movementClassification: "strong_spike",

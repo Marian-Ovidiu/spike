@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { buildSpikeDecisionTracePayload } from "./monitorConsole.js";
+import type { NormalizedRejectionReason } from "./rejectionReasons.js";
 
 describe("buildSpikeDecisionTracePayload", () => {
   const baseEntry = {
@@ -8,7 +9,7 @@ describe("buildSpikeDecisionTracePayload", () => {
     direction: "UP" as const,
     reasons: ["opposite_side_price_too_high"] as string[],
     stableRangeDetected: true,
-    priorRangePercent: 0.08,
+    priorRangeFraction: 0.0008,
     stableRangeQuality: "good" as const,
     rangeDecisionNote: "",
     movementClassification: "strong_spike" as const,
@@ -33,7 +34,7 @@ describe("buildSpikeDecisionTracePayload", () => {
     spikeDetected: true,
     fastPathUsed: false,
     reason: "blocked by test",
-    reasons: ["opposite_side_price_too_high"] as const,
+    reasons: ["opposite_side_price_too_high"] as NormalizedRejectionReason[],
   };
 
   it("maps fields and lists normalized rejection reasons when not entering", () => {

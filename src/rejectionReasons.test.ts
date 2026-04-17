@@ -110,5 +110,18 @@ describe("normalizeDecisionRejectionReasons", () => {
     });
     expect(reasons).toContain("strong_spike_continuation");
   });
+
+  it("maps quote_feed_stale critical blocker", () => {
+    const reasons = normalizeDecisionRejectionReasons({
+      decision: baseDecision({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        criticalBlockerUsed: "quote_feed_stale",
+        reason: "quote_feed_stale",
+      }),
+      entry: { movementClassification: "strong_spike", reasons: [] },
+    });
+    expect(reasons).toContain("quote_feed_stale");
+  });
 });
 

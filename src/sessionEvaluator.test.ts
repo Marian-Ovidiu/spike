@@ -16,7 +16,7 @@ function opp(
     currentPrice: 100_000 + spikePct * 1000,
     spikeDirection: "UP",
     spikePercent: spikePct,
-    priorRangePercent: 0.05,
+    priorRangeFraction: 0.05,
     upSidePrice: 0.3,
     downSidePrice: 0.25,
     stableRangeDetected: true,

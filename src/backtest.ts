@@ -12,7 +12,11 @@ import {
   type SimulatedTrade,
   SimulationEngine,
 } from "./simulationEngine.js";
-import { runStrategyDecisionPipeline } from "./strategyDecisionPipeline.js";
+import {
+  entryEvaluationForPipelinePaperExecution,
+  runStrategyDecisionPipeline,
+} from "./strategyDecisionPipeline.js";
+import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
 
 export type BacktestOptions = {
   config: AppConfig;
@@ -20,8 +24,11 @@ export type BacktestOptions = {
   tickMs?: number;
   /** Epoch ms for first tick (only relative deltas matter for exit timeout). */
   epochStartMs?: number;
-  /** Static binary leg quotes on every step (paper book). */
-  sides?: { upSidePrice: number; downSidePrice: number };
+  /**
+   * Synthetic bid/ask spread (bps) around each step's BTC mid for paper book.
+   * Default: 3 bps (tight book).
+   */
+  syntheticSpreadBps?: number;
   /** Include strict-vs-relaxed comparison (default: true). */
   includeStrictComparison?: boolean;
 };
@@ -119,8 +126,6 @@ export type BacktestResult = {
   };
 };
 
-const DEFAULT_SIDES = { upSidePrice: 0.2, downSidePrice: 0.2 };
-
 /**
  * Parse a CSV or one-column text file into BTC prices (oldest → newest).
  * Supports: one number per line, or CSV with a header containing `price`, `close`, or `btc`.
@@ -195,7 +200,7 @@ export function runBacktestReplay(
     config,
     tickMs = BOT_TICK_INTERVAL_MS,
     epochStartMs = 0,
-    sides = DEFAULT_SIDES,
+    syntheticSpreadBps = 3,
     includeStrictComparison = true,
   } = options;
 
@@ -265,6 +270,7 @@ export function runBacktestReplay(
     if (prev === undefined || last === undefined) continue;
 
     const prices = priceBuffer.getPrices();
+    const sides = syntheticSpotBookFromMid(btc, syntheticSpreadBps);
     const entry = evaluateEntryConditions({
       prices,
       rangeThreshold: config.rangeThreshold,
@@ -275,12 +281,11 @@ export function runBacktestReplay(
       spikeThreshold: config.spikeThreshold,
       spikeMinRangeMultiple: config.spikeMinRangeMultiple,
       borderlineMinRatio: config.borderlineMinRatio,
-      entryPrice: config.entryPrice,
-      maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: config.neutralQuoteBandMin,
-      neutralQuoteBandMax: config.neutralQuoteBandMax,
-      upSidePrice: sides.upSidePrice,
-      downSidePrice: sides.downSidePrice,
+      maxEntrySpreadBps: config.maxEntrySpreadBps,
+      bestBid: sides.bestBid,
+      bestAsk: sides.bestAsk,
+      midPrice: sides.midPrice,
+      spreadBps: sides.spreadBps,
     });
 
     if (entry.windowSpike?.classification === "strong_spike") {
@@ -296,7 +301,7 @@ export function runBacktestReplay(
       noSignalMoves += 1;
     }
 
-    const tick: StrategyTickResult = {
+    const tick: Extract<StrategyTickResult, { kind: "ready" }> = {
       kind: "ready",
       btc,
       n: prices.length,
@@ -306,6 +311,7 @@ export function runBacktestReplay(
       prices,
       sides,
       entry,
+      market: { book: sides, feedPossiblyStale: false },
     };
 
     const pipeline = runStrategyDecisionPipeline({
@@ -325,10 +331,7 @@ export function runBacktestReplay(
         strongSpikeConfirmationTicks: config.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: config.exceptionalSpikePercent,
         exceptionalSpikeOverridesCooldown: config.exceptionalSpikeOverridesCooldown,
-        entryPrice: config.entryPrice,
-        maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-        neutralQuoteBandMin: config.neutralQuoteBandMin,
-        neutralQuoteBandMax: config.neutralQuoteBandMax,
+        maxEntrySpreadBps: config.maxEntrySpreadBps,
         entryCooldownMs: config.entryCooldownMs,
         borderlineRequirePause: config.borderlineRequirePause,
         borderlineRequireNoContinuation: config.borderlineRequireNoContinuation,
@@ -338,6 +341,8 @@ export function runBacktestReplay(
         allowWeakQualityEntries: config.allowWeakQualityEntries,
         allowWeakQualityOnlyForStrongSpikes:
           config.allowWeakQualityOnlyForStrongSpikes,
+        allowAcceptableQualityStrongSpikes:
+          config.allowAcceptableQualityStrongSpikes,
         unstableContextMode: config.unstableContextMode,
       },
     });
@@ -407,6 +412,10 @@ export function runBacktestReplay(
     }
 
     const entryForSimulation = pipeline.entryForSimulation ?? entry;
+    const paperEntry = entryEvaluationForPipelinePaperExecution(
+      pipeline.decision,
+      entryForSimulation
+    );
     const entryPath =
       pipeline.decision.action === "promote_borderline_candidate"
         ? "borderline_delayed"
@@ -414,15 +423,18 @@ export function runBacktestReplay(
 
     simulation.onTick({
       now,
-      entry: entryForSimulation,
+      entry: paperEntry,
       entryPath,
       ...(pipeline.decision.qualityProfile !== undefined
         ? { entryQualityProfile: pipeline.decision.qualityProfile }
         : {}),
       sides,
+      symbol: "BTCUSDT",
       config: {
-        exitPrice: config.exitPrice,
-        stopLoss: config.stopLoss,
+        takeProfitBps: config.takeProfitBps,
+        stopLossBps: config.stopLossBps,
+        paperSlippageBps: config.paperSlippageBps,
+        paperFeeRoundTripBps: config.paperFeeRoundTripBps,
         exitTimeoutMs: config.exitTimeoutMs,
         entryCooldownMs: config.entryCooldownMs,
         stakePerTrade: config.stakePerTrade,
@@ -536,15 +548,13 @@ export function runBacktestReplay(
       hardRejectPriorRangePercent: Math.max(config.hardRejectPriorRangePercent, 0.01),
       strongSpikeConfirmationTicks: 0,
       exceptionalSpikeOverridesCooldown: false,
-      maxOppositeSideEntryPrice: Math.max(config.maxOppositeSideEntryPrice, 1),
-      neutralQuoteBandMin: 1,
-      neutralQuoteBandMax: 1,
+      maxEntrySpreadBps: Math.max(config.maxEntrySpreadBps, 500),
     };
     const baselineResult = runBacktestReplay(btcPrices, {
       config: baselineConfig,
       tickMs,
       epochStartMs,
-      sides,
+      syntheticSpreadBps,
       includeStrictComparison: false,
     });
     result.comparison = {
@@ -590,6 +600,8 @@ export async function runBacktestFromFile(
   };
   if (options?.tickMs !== undefined) replay.tickMs = options.tickMs;
   if (options?.epochStartMs !== undefined) replay.epochStartMs = options.epochStartMs;
-  if (options?.sides !== undefined) replay.sides = options.sides;
+  if (options?.syntheticSpreadBps !== undefined) {
+    replay.syntheticSpreadBps = options.syntheticSpreadBps;
+  }
   return runBacktestReplay(prices, replay);
 }

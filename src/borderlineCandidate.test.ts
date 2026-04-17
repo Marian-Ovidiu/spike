@@ -8,6 +8,7 @@ import {
   createBorderlineCandidate,
   evaluateBorderlineWatchDecision,
 } from "./borderlineCandidate.js";
+import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
 
 function readyTickWithClassification(
   classification: "no_signal" | "borderline" | "strong_spike",
@@ -47,7 +48,7 @@ function readyTickWithClassification(
       ],
     },
     stableRangeDetected: true,
-    priorRangePercent: 0.05,
+    priorRangeFraction: 0.05,
     stableRangeQuality: "good",
     rangeDecisionNote: "test",
     movementClassification: classification,
@@ -63,6 +64,7 @@ function readyTickWithClassification(
     },
   };
 
+  const sides = syntheticSpotBookFromMid(100_093, 5);
   return {
     kind: "ready",
     btc: 100_093,
@@ -71,8 +73,9 @@ function readyTickWithClassification(
     prev: 100_000,
     last: 100_093,
     prices: [100_000, 100_010, 100_020, 100_093],
-    sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
+    sides,
     entry,
+    market: { book: sides, feedPossiblyStale: false },
   };
 }
 
@@ -148,7 +151,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,
@@ -177,7 +180,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,
@@ -206,7 +209,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,
@@ -230,7 +233,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,
@@ -260,7 +263,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,
@@ -291,7 +294,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: false,
         borderlineContinuationThreshold: 0.95,
@@ -316,7 +319,7 @@ describe("borderlineCandidate", () => {
         rangeThreshold: 0.02,
         stableRangeSoftToleranceRatio: 1.5,
         spikeThreshold: 0.001,
-        entryPrice: 0.25,
+        maxEntrySpreadBps: 500,
         borderlineRequirePause: true,
         borderlineRequireNoContinuation: true,
         borderlineContinuationThreshold: 0.25,

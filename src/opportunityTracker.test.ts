@@ -1,9 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { config as defaultConfig } from "./config.js";
-import {
-  evaluateEntryConditions,
-} from "./entryConditions.js";
+import { evaluateEntryConditions } from "./entryConditions.js";
 import {
   buildOpportunityFromReadyTick,
   OpportunityTracker,
@@ -11,8 +9,38 @@ import {
 import { runStrategyDecisionPipeline } from "./strategyDecisionPipeline.js";
 import { BorderlineCandidateManager } from "./borderlineCandidate.js";
 import { SimulationEngine } from "./simulationEngine.js";
+import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
 
 const cfg = defaultConfig;
+
+function bookAtMid(mid: number) {
+  return syntheticSpotBookFromMid(mid, 5);
+}
+
+function entryAtMid(
+  prices: number[],
+  prev: number,
+  last: number,
+  midForBook = last
+) {
+  const b = bookAtMid(midForBook);
+  return evaluateEntryConditions({
+    prices,
+    rangeThreshold: cfg.rangeThreshold,
+    stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
+    strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
+    previousPrice: prev,
+    currentPrice: last,
+    spikeThreshold: cfg.spikeThreshold,
+    spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
+    borderlineMinRatio: cfg.borderlineMinRatio,
+    maxEntrySpreadBps: cfg.maxEntrySpreadBps,
+    bestBid: b.bestBid,
+    bestAsk: b.bestAsk,
+    midPrice: b.midPrice,
+    spreadBps: b.spreadBps,
+  });
+}
 
 function makeStableThenSpikePrices(
   flat: number,
@@ -30,30 +58,15 @@ describe("buildOpportunityFromReadyTick", () => {
     const prices = makeStableThenSpikePrices(100_000, 10, 100_010);
     const prev = 100_000;
     const last = 100_010;
-    const entry = evaluateEntryConditions({
-      prices,
-      rangeThreshold: cfg.rangeThreshold,
-      stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
-      previousPrice: prev,
-      currentPrice: last,
-      spikeThreshold: cfg.spikeThreshold,
-      spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
-      borderlineMinRatio: cfg.borderlineMinRatio,
-      entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
-      upSidePrice: 0.15,
-      downSidePrice: 0.15,
-    });
+    const entry = entryAtMid(prices, prev, last);
+    const sides = bookAtMid(last);
     const o = buildOpportunityFromReadyTick({
       timestamp: 0,
       btcPrice: last,
       prices,
       previousPrice: prev,
       currentPrice: last,
-      sides: { upSidePrice: 0.15, downSidePrice: 0.15 },
+      sides,
       entry,
       tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,
@@ -67,30 +80,15 @@ describe("buildOpportunityFromReadyTick", () => {
     prices.push(106_000);
     const prev = prices[prices.length - 2]!;
     const last = prices[prices.length - 1]!;
-    const entry = evaluateEntryConditions({
-      prices,
-      rangeThreshold: cfg.rangeThreshold,
-      stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
-      previousPrice: prev,
-      currentPrice: last,
-      spikeThreshold: cfg.spikeThreshold,
-      spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
-      borderlineMinRatio: cfg.borderlineMinRatio,
-      entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
-      upSidePrice: 0.15,
-      downSidePrice: 0.15,
-    });
+    const entry = entryAtMid(prices, prev, last);
+    const sides = bookAtMid(last);
     const o = buildOpportunityFromReadyTick({
       timestamp: 1,
       btcPrice: last,
       prices,
       previousPrice: prev,
       currentPrice: last,
-      sides: { upSidePrice: 0.15, downSidePrice: 0.15 },
+      sides,
       entry,
       tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,
@@ -102,34 +100,19 @@ describe("buildOpportunityFromReadyTick", () => {
     expect(o!.entryAllowed).toBe(true);
   });
 
-  it("records valid opportunity when gates pass and opposite leg is cheap", () => {
+  it("records valid opportunity when gates pass", () => {
     const prev = 100_000;
     const last = 100_700;
     const prices = makeStableThenSpikePrices(prev, 10, last);
-    const entry = evaluateEntryConditions({
-      prices,
-      rangeThreshold: cfg.rangeThreshold,
-      stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
-      previousPrice: prev,
-      currentPrice: last,
-      spikeThreshold: cfg.spikeThreshold,
-      spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
-      borderlineMinRatio: cfg.borderlineMinRatio,
-      entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
-      upSidePrice: 0.5,
-      downSidePrice: 0.18,
-    });
+    const entry = entryAtMid(prices, prev, last);
+    const sides = bookAtMid(last);
     const o = buildOpportunityFromReadyTick({
       timestamp: 2,
       btcPrice: last,
       prices,
       previousPrice: prev,
       currentPrice: last,
-      sides: { upSidePrice: 0.5, downSidePrice: 0.18 },
+      sides,
       entry,
       tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,
@@ -151,30 +134,15 @@ describe("OpportunityTracker", () => {
     const prev = 100_000;
     const last = 100_700;
     const prices = makeStableThenSpikePrices(prev, 10, last);
-    const entry = evaluateEntryConditions({
-      prices,
-      rangeThreshold: cfg.rangeThreshold,
-      stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
-      previousPrice: prev,
-      currentPrice: last,
-      spikeThreshold: cfg.spikeThreshold,
-      spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
-      borderlineMinRatio: cfg.borderlineMinRatio,
-      entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
-      upSidePrice: 0.5,
-      downSidePrice: 0.18,
-    });
+    const entry = entryAtMid(prices, prev, last);
+    const sides = bookAtMid(last);
     const o = tracker.recordFromReadyTick({
       timestamp: 0,
       btcPrice: last,
       prices,
       previousPrice: prev,
       currentPrice: last,
-      sides: { upSidePrice: 0.5, downSidePrice: 0.18 },
+      sides,
       entry,
       tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,
@@ -197,31 +165,19 @@ describe("OpportunityTracker", () => {
     const prev = 100_000;
     const last = 100_700;
     const prices = makeStableThenSpikePrices(prev, 10, last);
-    const entry = evaluateEntryConditions({
-      prices,
-      rangeThreshold: cfg.rangeThreshold,
-      stableRangeSoftToleranceRatio: cfg.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: cfg.strongSpikeHardRejectPoorRange,
-      previousPrice: prev,
-      currentPrice: last,
-      spikeThreshold: cfg.spikeThreshold,
-      spikeMinRangeMultiple: cfg.spikeMinRangeMultiple,
-      borderlineMinRatio: cfg.borderlineMinRatio,
-      entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
-      upSidePrice: 0.5,
-      downSidePrice: 0.18,
-    });
+    const entry = entryAtMid(prices, prev, last);
+    const sides = bookAtMid(last);
     sim.onTick({
       now: 1,
       entry,
       entryPath: "strong_spike_immediate",
-      sides: { upSidePrice: 0.5, downSidePrice: 0.18 },
+      sides,
+      symbol: "BTCUSDT",
       config: {
-        exitPrice: cfg.exitPrice,
-        stopLoss: cfg.stopLoss,
+        takeProfitBps: cfg.takeProfitBps,
+        stopLossBps: cfg.stopLossBps,
+        paperSlippageBps: cfg.paperSlippageBps,
+        paperFeeRoundTripBps: cfg.paperFeeRoundTripBps,
         exitTimeoutMs: cfg.exitTimeoutMs,
         entryCooldownMs: 120_000,
         stakePerTrade: cfg.stakePerTrade,
@@ -242,8 +198,9 @@ describe("OpportunityTracker", () => {
         prev,
         last,
         prices,
-        sides: { upSidePrice: 0.5, downSidePrice: 0.18 },
+        sides,
         entry,
+        market: { book: sides, feedPossiblyStale: false },
       },
       manager,
       simulation: sim,
@@ -258,10 +215,7 @@ describe("OpportunityTracker", () => {
         strongSpikeConfirmationTicks: cfg.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: cfg.exceptionalSpikePercent,
         exceptionalSpikeOverridesCooldown: cfg.exceptionalSpikeOverridesCooldown,
-        entryPrice: cfg.entryPrice,
-      maxOppositeSideEntryPrice: cfg.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: cfg.neutralQuoteBandMin,
-      neutralQuoteBandMax: cfg.neutralQuoteBandMax,
+        maxEntrySpreadBps: cfg.maxEntrySpreadBps,
         entryCooldownMs: cfg.entryCooldownMs,
         borderlineRequirePause: cfg.borderlineRequirePause,
         borderlineRequireNoContinuation: cfg.borderlineRequireNoContinuation,
@@ -271,6 +225,8 @@ describe("OpportunityTracker", () => {
         allowWeakQualityEntries: cfg.allowWeakQualityEntries,
         allowWeakQualityOnlyForStrongSpikes:
           cfg.allowWeakQualityOnlyForStrongSpikes,
+        allowAcceptableQualityStrongSpikes:
+          cfg.allowAcceptableQualityStrongSpikes,
         unstableContextMode: cfg.unstableContextMode,
       },
     });
@@ -280,7 +236,7 @@ describe("OpportunityTracker", () => {
       prices,
       previousPrice: prev,
       currentPrice: last,
-      sides: { upSidePrice: 0.5, downSidePrice: 0.18 },
+      sides,
       entry,
       tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
       maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,

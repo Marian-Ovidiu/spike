@@ -39,7 +39,7 @@ import {
   shouldOverrideCooldownForExceptional,
   shouldOverrideCooldownForExceptionalCandidate,
 } from "./overridePolicyEngine.js";
-import { evaluateQuoteQuality } from "./quoteQualityFilter.js";
+import { evaluateSpotBookPipeline } from "./spotSpreadFilter.js";
 
 export type StrategyAction =
   | "none"
@@ -91,6 +91,39 @@ export type StrategyDecisionPipelineResult = {
   strongSpikeLifecycleMessages?: string[];
 };
 
+/** Appended to {@link EntryEvaluation.reasons} when the pipeline blocks a raw `shouldEnter` tick. */
+export const PIPELINE_BLOCKED_ENTRY_REASON = "pipeline_blocked_entry";
+
+/**
+ * Paper execution must mirror the strategy pipeline: raw {@link EntryEvaluation}
+ * can still have `shouldEnter: true` while {@link StrategyDecision.action} is `none`
+ * (quality gate, confirmation watch, cooldown, quotes, etc.). The simulator only
+ * consumes this object — clear the entry flag unless the pipeline approved an open.
+ */
+export function entryEvaluationForPipelinePaperExecution(
+  decision: Pick<StrategyDecision, "action">,
+  entryForSimulation: EntryEvaluation
+): EntryEvaluation {
+  if (
+    decision.action === "enter_immediate" ||
+    decision.action === "promote_borderline_candidate"
+  ) {
+    return entryForSimulation;
+  }
+  if (!entryForSimulation.shouldEnter) {
+    return entryForSimulation;
+  }
+  const reasons = entryForSimulation.reasons.includes(PIPELINE_BLOCKED_ENTRY_REASON)
+    ? entryForSimulation.reasons
+    : [...entryForSimulation.reasons, PIPELINE_BLOCKED_ENTRY_REASON];
+  return {
+    ...entryForSimulation,
+    shouldEnter: false,
+    direction: null,
+    reasons,
+  };
+}
+
 function withNormalizedReasons(input: {
   decision: StrategyDecision;
   tick: StrategyTickResult;
@@ -129,7 +162,7 @@ function withNormalizedReasons(input: {
               strongestMovePercent: 0,
               spikePercent: 0,
               thresholdRatio: 0,
-              priorRangePercent: 0,
+              priorRangeFraction: 0,
               stableRangeDetected: false,
               stableRangeQuality: "poor" as const,
               entryReasonCodes: [],
@@ -218,8 +251,10 @@ export type BorderlineLifecycleRenderEvent = {
   watchTicksObserved: number;
   watchTicksRemaining: number;
   currentBtcPrice: number | null;
-  yesPrice: number | null;
-  noPrice: number | null;
+  bestBid: number | null;
+  bestAsk: number | null;
+  midPrice: number | null;
+  spreadBps: number | null;
   postMoveClassification: PostMoveClassification | null;
   reason: string;
 };
@@ -241,10 +276,7 @@ type PipelineInput = {
     | "strongSpikeConfirmationTicks"
     | "exceptionalSpikePercent"
     | "exceptionalSpikeOverridesCooldown"
-    | "entryPrice"
-    | "maxOppositeSideEntryPrice"
-    | "neutralQuoteBandMin"
-    | "neutralQuoteBandMax"
+    | "maxEntrySpreadBps"
     | "entryCooldownMs"
     | "borderlineRequirePause"
     | "borderlineRequireNoContinuation"
@@ -254,6 +286,7 @@ type PipelineInput = {
     | "strongSpikeHardRejectPoorRange"
     | "allowWeakQualityEntries"
     | "allowWeakQualityOnlyForStrongSpikes"
+    | "allowAcceptableQualityStrongSpikes"
     | "unstableContextMode"
   >;
 };
@@ -288,6 +321,11 @@ function appendWeakQualityGateLogLines(
       "[quality-gate] weak no_signal rejected (allow-weak applies only to strong_spike/borderline when configured)"
     );
   }
+  if (r.includes("acceptable_quality_strong_spike_allowed_by_config")) {
+    messages.push(
+      "[quality-gate] ALLOW_ACCEPTABLE_QUALITY_STRONG_SPIKES: acceptable pre-spike range + strong_spike — pre-entry gate PASS (experimental)"
+    );
+  }
 }
 
 function appendUnstableContextLogs(
@@ -300,7 +338,7 @@ function appendUnstableContextLogs(
     messages.push(
       `[unstable-context] mode=${mode} unstable pre-spike context matched; hard_reject applied reason=${hardReject.hardRejectReason ?? "hard_reject_unstable_pre_spike_context"}` +
         (m
-          ? ` | priorRange=${m.priorRangePercent} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
+          ? ` | priorRangeFrac=${m.priorRangeFraction} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
           : "")
     );
     return;
@@ -310,7 +348,7 @@ function appendUnstableContextLogs(
     messages.push(
       `[unstable-context] mode=${mode} unstable pre-spike context matched; downgraded to soft handling (downstream gates decide)` +
         (m
-          ? ` | priorRange=${m.priorRangePercent} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
+          ? ` | priorRangeFrac=${m.priorRangeFraction} threshold=${m.threshold} stableRangeDetected=${m.stableRangeDetected}`
           : "")
     );
   }
@@ -383,8 +421,10 @@ function toRenderEvent(
 ): BorderlineLifecycleRenderEvent | null {
   const c = event.candidate;
   const currentBtcPrice = tick.kind === "ready" ? tick.btc : null;
-  const yesPrice = tick.kind === "ready" ? tick.sides.upSidePrice : null;
-  const noPrice = tick.kind === "ready" ? tick.sides.downSidePrice : null;
+  const bestBid = tick.kind === "ready" ? tick.sides.bestBid : null;
+  const bestAsk = tick.kind === "ready" ? tick.sides.bestAsk : null;
+  const midPrice = tick.kind === "ready" ? tick.sides.midPrice : null;
+  const spreadBps = tick.kind === "ready" ? tick.sides.spreadBps : null;
 
   if (event.type === "created") {
     return {
@@ -404,8 +444,10 @@ function toRenderEvent(
       ),
       watchTicksRemaining: c.watchTicksRemaining,
       currentBtcPrice,
-      yesPrice,
-      noPrice,
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadBps,
       postMoveClassification: null,
       reason: "borderline_detected_enter_watch_mode",
     };
@@ -428,8 +470,10 @@ function toRenderEvent(
       ),
       watchTicksRemaining: c.watchTicksRemaining,
       currentBtcPrice,
-      yesPrice,
-      noPrice,
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadBps,
       postMoveClassification: null,
       reason: event.message,
     };
@@ -452,8 +496,10 @@ function toRenderEvent(
       ),
       watchTicksRemaining: c.watchTicksRemaining,
       currentBtcPrice,
-      yesPrice,
-      noPrice,
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadBps,
       postMoveClassification: null,
       reason: c.promotionReason ?? event.message,
     };
@@ -476,8 +522,10 @@ function toRenderEvent(
       ),
       watchTicksRemaining: c.watchTicksRemaining,
       currentBtcPrice,
-      yesPrice,
-      noPrice,
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadBps,
       postMoveClassification: null,
       reason: c.cancellationReason ?? event.message,
     };
@@ -500,8 +548,10 @@ function toRenderEvent(
       ),
       watchTicksRemaining: c.watchTicksRemaining,
       currentBtcPrice,
-      yesPrice,
-      noPrice,
+      bestBid,
+      bestAsk,
+      midPrice,
+      spreadBps,
       postMoveClassification: null,
       reason: c.cancellationReason ?? event.message,
     };
@@ -581,8 +631,10 @@ export function runStrategyDecisionPipeline(
             ),
             watchTicksRemaining: cancelled.watchTicksRemaining,
             currentBtcPrice: null,
-            yesPrice: null,
-            noPrice: null,
+            bestBid: null,
+            bestAsk: null,
+            midPrice: null,
+            spreadBps: null,
             postMoveClassification: null,
             reason: cancelled.cancellationReason ?? "data fetch invalidated watch",
           },
@@ -634,6 +686,8 @@ export function runStrategyDecisionPipeline(
     allowWeakQualityEntries: config.allowWeakQualityEntries,
     allowWeakQualityOnlyForStrongSpikes:
       config.allowWeakQualityOnlyForStrongSpikes,
+    allowAcceptableQualityStrongSpikes:
+      config.allowAcceptableQualityStrongSpikes,
   });
   appendWeakQualityGateLogLines(strongSpikeLifecycleMessages, qualityGateBase);
   const hardReject = evaluateHardRejectContext({
@@ -712,10 +766,7 @@ export function runStrategyDecisionPipeline(
       candidate: activeStrong,
       tick,
       config: {
-        entryPrice: config.entryPrice,
-        maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-        neutralQuoteBandMin: config.neutralQuoteBandMin,
-        neutralQuoteBandMax: config.neutralQuoteBandMax,
+        maxEntrySpreadBps: config.maxEntrySpreadBps,
         borderlineContinuationThreshold: config.borderlineContinuationThreshold,
         borderlineReversionThreshold: config.borderlineReversionThreshold,
         borderlinePauseBandPercent: config.borderlinePauseBandPercent,
@@ -881,59 +932,17 @@ export function runStrategyDecisionPipeline(
         strongSpikeLifecycleMessages,
       };
     }
-    if (!Number.isFinite(tick.sides.upSidePrice) || !Number.isFinite(tick.sides.downSidePrice)) {
-      return {
-        decision: nrm({
-          tick,
-          simulation,
-          tradableSpikeMinPercent: config.tradableSpikeMinPercent,
-          pipelineQualityGate: qualityGate,
-          decision: {
-          action: "none",
-          direction: null,
-          stableRangeQuality,
-          movementClassification: tick.entry.movementClassification,
-            qualityGatePassed: qualityGate.qualityGatePassed,
-            qualityGateReasons: qualityGate.qualityGateReasons,
-            qualityProfile: qualityGate.qualityProfile,
-            hardRejectApplied: false,
-            hardRejectReason: null,
-            cooldownOverridden: false,
-            overrideReason: null,
-          spikeDetected: tick.entry.spikeDetected,
-          fastPathUsed: true,
-          criticalBlockerUsed: "invalid_market_prices",
-          reason: "strong spike detected but blocked by invalid quote data",
-          },
-        }),
-        entryForSimulation: tick.entry,
-        borderlineLifecycleEvents: renderEvents,
-        strongSpikeLifecycleMessages,
-      };
-    }
-    const pricingBlocker = evaluateQuoteQuality({
-      upSidePrice: tick.sides.upSidePrice,
-      downSidePrice: tick.sides.downSidePrice,
-      direction: tick.entry.direction,
-      entryPrice: config.entryPrice,
-      maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: config.neutralQuoteBandMin,
-      neutralQuoteBandMax: config.neutralQuoteBandMax,
-    });
-    if (pricingBlocker !== null) {
-      strongSpikeLifecycleMessages.push(
-        `[strategy] quote pricing blocker=${pricingBlocker} | opposite=${(
-          tick.entry.direction === "UP" ? tick.sides.upSidePrice : tick.sides.downSidePrice
-        ).toFixed(4)} | maxOpp=${Math.min(
-          config.entryPrice,
-          config.maxOppositeSideEntryPrice
-        ).toFixed(4)} | neutralBand=[${Math.min(
-          config.neutralQuoteBandMin,
-          config.neutralQuoteBandMax
-        ).toFixed(4)}, ${Math.max(config.neutralQuoteBandMin, config.neutralQuoteBandMax).toFixed(
-          4
-        )}]`
-      );
+    const bookGate = evaluateSpotBookPipeline(tick.sides, config.maxEntrySpreadBps);
+    if (bookGate !== null) {
+      if (bookGate === "invalid_book") {
+        strongSpikeLifecycleMessages.push(
+          "[strategy] spot book invalid (bid/ask) — blocking immediate entry"
+        );
+      } else {
+        strongSpikeLifecycleMessages.push(
+          `[strategy] spread_too_wide | spr=${tick.sides.spreadBps.toFixed(2)}bps max=${config.maxEntrySpreadBps}`
+        );
+      }
       return {
         decision: nrm({
           tick,
@@ -950,7 +959,7 @@ export function runStrategyDecisionPipeline(
             qualityProfile: qualityGate.qualityProfile,
             pipelineQualityModifier: {
               effectiveQualityProfile: qualityGate.qualityProfile,
-              reason: `post_gate_quote_filter:${pricingBlocker}`,
+              reason: `post_gate_spot_book:${bookGate}`,
               preModifierGateProfile: qualityGate.qualityProfile,
             },
             hardRejectApplied: false,
@@ -959,8 +968,12 @@ export function runStrategyDecisionPipeline(
             overrideReason: null,
             spikeDetected: tick.entry.spikeDetected,
             fastPathUsed: true,
-            criticalBlockerUsed: "quality_gate_rejected",
-            reason: pricingBlocker,
+            criticalBlockerUsed:
+              bookGate === "invalid_book" ? "invalid_market_prices" : "quality_gate_rejected",
+            reason:
+              bookGate === "invalid_book"
+                ? "strong spike detected but blocked by invalid spot book"
+                : "strong spike detected but blocked by wide spread",
           },
         }),
         entryForSimulation: tick.entry,
@@ -1094,10 +1107,7 @@ export function runStrategyDecisionPipeline(
         rangeThreshold: config.rangeThreshold,
         stableRangeSoftToleranceRatio: config.stableRangeSoftToleranceRatio,
         spikeThreshold: config.spikeThreshold,
-        entryPrice: config.entryPrice,
-        maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-        neutralQuoteBandMin: config.neutralQuoteBandMin,
-        neutralQuoteBandMax: config.neutralQuoteBandMax,
+        maxEntrySpreadBps: config.maxEntrySpreadBps,
         borderlineRequirePause: config.borderlineRequirePause,
         borderlineRequireNoContinuation: config.borderlineRequireNoContinuation,
         borderlineContinuationThreshold: config.borderlineContinuationThreshold,
@@ -1360,6 +1370,81 @@ export function runStrategyDecisionPipeline(
     borderlineLifecycleEvents: renderEvents,
     strongSpikeLifecycleMessages,
   };
+}
+
+/**
+ * After {@link runStrategyDecisionPipeline}, blocks opening when the Binance feed
+ * is stale (no recent WS messages). Does not close positions.
+ */
+export function applyFeedStaleEntryBlock(
+  result: StrategyDecisionPipelineResult,
+  input: {
+    tick: StrategyTickResult;
+    simulation: SimulationEngine;
+    config: Pick<AppConfig, "blockEntriesOnStaleFeed" | "tradableSpikeMinPercent">;
+    feedStale: boolean;
+  }
+): StrategyDecisionPipelineResult {
+  if (input.tick.kind !== "ready") return result;
+  if (!input.config.blockEntriesOnStaleFeed || !input.feedStale) {
+    return result;
+  }
+  const act = result.decision.action;
+  if (act !== "enter_immediate" && act !== "promote_borderline_candidate") {
+    return result;
+  }
+  const d = result.decision;
+  const blocked: StrategyDecision = {
+    ...d,
+    action: "none",
+    direction: null,
+    criticalBlockerUsed: "feed_stale",
+    reason: "feed_stale",
+  };
+  return {
+    ...result,
+    decision: withNormalizedReasons({
+      decision: blocked,
+      tick: input.tick,
+      simulation: input.simulation,
+      tradableSpikeMinPercent: input.config.tradableSpikeMinPercent,
+    }),
+    entryForSimulation: input.tick.entry,
+  };
+}
+
+/**
+ * Legacy name for {@link applyFeedStaleEntryBlock}. Accepts `quoteFeedStale` /
+ * `blockEntriesOnStaleQuotes` for older call sites.
+ */
+export function applyQuoteStaleEntryBlock(
+  result: StrategyDecisionPipelineResult,
+  input: {
+    tick: StrategyTickResult;
+    simulation: SimulationEngine;
+    config: {
+      tradableSpikeMinPercent: number;
+      blockEntriesOnStaleFeed?: boolean;
+      blockEntriesOnStaleQuotes?: boolean;
+    };
+    feedStale?: boolean;
+    quoteFeedStale?: boolean;
+  }
+): StrategyDecisionPipelineResult {
+  const stale = input.feedStale ?? input.quoteFeedStale ?? false;
+  const block =
+    input.config.blockEntriesOnStaleFeed ??
+    input.config.blockEntriesOnStaleQuotes ??
+    false;
+  return applyFeedStaleEntryBlock(result, {
+    tick: input.tick,
+    simulation: input.simulation,
+    config: {
+      tradableSpikeMinPercent: input.config.tradableSpikeMinPercent,
+      blockEntriesOnStaleFeed: block,
+    },
+    feedStale: stale,
+  });
 }
 
 export function formatStrategyDecisionLog(decision: StrategyDecision): string {

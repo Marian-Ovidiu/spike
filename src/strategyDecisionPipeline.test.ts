@@ -4,14 +4,22 @@ import { BorderlineCandidateManager } from "./borderlineCandidate.js";
 import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
 import type { StrategyTickResult } from "./botLoop.js";
 import type { EntryEvaluation } from "./entryConditions.js";
-import { runStrategyDecisionPipeline } from "./strategyDecisionPipeline.js";
+import { OpportunityTracker } from "./opportunityTracker.js";
+import {
+  applyQuoteStaleEntryBlock,
+  entryEvaluationForPipelinePaperExecution,
+  PIPELINE_BLOCKED_ENTRY_REASON,
+  runStrategyDecisionPipeline,
+} from "./strategyDecisionPipeline.js";
+import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
 
 function readyTick(
   entry: EntryEvaluation
 ): Extract<StrategyTickResult, { kind: "ready" }> {
+  const sides = syntheticSpotBookFromMid(100_000, 5);
   const normalizedEntry: EntryEvaluation = {
     stableRangeDetected: true,
-    priorRangePercent: 0.0005,
+    priorRangeFraction: 0.0005,
     stableRangeQuality: "good",
     rangeDecisionNote: "test",
     movementClassification: "no_signal",
@@ -35,8 +43,9 @@ function readyTick(
     prev: 100_000,
     last: 100_050,
     prices: [99_980, 99_990, 100_000, 100_050],
-    sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
+    sides,
     entry: normalizedEntry,
+    market: { book: sides, feedPossiblyStale: false },
   };
 }
 
@@ -51,10 +60,7 @@ const pipelineConfig = {
   strongSpikeConfirmationTicks: 1,
   exceptionalSpikePercent: 0.0025,
   exceptionalSpikeOverridesCooldown: true,
-  entryPrice: 0.25,
-  maxOppositeSideEntryPrice: 0.35,
-  neutralQuoteBandMin: 0.45,
-  neutralQuoteBandMax: 0.55,
+  maxEntrySpreadBps: 500,
   entryCooldownMs: 0,
   borderlineRequirePause: true,
   borderlineRequireNoContinuation: true,
@@ -63,7 +69,22 @@ const pipelineConfig = {
   borderlinePauseBandPercent: 0.00015,
   allowWeakQualityEntries: false,
   allowWeakQualityOnlyForStrongSpikes: true,
+  allowAcceptableQualityStrongSpikes: false,
   unstableContextMode: "hard" as const,
+} as const;
+
+const spotSimConfig = {
+  takeProfitBps: 35,
+  stopLossBps: 25,
+  paperSlippageBps: 0,
+  paperFeeRoundTripBps: 8,
+  exitTimeoutMs: 60_000,
+  entryCooldownMs: 120_000,
+  stakePerTrade: 5,
+  allowWeakQualityEntries: false,
+  weakQualitySizeMultiplier: 0.5,
+  strongQualitySizeMultiplier: 1,
+  exceptionalQualitySizeMultiplier: 1,
 } as const;
 
 describe("strategyDecisionPipeline", () => {
@@ -84,7 +105,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0004,
+      priorRangeFraction: 0.0004,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -130,6 +151,131 @@ describe("strategyDecisionPipeline", () => {
     expect((result.strongSpikeLifecycleMessages ?? []).join(" ")).toContain("detected");
   });
 
+  it("rejects acceptable-profile strong_spike at gate when allow flag is false", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0004,
+      stableRangeQuality: "acceptable",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0016,
+        strongestMoveAbsolute: 160,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0016,
+        strongestMoveAbsolute: 160,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_160,
+        strongestMove: 0.0016,
+        strongestAbsDelta: 160,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: readyTick(entry),
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: pipelineConfig,
+    });
+    expect(result.decision.criticalBlockerUsed).toBe("quality_gate_rejected");
+    expect(result.decision.qualityProfile).toBe("acceptable");
+    expect((result.strongSpikeLifecycleMessages ?? []).join("\n")).not.toContain(
+      "ALLOW_ACCEPTABLE_QUALITY_STRONG_SPIKES"
+    );
+  });
+
+  it("when allow flag is true, acceptable-profile strong_spike passes gate and logs override", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0004,
+      stableRangeQuality: "acceptable",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0016,
+        strongestMoveAbsolute: 160,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0016,
+        strongestMoveAbsolute: 160,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_160,
+        strongestMove: 0.0016,
+        strongestAbsDelta: 160,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: readyTick(entry),
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: { ...pipelineConfig, allowAcceptableQualityStrongSpikes: true },
+    });
+    expect(result.decision.reason).toBe("strong_spike_waiting_confirmation_tick");
+    expect((result.strongSpikeLifecycleMessages ?? []).join("\n")).toContain(
+      "ALLOW_ACCEPTABLE_QUALITY_STRONG_SPIKES"
+    );
+  });
+
   it("blocks strong spike when quality gate profile is only acceptable", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     const manager = new BorderlineCandidateManager({
@@ -143,7 +289,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0004,
+      priorRangeFraction: 0.0004,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -202,7 +348,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0004,
+      priorRangeFraction: 0.0004,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -262,7 +408,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0004,
+      priorRangeFraction: 0.0004,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -338,7 +484,7 @@ describe("strategyDecisionPipeline", () => {
     expect(result.decision.direction).toBe("DOWN");
   });
 
-  it("rejects strong spike when priorRangePercent is wider than strict max", () => {
+  it("rejects strong spike when priorRangeFraction is wider than strict max", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     const manager = new BorderlineCandidateManager({
       symbol: "BTCUSD",
@@ -351,7 +497,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0016,
+      priorRangeFraction: 0.0016,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -406,7 +552,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: false,
-      priorRangePercent: 0.0021,
+      priorRangeFraction: 0.0021,
       stableRangeQuality: "poor",
       rangeDecisionNote: "test",
       movement: {
@@ -462,7 +608,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0021,
+      priorRangeFraction: 0.0021,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -514,7 +660,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: false,
-      priorRangePercent: 0.0018,
+      priorRangeFraction: 0.0018,
       stableRangeQuality: "poor",
       rangeDecisionNote: "test",
       movement: {
@@ -569,7 +715,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -628,7 +774,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -690,7 +836,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -745,7 +891,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -800,7 +946,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -879,7 +1025,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "borderline",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.0008,
+      priorRangeFraction: 0.0008,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -925,7 +1071,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0009,
+      priorRangeFraction: 0.0009,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -988,7 +1134,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.001,
+      priorRangeFraction: 0.001,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1024,18 +1170,9 @@ describe("strategyDecisionPipeline", () => {
       now: 100,
       entry: strong,
       entryPath: "strong_spike_immediate",
-      sides: { upSidePrice: 0.2, downSidePrice: 0.2 },
-      config: {
-        exitPrice: 0.5,
-        stopLoss: 0.1,
-        exitTimeoutMs: 60_000,
-        entryCooldownMs: 120_000,
-        stakePerTrade: 5,
-        allowWeakQualityEntries: false,
-        weakQualitySizeMultiplier: 0.5,
-        strongQualitySizeMultiplier: 1,
-        exceptionalQualitySizeMultiplier: 1,
-      },
+      sides: syntheticSpotBookFromMid(100_000, 5),
+      symbol: "BTCUSDT",
+      config: spotSimConfig,
     });
 
     const first = runStrategyDecisionPipeline({
@@ -1099,7 +1236,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.001,
+      priorRangeFraction: 0.001,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1160,7 +1297,8 @@ describe("strategyDecisionPipeline", () => {
         detected: false,
       },
     });
-    t.sides.upSidePrice = Number.NaN;
+    t.sides.bestBid = Number.NaN;
+    t.market = { book: t.sides, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 2_000,
       tick: t,
@@ -1192,7 +1330,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0005,
+      priorRangeFraction: 0.0005,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1258,7 +1396,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0005,
+      priorRangeFraction: 0.0005,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1319,7 +1457,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0005,
+      priorRangeFraction: 0.0005,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1405,7 +1543,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "no_signal",
       spikeDetected: false,
       stableRangeDetected: true,
-      priorRangePercent: 0.001,
+      priorRangeFraction: 0.001,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1457,7 +1595,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0005,
+      priorRangeFraction: 0.0005,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1488,20 +1626,22 @@ describe("strategyDecisionPipeline", () => {
         comparisons: [],
       },
     };
+    const wide = syntheticSpotBookFromMid(100_000, 400);
     const t = readyTick(strong);
-    t.sides.downSidePrice = 0.5125;
+    t.sides = wide;
+    t.market = { book: wide, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 1_000,
       tick: t,
       manager,
       simulation: sim,
-      config: pipelineConfig,
+      config: { ...pipelineConfig, maxEntrySpreadBps: 50 },
     });
     expect(result.decision.action).toBe("none");
-    expect(result.decision.reason).toBe("opposite_side_price_too_high");
+    expect(result.decision.reason).toContain("wide spread");
   });
 
-  it("rejects exceptional immediate path when quotes are too neutral", () => {
+  it("rejects exceptional immediate path when book is invalid (crossed)", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
     const strong: EntryEvaluation = {
@@ -1511,7 +1651,7 @@ describe("strategyDecisionPipeline", () => {
       movementClassification: "strong_spike",
       spikeDetected: true,
       stableRangeDetected: true,
-      priorRangePercent: 0.0005,
+      priorRangeFraction: 0.0005,
       stableRangeQuality: "good",
       rangeDecisionNote: "test",
       movement: {
@@ -1543,8 +1683,13 @@ describe("strategyDecisionPipeline", () => {
       },
     };
     const t = readyTick(strong);
-    t.sides.upSidePrice = 0.49;
-    t.sides.downSidePrice = 0.51;
+    t.sides = {
+      bestBid: 100_100,
+      bestAsk: 100_000,
+      midPrice: 100_050,
+      spreadBps: Number.NaN,
+    };
+    t.market = { book: t.sides, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 1_000,
       tick: t,
@@ -1553,7 +1698,7 @@ describe("strategyDecisionPipeline", () => {
       config: pipelineConfig,
     });
     expect(result.decision.action).toBe("none");
-    expect(result.decision.reason).toBe("market_quotes_too_neutral");
+    expect(result.decision.reason).toContain("invalid spot book");
   });
 
   it("unstable pre-spike context: hard mode keeps immediate hard reject", () => {
@@ -1567,7 +1712,7 @@ describe("strategyDecisionPipeline", () => {
       direction: "DOWN",
       reasons: [],
       stableRangeDetected: false,
-      priorRangePercent: 0.01,
+      priorRangeFraction: 0.01,
       stableRangeQuality: "acceptable",
       rangeDecisionNote: "test",
       movementClassification: "strong_spike",
@@ -1629,7 +1774,7 @@ describe("strategyDecisionPipeline", () => {
       direction: "DOWN",
       reasons: [],
       stableRangeDetected: false,
-      priorRangePercent: 0.01,
+      priorRangeFraction: 0.01,
       stableRangeQuality: "acceptable",
       rangeDecisionNote: "test",
       movementClassification: "strong_spike",
@@ -1682,6 +1827,277 @@ describe("strategyDecisionPipeline", () => {
         "unstable_pre_spike_context_soft_handling"
       )
     ).toBe(true);
+  });
+});
+
+describe("entryEvaluationForPipelinePaperExecution", () => {
+  const paperConfig = {
+    takeProfitBps: 35,
+    stopLossBps: 25,
+    paperSlippageBps: 0,
+    paperFeeRoundTripBps: 8,
+    exitTimeoutMs: 60_000,
+    entryCooldownMs: 0,
+    stakePerTrade: 10,
+    allowWeakQualityEntries: false,
+    weakQualitySizeMultiplier: 1,
+    strongQualitySizeMultiplier: 1,
+    exceptionalQualitySizeMultiplier: 1,
+  } as const;
+
+  it("clears shouldEnter when pipeline did not approve, so paper sim stays flat", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const raw: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const paper = entryEvaluationForPipelinePaperExecution(
+      { action: "none" },
+      raw
+    );
+    expect(paper.shouldEnter).toBe(false);
+    expect(paper.direction).toBeNull();
+    expect(paper.reasons).toContain(PIPELINE_BLOCKED_ENTRY_REASON);
+
+    sim.onTick({
+      now: 1,
+      entry: paper,
+      sides: syntheticSpotBookFromMid(100_000, 5),
+      symbol: "BTCUSDT",
+      config: paperConfig,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+  });
+
+  it("passes through approved enter_immediate unchanged", () => {
+    const raw: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const paper = entryEvaluationForPipelinePaperExecution(
+      { action: "enter_immediate" },
+      raw
+    );
+    expect(paper).toBe(raw);
+  });
+
+  it("applyQuoteStaleEntryBlock blocks immediate entry and persists feed_stale on opportunities", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const strong: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const tick = readyTick(strong);
+    const base = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick,
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: pipelineConfig,
+    });
+    expect(base.decision.action).toBe("enter_immediate");
+
+    const blocked = applyQuoteStaleEntryBlock(base, {
+      tick,
+      simulation: sim,
+      config: {
+        blockEntriesOnStaleQuotes: true,
+        tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
+      },
+      quoteFeedStale: true,
+    });
+    expect(blocked.decision.action).toBe("none");
+    expect(blocked.decision.criticalBlockerUsed).toBe("feed_stale");
+    expect(blocked.decision.reasons?.includes("feed_stale")).toBe(true);
+
+    const tracker = new OpportunityTracker();
+    const o = tracker.recordFromReadyTick({
+      timestamp: 1_000,
+      btcPrice: tick.btc,
+      prices: tick.prices,
+      previousPrice: tick.prev,
+      currentPrice: tick.last,
+      sides: tick.sides,
+      entry: strong,
+      decision: blocked.decision,
+      tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
+    });
+    expect(o).not.toBeNull();
+    expect(o!.entryRejectionReasons).toContain("feed_stale");
+  });
+
+  it("applyQuoteStaleEntryBlock does nothing when stale flag is false", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const strong: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const tick = readyTick(strong);
+    const base = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick,
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: pipelineConfig,
+    });
+    const passthrough = applyQuoteStaleEntryBlock(base, {
+      tick,
+      simulation: sim,
+      config: {
+        blockEntriesOnStaleQuotes: true,
+        tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
+      },
+      quoteFeedStale: false,
+    });
+    expect(passthrough.decision.action).toBe("enter_immediate");
   });
 });
 

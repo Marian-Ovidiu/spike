@@ -81,7 +81,14 @@ export type StrongSpikeGateFunnel = {
   passedQualityGate: number;
   passedPriorRangeGate: number;
   passedOppositeSidePriceGate: number;
+  /** Rows with `status === "valid"` among strong-spike JSONL records only. */
   validOpportunities: number;
+  /**
+   * Runtime funnel L3 ticks (`enter_immediate` or `promote_borderline_candidate`).
+   * Used with {@link validOpportunities} so opened-trade % is not misleading when
+   * entries are borderline-promoted (no strong-spike JSON row on that tick).
+   */
+  strategyApprovedEntryTicks?: number;
   /** Same as runtime `tradesExecuted` (paper opens). */
   openedTrades: number;
   borderlineCandidatesCreated: number;
@@ -98,6 +105,8 @@ export function computeStrongSpikeGateFunnel(input: {
   opportunities: readonly Opportunity[];
   borderlineCandidatesCreated: number;
   tradesExecuted: number;
+  /** When provided (e.g. from runtime stats), included in opened-trade % denominator. */
+  strategyApprovedEntryTicks?: number;
 }): StrongSpikeGateFunnel {
   const strong = input.opportunities.filter((o) => o.opportunityType === "strong_spike");
   const spikesDetected = strong.length;
@@ -178,6 +187,9 @@ export function computeStrongSpikeGateFunnel(input: {
     passedPriorRangeGate,
     passedOppositeSidePriceGate,
     validOpportunities,
+    ...(input.strategyApprovedEntryTicks !== undefined
+      ? { strategyApprovedEntryTicks: input.strategyApprovedEntryTicks }
+      : {}),
     openedTrades: input.tradesExecuted,
     borderlineCandidatesCreated: input.borderlineCandidatesCreated,
     rejectedWithMultipleNormalizedReasons,
@@ -206,6 +218,8 @@ export function formatGateFunnelSection(f: StrongSpikeGateFunnel): string[] {
   const n4 = f.passedPriorRangeGate;
   const n5 = f.passedOppositeSidePriceGate;
   const nv = f.validOpportunities;
+  const approvedBaseline = Math.max(nv, f.strategyApprovedEntryTicks ?? 0);
+  const openedDenom = Math.max(approvedBaseline, f.openedTrades > 0 ? 1 : 0);
   const out: string[] = [
     "",
     "──────── Gate funnel (strong-spike rows in JSONL) ────────────",
@@ -217,7 +231,11 @@ export function formatGateFunnelSection(f: StrongSpikeGateFunnel): string[] {
     line("  → prior-range gate passed", n4, `${pct(n4, n3)} of quality-pass`),
     line("  → opposite-side price passed", n5, `${pct(n5, n4)} of prior-pass`),
     line("Valid opportunities (strategy)", nv, `${pct(nv, n0)} of spikes`),
-    line("Opened trades (paper sim)", f.openedTrades, `${pct(f.openedTrades, nv)} of valid`),
+    line(
+      "Opened trades (paper sim)",
+      f.openedTrades,
+      `${pct(f.openedTrades, openedDenom)} of max(JSONL-valid, runtime-approved)`
+    ),
     `  Borderline watch candidates created   ${String(f.borderlineCandidatesCreated).padStart(6)}`,
     "  Multi-reason rejections (2+ codes)    " +
       String(f.rejectedWithMultipleNormalizedReasons).padStart(6),

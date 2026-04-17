@@ -2,6 +2,27 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const DEPRECATED_POLYMARKET_ENV_KEYS = [
+  "POLYMARKET_MARKET_SLUG",
+  "POLYMARKET_MARKET_ID",
+  "POLYMARKET_DISCOVERY_QUERY",
+  "POLYMARKET_DISCOVERY_MIN_CONFIDENCE",
+  "BINARY_MARKET_SOURCE",
+  "UP_SIDE_PRICE",
+  "DOWN_SIDE_PRICE",
+] as const;
+
+function warnDeprecatedPolymarketEnv(): void {
+  for (const k of DEPRECATED_POLYMARKET_ENV_KEYS) {
+    const v = process.env[k]?.trim();
+    if (v) {
+      console.warn(
+        `[config] ${k} is deprecated (Polymarket removed). Value ignored — use Binance spot settings; see .env.example.`
+      );
+    }
+  }
+}
+
 /** Built-in defaults when an env var is missing or invalid. */
 export const configDefaults = {
   /** Minimum relative 1-tick move (fraction) to count as a spike. */
@@ -12,11 +33,11 @@ export const configDefaults = {
   rangeThreshold: 0.0012,
   /** Soft tolerance over rangeThreshold to classify pre-spike range as acceptable. */
   stableRangeSoftToleranceRatio: 1.5,
-  /** Max prior range for normal mean-reversion entries (0.0015 = 0.15%). */
+  /** Max prior-window relative range as a fraction (0.0015 = 0.15%). */
   maxPriorRangeForNormalEntry: 0.0015,
   /**
-   * Hard reject threshold for unstable pre-spike context:
-   * if stableRangeDetected=false and priorRangePercent exceeds this value.
+   * Hard reject threshold for unstable pre-spike context (fraction of min price):
+   * if stableRangeDetected=false and prior range fraction exceeds this value.
    */
   hardRejectPriorRangePercent: 0.002,
   /** Optional hard reject for strong spikes when pre-range quality is poor. */
@@ -27,12 +48,8 @@ export const configDefaults = {
   exceptionalSpikePercent: 0.0025,
   /** If true, exceptional spikes can bypass cooldown-only blockers. */
   exceptionalSpikeOverridesCooldown: true,
-  /** Hard cap for opposite-side entry quote (independent from entryPrice). */
-  maxOppositeSideEntryPrice: 0.35,
-  /** Lower bound of neutral quote band where both sides are considered non-tradable. */
-  neutralQuoteBandMin: 0.45,
-  /** Upper bound of neutral quote band where both sides are considered non-tradable. */
-  neutralQuoteBandMax: 0.55,
+  /** Max bid/ask spread (basis points) to allow a paper entry. */
+  maxEntrySpreadBps: 40,
   /** Spike move must be ≥ this × prior-window relative range (filters weak spikes). */
   spikeMinRangeMultiple: 2.2,
   /** Borderline lower bound as ratio of SPIKE_THRESHOLD (e.g. 0.85 = 85%). */
@@ -49,10 +66,14 @@ export const configDefaults = {
   borderlineReversionThreshold: 0.2,
   /** Narrow band around detection price to classify as pause (fraction; 0.00015 = 0.015%). */
   borderlinePauseBandPercent: 0.00015,
-  entryPrice: 0.22,
-  exitPrice: 0.52,
-  /** Exit long if mark at or below this (tighter = less $ at risk per contract). */
-  stopLoss: 0.085,
+  /** Take profit vs entry fill, in basis points (spot). */
+  takeProfitBps: 35,
+  /** Stop loss vs entry fill, in basis points (spot). */
+  stopLossBps: 25,
+  /** Extra slippage applied to entry fill (bps) for paper realism. */
+  paperSlippageBps: 3,
+  /** Round-trip fee estimate as fraction of notional (bps), deducted from P/L. */
+  paperFeeRoundTripBps: 8,
   /** Starting paper equity (same units as contract P/L). */
   initialCapital: 10_000,
   /** Max fraction of **current** equity at planned stop per trade (1 = 1%). */
@@ -75,6 +96,12 @@ export const configDefaults = {
    * not to `borderline` moves with a weak profile.
    */
   allowWeakQualityOnlyForStrongSpikes: true,
+  /**
+   * When true, strong_spike moves whose capped profile is only `acceptable` (e.g. pre-spike range
+   * quality acceptable) may pass the pre-entry quality gate — same downstream rules as `strong`
+   * (confirmation tick, quotes, etc.). Default false preserves legacy gate behavior.
+   */
+  allowAcceptableQualityStrongSpikes: false,
   /** Stake multiplier when quality is weak (only used if allowWeakQualityEntries). */
   weakQualitySizeMultiplier: 0.5,
   /** Stake multiplier for strong / acceptable quality when weak entries are enabled. */
@@ -91,6 +118,19 @@ export const configDefaults = {
    * Does not change defaults unless TEST_MODE=true — see loadConfig preset logic.
    */
   testMode: false,
+  /**
+   * When true, live monitor paper sim prints `[PAPER-MTM]` JSON for each open position:
+   * quote snapshot at open, per-tick mark / distances / exit flags, and close snapshot.
+   */
+  paperPositionMtmDebug: false,
+  /**
+   * Block new entries when Binance bookTicker data is older than this (ms).
+   */
+  feedStaleMaxAgeMs: 15_000,
+  /**
+   * When true, stale WebSocket feed blocks entries (monitor paper pipeline).
+   */
+  blockEntriesOnStaleFeed: true,
 } as const;
 
 type ConfigKey = keyof typeof configDefaults;
@@ -115,9 +155,7 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   strongSpikeConfirmationTicks: "STRONG_SPIKE_CONFIRMATION_TICKS",
   exceptionalSpikePercent: "EXCEPTIONAL_SPIKE_PERCENT",
   exceptionalSpikeOverridesCooldown: "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
-  maxOppositeSideEntryPrice: "MAX_OPPOSITE_SIDE_ENTRY_PRICE",
-  neutralQuoteBandMin: "NEUTRAL_QUOTE_BAND_MIN",
-  neutralQuoteBandMax: "NEUTRAL_QUOTE_BAND_MAX",
+  maxEntrySpreadBps: "MAX_ENTRY_SPREAD_BPS",
   spikeMinRangeMultiple: "SPIKE_MIN_RANGE_MULT",
   borderlineMinRatio: "BORDERLINE_MIN_RATIO",
   borderlineWatchTicks: "BORDERLINE_WATCH_TICKS",
@@ -126,9 +164,10 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   borderlineContinuationThreshold: "BORDERLINE_CONTINUATION_THRESHOLD",
   borderlineReversionThreshold: "BORDERLINE_REVERSION_THRESHOLD",
   borderlinePauseBandPercent: "BORDERLINE_PAUSE_BAND_PERCENT",
-  entryPrice: "ENTRY_PRICE",
-  exitPrice: "EXIT_PRICE",
-  stopLoss: "STOP_LOSS",
+  takeProfitBps: "TAKE_PROFIT_BPS",
+  stopLossBps: "STOP_LOSS_BPS",
+  paperSlippageBps: "PAPER_SLIPPAGE_BPS",
+  paperFeeRoundTripBps: "PAPER_FEE_ROUND_TRIP_BPS",
   initialCapital: "INITIAL_CAPITAL",
   riskPercentPerTrade: "RISK_PERCENT_PER_TRADE",
   stakePerTrade: "STAKE_PER_TRADE",
@@ -138,11 +177,16 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   allowWeakQualityEntries: "ALLOW_WEAK_QUALITY_ENTRIES",
   allowWeakQualityOnlyForStrongSpikes:
     "ALLOW_WEAK_QUALITY_ONLY_FOR_STRONG_SPIKES",
+  allowAcceptableQualityStrongSpikes:
+    "ALLOW_ACCEPTABLE_QUALITY_STRONG_SPIKES",
   weakQualitySizeMultiplier: "WEAK_QUALITY_SIZE_MULTIPLIER",
   strongQualitySizeMultiplier: "STRONG_QUALITY_SIZE_MULTIPLIER",
   exceptionalQualitySizeMultiplier: "EXCEPTIONAL_QUALITY_SIZE_MULTIPLIER",
   unstableContextMode: "UNSTABLE_CONTEXT_MODE",
   testMode: "TEST_MODE",
+  paperPositionMtmDebug: "PAPER_POSITION_MTM_DEBUG",
+  feedStaleMaxAgeMs: "FEED_STALE_MAX_AGE_MS",
+  blockEntriesOnStaleFeed: "BLOCK_ENTRIES_ON_STALE_FEED",
 };
 
 function parseEnvNumber(
@@ -219,6 +263,7 @@ function loadConfig(): {
   config: AppConfig;
   _meta: { [K in keyof AppConfig]: { fromEnv: boolean } };
 } {
+  warnDeprecatedPolymarketEnv();
   const spikeThreshold = parseEnvNumber(
     "SPIKE_THRESHOLD",
     configDefaults.spikeThreshold
@@ -263,17 +308,9 @@ function loadConfig(): {
     "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
     configDefaults.exceptionalSpikeOverridesCooldown
   );
-  const maxOppositeSideEntryPrice = parseEnvNumber(
-    "MAX_OPPOSITE_SIDE_ENTRY_PRICE",
-    configDefaults.maxOppositeSideEntryPrice
-  );
-  const neutralQuoteBandMin = parseEnvNumber(
-    "NEUTRAL_QUOTE_BAND_MIN",
-    configDefaults.neutralQuoteBandMin
-  );
-  const neutralQuoteBandMax = parseEnvNumber(
-    "NEUTRAL_QUOTE_BAND_MAX",
-    configDefaults.neutralQuoteBandMax
+  const maxEntrySpreadBps = parseEnvNumber(
+    "MAX_ENTRY_SPREAD_BPS",
+    configDefaults.maxEntrySpreadBps
   );
   const spikeMinRangeMultiple = parseEnvNumber(
     "SPIKE_MIN_RANGE_MULT",
@@ -308,9 +345,22 @@ function loadConfig(): {
     "BORDERLINE_PAUSE_BAND_PERCENT",
     configDefaults.borderlinePauseBandPercent
   );
-  const entryPrice = parseEnvNumber("ENTRY_PRICE", configDefaults.entryPrice);
-  const exitPrice = parseEnvNumber("EXIT_PRICE", configDefaults.exitPrice);
-  const stopLoss = parseEnvNumber("STOP_LOSS", configDefaults.stopLoss);
+  const takeProfitBps = parseEnvNumber(
+    "TAKE_PROFIT_BPS",
+    configDefaults.takeProfitBps
+  );
+  const stopLossBps = parseEnvNumber(
+    "STOP_LOSS_BPS",
+    configDefaults.stopLossBps
+  );
+  const paperSlippageBps = parseEnvNumber(
+    "PAPER_SLIPPAGE_BPS",
+    configDefaults.paperSlippageBps
+  );
+  const paperFeeRoundTripBps = parseEnvNumber(
+    "PAPER_FEE_ROUND_TRIP_BPS",
+    configDefaults.paperFeeRoundTripBps
+  );
   const initialCapital = parseEnvNumber(
     "INITIAL_CAPITAL",
     configDefaults.initialCapital
@@ -344,6 +394,10 @@ function loadConfig(): {
     "ALLOW_WEAK_QUALITY_ONLY_FOR_STRONG_SPIKES",
     configDefaults.allowWeakQualityOnlyForStrongSpikes
   );
+  const allowAcceptableQualityStrongSpikes = parseEnvBoolean(
+    "ALLOW_ACCEPTABLE_QUALITY_STRONG_SPIKES",
+    configDefaults.allowAcceptableQualityStrongSpikes
+  );
   const weakQualitySizeMultiplier = parseEnvNumber(
     "WEAK_QUALITY_SIZE_MULTIPLIER",
     configDefaults.weakQualitySizeMultiplier
@@ -361,6 +415,18 @@ function loadConfig(): {
     configDefaults.unstableContextMode
   );
   const testModeParsed = parseEnvBoolean("TEST_MODE", configDefaults.testMode);
+  const feedStaleMaxAgeMs = parseEnvNumber(
+    "FEED_STALE_MAX_AGE_MS",
+    configDefaults.feedStaleMaxAgeMs
+  );
+  const blockEntriesOnStaleFeed = parseEnvBoolean(
+    "BLOCK_ENTRIES_ON_STALE_FEED",
+    configDefaults.blockEntriesOnStaleFeed
+  );
+  const paperPositionMtmDebug = parseEnvBoolean(
+    "PAPER_POSITION_MTM_DEBUG",
+    configDefaults.paperPositionMtmDebug
+  );
   const testModeSoftUnstable = parseEnvBoolean(
     "TEST_MODE_SOFT_UNSTABLE",
     false
@@ -385,9 +451,7 @@ function loadConfig(): {
       strongSpikeConfirmationTicks,
       exceptionalSpikePercent: Math.max(0, exceptionalSpikePercent.value),
       exceptionalSpikeOverridesCooldown: exceptionalSpikeOverridesCooldown.value,
-      maxOppositeSideEntryPrice: Math.max(0, maxOppositeSideEntryPrice.value),
-      neutralQuoteBandMin: Math.max(0, Math.min(1, neutralQuoteBandMin.value)),
-      neutralQuoteBandMax: Math.max(0, Math.min(1, neutralQuoteBandMax.value)),
+      maxEntrySpreadBps: Math.max(0, maxEntrySpreadBps.value),
       spikeMinRangeMultiple: Math.max(0, spikeMinRangeMultiple.value),
       borderlineMinRatio: Math.min(1, Math.max(0, borderlineMinRatio.value)),
       borderlineWatchTicks,
@@ -399,9 +463,10 @@ function loadConfig(): {
       ),
       borderlineReversionThreshold: Math.max(0, borderlineReversionThreshold.value),
       borderlinePauseBandPercent: Math.max(0, borderlinePauseBandPercent.value),
-      entryPrice: entryPrice.value,
-      exitPrice: exitPrice.value,
-      stopLoss: stopLoss.value,
+      takeProfitBps: Math.max(0, takeProfitBps.value),
+      stopLossBps: Math.max(0, stopLossBps.value),
+      paperSlippageBps: Math.max(0, paperSlippageBps.value),
+      paperFeeRoundTripBps: Math.max(0, paperFeeRoundTripBps.value),
       initialCapital: Math.max(1, initialCapital.value),
       riskPercentPerTrade: Math.min(100, Math.max(0, riskPercentPerTrade.value)),
       stakePerTrade: Math.max(0, stakePerTrade.value),
@@ -411,6 +476,7 @@ function loadConfig(): {
       allowWeakQualityEntries: allowWeakQualityEntries.value,
       allowWeakQualityOnlyForStrongSpikes:
         allowWeakQualityOnlyForStrongSpikes.value,
+      allowAcceptableQualityStrongSpikes: allowAcceptableQualityStrongSpikes.value,
       weakQualitySizeMultiplier: Math.max(0, weakQualitySizeMultiplier.value),
       strongQualitySizeMultiplier: Math.max(0, strongQualitySizeMultiplier.value),
       exceptionalQualitySizeMultiplier: Math.max(
@@ -419,6 +485,9 @@ function loadConfig(): {
       ),
       unstableContextMode: unstableContextMode.value,
       testMode: testModeParsed.value,
+      feedStaleMaxAgeMs: Math.max(0, feedStaleMaxAgeMs.value),
+      blockEntriesOnStaleFeed: blockEntriesOnStaleFeed.value,
+      paperPositionMtmDebug: paperPositionMtmDebug.value,
   };
 
   if (config.testMode) {
@@ -470,9 +539,7 @@ function loadConfig(): {
       exceptionalSpikeOverridesCooldown: {
         fromEnv: exceptionalSpikeOverridesCooldown.fromEnv,
       },
-      maxOppositeSideEntryPrice: { fromEnv: maxOppositeSideEntryPrice.fromEnv },
-      neutralQuoteBandMin: { fromEnv: neutralQuoteBandMin.fromEnv },
-      neutralQuoteBandMax: { fromEnv: neutralQuoteBandMax.fromEnv },
+      maxEntrySpreadBps: { fromEnv: maxEntrySpreadBps.fromEnv },
       spikeMinRangeMultiple: { fromEnv: spikeMinRangeMultiple.fromEnv },
       borderlineMinRatio: { fromEnv: borderlineMinRatio.fromEnv },
       borderlineWatchTicks: { fromEnv: borderlineWatchTicksRaw.fromEnv },
@@ -485,9 +552,10 @@ function loadConfig(): {
       },
       borderlineReversionThreshold: { fromEnv: borderlineReversionThreshold.fromEnv },
       borderlinePauseBandPercent: { fromEnv: borderlinePauseBandPercent.fromEnv },
-      entryPrice: { fromEnv: entryPrice.fromEnv },
-      exitPrice: { fromEnv: exitPrice.fromEnv },
-      stopLoss: { fromEnv: stopLoss.fromEnv },
+      takeProfitBps: { fromEnv: takeProfitBps.fromEnv },
+      stopLossBps: { fromEnv: stopLossBps.fromEnv },
+      paperSlippageBps: { fromEnv: paperSlippageBps.fromEnv },
+      paperFeeRoundTripBps: { fromEnv: paperFeeRoundTripBps.fromEnv },
       initialCapital: { fromEnv: initialCapital.fromEnv },
       riskPercentPerTrade: { fromEnv: riskPercentPerTrade.fromEnv },
       stakePerTrade: { fromEnv: stakePerTrade.fromEnv },
@@ -498,6 +566,9 @@ function loadConfig(): {
       allowWeakQualityOnlyForStrongSpikes: {
         fromEnv: allowWeakQualityOnlyForStrongSpikes.fromEnv,
       },
+      allowAcceptableQualityStrongSpikes: {
+        fromEnv: allowAcceptableQualityStrongSpikes.fromEnv,
+      },
       weakQualitySizeMultiplier: { fromEnv: weakQualitySizeMultiplier.fromEnv },
       strongQualitySizeMultiplier: {
         fromEnv: strongQualitySizeMultiplier.fromEnv,
@@ -507,6 +578,11 @@ function loadConfig(): {
       },
       unstableContextMode: { fromEnv: unstableContextMode.fromEnv },
       testMode: { fromEnv: testModeParsed.fromEnv },
+      feedStaleMaxAgeMs: { fromEnv: feedStaleMaxAgeMs.fromEnv },
+      blockEntriesOnStaleFeed: {
+        fromEnv: blockEntriesOnStaleFeed.fromEnv,
+      },
+      paperPositionMtmDebug: { fromEnv: paperPositionMtmDebug.fromEnv },
     },
   };
 }

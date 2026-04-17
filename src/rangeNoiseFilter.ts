@@ -7,5 +7,5 @@ export function isPriorRangeTooWideForNormalEntry(
   const threshold = Number.isFinite(maxPriorRangeForNormalEntry)
     ? Math.max(0, maxPriorRangeForNormalEntry)
     : 0.0015;
-  return entry.priorRangePercent > threshold;
+  return entry.priorRangeFraction > threshold;
 }

@@ -34,7 +34,7 @@ describe("MonitorRuntimeStats", () => {
         direction: "UP",
         reasons: ["opposite_side_price_too_high"],
         stableRangeDetected: true,
-        priorRangePercent: 0.1,
+        priorRangeFraction: 0.1,
         stableRangeQuality: "good",
         rangeDecisionNote: "test",
         movementClassification: "strong_spike",
@@ -67,6 +67,7 @@ describe("MonitorRuntimeStats", () => {
           comparisons: [],
         },
       },
+      quoteFeed: { quoteSource: "env" },
     });
     expect(s.strongSpikeSignals).toBe(1);
     expect(s.strongSpikeCount).toBe(1);
@@ -85,7 +86,7 @@ describe("MonitorRuntimeStats", () => {
         direction: null,
         reasons: ["spike_not_strong_enough"],
         stableRangeDetected: true,
-        priorRangePercent: 0.1,
+        priorRangeFraction: 0.1,
         stableRangeQuality: "good",
         rangeDecisionNote: "test",
         movementClassification: "borderline",
@@ -101,6 +102,7 @@ describe("MonitorRuntimeStats", () => {
         },
         windowSpike: undefined,
       },
+      quoteFeed: { quoteSource: "env" },
     });
     s.observeTick({
       kind: "ready",
@@ -116,7 +118,7 @@ describe("MonitorRuntimeStats", () => {
         direction: null,
         reasons: ["spike_not_strong_enough"],
         stableRangeDetected: true,
-        priorRangePercent: 0.1,
+        priorRangeFraction: 0.1,
         stableRangeQuality: "good",
         rangeDecisionNote: "test",
         movementClassification: "no_signal",
@@ -132,6 +134,7 @@ describe("MonitorRuntimeStats", () => {
         },
         windowSpike: undefined,
       },
+      quoteFeed: { quoteSource: "env" },
     });
     expect(s.borderlineCount).toBe(1);
     expect(s.noSignalCount).toBe(1);
@@ -151,7 +154,7 @@ describe("MonitorRuntimeStats", () => {
       spikePercent: 1,
       spikeSource: "tick-1",
       spikeReferencePrice: 1,
-      priorRangePercent: 0.1,
+      priorRangeFraction: 0.1,
       upSidePrice: 0.5,
       downSidePrice: 0.5,
       stableRangeDetected: true,
@@ -215,7 +218,7 @@ describe("MonitorRuntimeStats", () => {
       spikePercent: 1,
       spikeSource: "tick-1",
       spikeReferencePrice: 1,
-      priorRangePercent: 0.2,
+      priorRangeFraction: 0.2,
       upSidePrice: 0.5,
       downSidePrice: 0.5,
       stableRangeDetected: true,
@@ -264,7 +267,7 @@ describe("MonitorRuntimeStats", () => {
       spikePercent: 1,
       spikeSource: "tick-1",
       spikeReferencePrice: 1,
-      priorRangePercent: 0.21,
+      priorRangeFraction: 0.21,
       upSidePrice: 0.5,
       downSidePrice: 0.5,
       stableRangeDetected: false,
@@ -309,7 +312,7 @@ describe("MonitorRuntimeStats", () => {
       spikePercent: 1,
       spikeSource: "tick-1",
       spikeReferencePrice: 1,
-      priorRangePercent: 0.21,
+      priorRangeFraction: 0.21,
       upSidePrice: 0.5,
       downSidePrice: 0.5,
       stableRangeDetected: false,
@@ -360,6 +363,39 @@ describe("MonitorRuntimeStats", () => {
       spikeEventsDetected: 5,
     });
     expect(err).toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("logReportCounterConsistency is silent when funnel totals are ordered", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    logReportCounterConsistency({
+      tradesExecuted: 3,
+      validOpportunities: 5,
+      candidateOpportunities: 10,
+      spikeEventsDetected: 12,
+    });
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("approved open ticks increment valid and trades together (live monitor invariant)", () => {
+    const s = new MonitorRuntimeStats();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    s.observeReadyTickFunnel({
+      spikeRawEvent: true,
+      candidatePass: true,
+      validEntryApproved: true,
+      positionOpenedThisTick: true,
+    });
+    expect(s.tradesExecuted).toBe(1);
+    expect(s.validOpportunities).toBe(1);
+    logReportCounterConsistency({
+      tradesExecuted: s.tradesExecuted,
+      validOpportunities: s.validOpportunities,
+      candidateOpportunities: s.candidateOpportunities,
+      spikeEventsDetected: s.spikeEventsDetected,
+    });
+    expect(err).not.toHaveBeenCalled();
     err.mockRestore();
   });
 });

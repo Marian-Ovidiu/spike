@@ -23,13 +23,42 @@ export type EvaluateExitConditionsInput = {
   now?: number;
 };
 
+/** Independent exit-rule booleans (for diagnostics; not evaluation order). */
+export type ExitDiagnosticsFlags = {
+  inputsValid: boolean;
+  targetHit: boolean;
+  stopHit: boolean;
+  timeoutReached: boolean;
+  elapsedMs: number;
+};
+
+function exitInputsInvalid(input: EvaluateExitConditionsInput): boolean {
+  const {
+    currentPrice,
+    exitPrice,
+    stopLoss,
+    openedAt,
+    timeoutMs = DEFAULT_EXIT_TIMEOUT_MS,
+    now = Date.now(),
+  } = input;
+  return (
+    !Number.isFinite(currentPrice) ||
+    !Number.isFinite(exitPrice) ||
+    !Number.isFinite(stopLoss) ||
+    !Number.isFinite(openedAt) ||
+    !Number.isFinite(now) ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs < 0
+  );
+}
+
 /**
- * Long-position exit rules: profit at or above `exitPrice`, stop at or below `stopLoss`,
- * or time in position ≥ `timeoutMs`. Evaluation order: profit → stop → timeout.
+ * Snapshot of which exit bands the current mark satisfies (profit / stop / timeout),
+ * without applying evaluation precedence.
  */
-export function evaluateExitConditions(
+export function computeExitDiagnosticsFlags(
   input: EvaluateExitConditionsInput
-): ExitEvaluation {
+): ExitDiagnosticsFlags {
   const {
     currentPrice,
     exitPrice,
@@ -39,17 +68,45 @@ export function evaluateExitConditions(
     now = Date.now(),
   } = input;
 
-  if (
-    !Number.isFinite(currentPrice) ||
-    !Number.isFinite(exitPrice) ||
-    !Number.isFinite(stopLoss) ||
-    !Number.isFinite(openedAt) ||
-    !Number.isFinite(now) ||
-    !Number.isFinite(timeoutMs) ||
-    timeoutMs < 0
-  ) {
+  if (exitInputsInvalid(input)) {
+    return {
+      inputsValid: false,
+      targetHit: false,
+      stopHit: false,
+      timeoutReached: false,
+      elapsedMs: 0,
+    };
+  }
+
+  const elapsedMs = now - openedAt;
+  return {
+    inputsValid: true,
+    targetHit: currentPrice >= exitPrice,
+    stopHit: currentPrice <= stopLoss,
+    timeoutReached: elapsedMs >= timeoutMs,
+    elapsedMs,
+  };
+}
+
+/**
+ * Long-position exit rules: profit at or above `exitPrice`, stop at or below `stopLoss`,
+ * or time in position ≥ `timeoutMs`. Evaluation order: profit → stop → timeout.
+ */
+export function evaluateExitConditions(
+  input: EvaluateExitConditionsInput
+): ExitEvaluation {
+  if (exitInputsInvalid(input)) {
     return { shouldExit: false, reason: null };
   }
+
+  const {
+    currentPrice,
+    exitPrice,
+    stopLoss,
+    openedAt,
+    timeoutMs = DEFAULT_EXIT_TIMEOUT_MS,
+    now = Date.now(),
+  } = input;
 
   if (currentPrice >= exitPrice) {
     return { shouldExit: true, reason: "profit" };

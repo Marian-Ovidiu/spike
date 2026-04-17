@@ -5,7 +5,7 @@ export type UnstableContextMode = "hard" | "soft";
 
 export type UnstablePreSpikeContextMetrics = {
   stableRangeDetected: boolean;
-  priorRangePercent: number;
+  priorRangeFraction: number;
   threshold: number;
 };
 
@@ -23,7 +23,7 @@ function unstableConditionMet(
   entry: EntryEvaluation,
   threshold: number
 ): boolean {
-  return !entry.stableRangeDetected && entry.priorRangePercent > threshold;
+  return !entry.stableRangeDetected && entry.priorRangeFraction > threshold;
 }
 
 /**
@@ -51,7 +51,7 @@ export function evaluateHardRejectContext(input: {
 
   const metrics: UnstablePreSpikeContextMetrics = {
     stableRangeDetected: input.entry.stableRangeDetected,
-    priorRangePercent: input.entry.priorRangePercent,
+    priorRangeFraction: input.entry.priorRangeFraction,
     threshold,
   };
 
@@ -89,7 +89,7 @@ export function applyUnstableSoftOverlayOnQualityGate(
     "unstable_pre_spike_context_soft_handling",
     ...(m
       ? [
-          `unstable_context_prior_gt_threshold:prior=${m.priorRangePercent}_thr=${m.threshold}_stableDetected=${m.stableRangeDetected}`,
+          `unstable_context_prior_gt_threshold:priorFrac=${m.priorRangeFraction}_thr=${m.threshold}_stableDetected=${m.stableRangeDetected}`,
         ]
       : []),
   ];

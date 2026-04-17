@@ -1,4 +1,3 @@
-import { getBTCPrice } from "./btcPriceService.js";
 import type { AppConfig } from "./config.js";
 import {
   evaluateEntryConditions,
@@ -6,15 +5,12 @@ import {
 } from "./entryConditions.js";
 import { logValidOpportunityBlock } from "./monitorConsole.js";
 import type { EntryEvaluation } from "./entryConditions.js";
-import {
-  fetchPolymarketYesNoForBtc,
-  isPolymarketGammaEnabled,
-  polymarketToStrategySides,
-} from "./polymarketGamma.js";
 import type { OpportunityTracker } from "./opportunityTracker.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulationEngine } from "./simulationEngine.js";
 import { classifySpikeQuality } from "./spikeQualityClassifier.js";
+import type { SpotMarketFeed } from "./adapters/binanceSpotFeed.js";
+import type { SpotMicrostructure } from "./spotSpreadFilter.js";
 
 /** Live / backtest cadence (ms). */
 export const BOT_TICK_INTERVAL_MS = 5_000;
@@ -27,35 +23,41 @@ export type BotContext = {
   simulation: SimulationEngine;
   config: AppConfig;
   opportunityTracker: OpportunityTracker;
+  /** Binance Spot WS feed (monitor) or {@link PaperBinanceFeed} for local runs. */
+  marketFeed: SpotMarketFeed;
+  /** e.g. BTCUSDT */
+  tradeSymbol: string;
 };
 
-async function resolveBinarySidePrices(
-  btc: number
-): Promise<{ upSidePrice: number; downSidePrice: number } | null> {
-  if (!isPolymarketGammaEnabled()) {
-    const rawUp = process.env.UP_SIDE_PRICE?.trim();
-    const rawDown = process.env.DOWN_SIDE_PRICE?.trim();
-    const up =
-      rawUp !== undefined && rawUp !== "" ? Number(rawUp) : Number.NaN;
-    const down =
-      rawDown !== undefined && rawDown !== "" ? Number(rawDown) : Number.NaN;
-    if (!Number.isFinite(up) || !Number.isFinite(down)) {
-      console.error(
-        "[bot] Set UP_SIDE_PRICE and DOWN_SIDE_PRICE when Polymarket Gamma is disabled (BINARY_MARKET_SOURCE=env), or enable Gamma."
-      );
-      return null;
-    }
-    return { upSidePrice: up, downSidePrice: down };
+export type ReadyTickMarketData = {
+  book: SpotMicrostructure;
+  /** True when last WS message is older than config.feedStaleMaxAgeMs. */
+  feedPossiblyStale: boolean;
+};
+
+async function resolveSpotBook(
+  ctx: BotContext
+): Promise<{ book: SpotMicrostructure; feedPossiblyStale: boolean } | null> {
+  const b = ctx.marketFeed.getNormalizedBook();
+  if (b === null) {
+    return null;
   }
-  const pm = await fetchPolymarketYesNoForBtc(btc);
-  if (!pm) return null;
-  return polymarketToStrategySides(pm);
+  const age = ctx.marketFeed.getLastMessageAgeMs();
+  const feedPossiblyStale =
+    Number.isFinite(age) && age > ctx.config.feedStaleMaxAgeMs;
+  const book: SpotMicrostructure = {
+    bestBid: b.bestBid,
+    bestAsk: b.bestAsk,
+    midPrice: b.midPrice,
+    spreadBps: b.spreadBps,
+  };
+  return { book, feedPossiblyStale };
 }
 
 export type StrategyTickResult =
   | { kind: "no_btc" }
   | { kind: "warming"; btc: number; n: number; cap: number }
-  | { kind: "no_sides"; btc: number; n: number; cap: number }
+  | { kind: "no_book"; btc: number; n: number; cap: number }
   | {
       kind: "ready";
       btc: number;
@@ -64,18 +66,21 @@ export type StrategyTickResult =
       prev: number;
       last: number;
       prices: readonly number[];
-      sides: { upSidePrice: number; downSidePrice: number };
+      sides: SpotMicrostructure;
       entry: EntryEvaluation;
+      market: ReadyTickMarketData;
     };
 
 export async function runStrategyTick(
   ctx: BotContext
 ): Promise<StrategyTickResult> {
   const { priceBuffer, config } = ctx;
-  const btc = await getBTCPrice();
-  if (btc === null) {
+  const resolved = await resolveSpotBook(ctx);
+  if (resolved === null) {
     return { kind: "no_btc" };
   }
+  const { book, feedPossiblyStale } = resolved;
+  const btc = book.midPrice;
 
   priceBuffer.addPrice(btc);
   const prices = priceBuffer.getPrices();
@@ -92,9 +97,8 @@ export async function runStrategyTick(
     return { kind: "warming", btc, n, cap };
   }
 
-  const sides = await resolveBinarySidePrices(btc);
-  if (sides === null) {
-    return { kind: "no_sides", btc, n, cap };
+  if (!Number.isFinite(book.spreadBps) || book.bestAsk < book.bestBid) {
+    return { kind: "no_book", btc, n, cap };
   }
 
   const entry = evaluateEntryConditions({
@@ -107,12 +111,11 @@ export async function runStrategyTick(
     spikeThreshold: config.spikeThreshold,
     spikeMinRangeMultiple: config.spikeMinRangeMultiple,
     borderlineMinRatio: config.borderlineMinRatio,
-    entryPrice: config.entryPrice,
-    maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-    neutralQuoteBandMin: config.neutralQuoteBandMin,
-    neutralQuoteBandMax: config.neutralQuoteBandMax,
-    upSidePrice: sides.upSidePrice,
-    downSidePrice: sides.downSidePrice,
+    maxEntrySpreadBps: config.maxEntrySpreadBps,
+    bestBid: book.bestBid,
+    bestAsk: book.bestAsk,
+    midPrice: book.midPrice,
+    spreadBps: book.spreadBps,
   });
 
   return {
@@ -123,8 +126,9 @@ export async function runStrategyTick(
     prev,
     last,
     prices,
-    sides,
+    sides: book,
     entry,
+    market: { book, feedPossiblyStale },
   };
 }
 
@@ -133,20 +137,20 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
   const now = Date.now();
 
   if (tick.kind === "no_btc") {
-    console.log("[BOT] BTC fetch failed — skip tick");
+    console.log("[BOT] No spot book / feed — skip tick");
     return;
   }
 
   if (tick.kind === "warming") {
     console.log(
-      `[BOT] Warmup ${tick.n}/${MIN_SAMPLES_FOR_STRATEGY} | BTC $${tick.btc.toFixed(2)}`
+      `[BOT] Warmup ${tick.n}/${MIN_SAMPLES_FOR_STRATEGY} | mid $${tick.btc.toFixed(2)}`
     );
     return;
   }
 
-  if (tick.kind === "no_sides") {
+  if (tick.kind === "no_book") {
     console.log(
-      `[BOT] No binary quotes | BTC $${tick.btc.toFixed(2)} | buf ${tick.n}/${tick.cap}`
+      `[BOT] Invalid book | mid $${tick.btc.toFixed(2)} | buf ${tick.n}/${tick.cap}`
     );
     return;
   }
@@ -171,9 +175,12 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
       ? { entryQualityProfile }
       : {}),
     sides,
+    symbol: ctx.tradeSymbol,
     config: {
-      exitPrice: ctx.config.exitPrice,
-      stopLoss: ctx.config.stopLoss,
+      takeProfitBps: ctx.config.takeProfitBps,
+      stopLossBps: ctx.config.stopLossBps,
+      paperSlippageBps: ctx.config.paperSlippageBps,
+      paperFeeRoundTripBps: ctx.config.paperFeeRoundTripBps,
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
       stakePerTrade: ctx.config.stakePerTrade,
@@ -187,7 +194,7 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
 
   const pos = ctx.simulation.getOpenPosition();
   const posStr = pos
-    ? `open ${pos.direction} stake=${pos.stake.toFixed(2)} sh=${pos.shares.toFixed(4)}@${pos.entryPrice.toFixed(4)}`
+    ? `open ${pos.direction} stake=${pos.stake.toFixed(2)} qty=${pos.shares.toFixed(6)}@${pos.entryPrice.toFixed(2)}`
     : "flat";
 
   const recorded = ctx.opportunityTracker.recordFromReadyTick({
@@ -204,6 +211,8 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
     allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
     allowWeakQualityOnlyForStrongSpikes:
       ctx.config.allowWeakQualityOnlyForStrongSpikes,
+    allowAcceptableQualityStrongSpikes:
+      ctx.config.allowAcceptableQualityStrongSpikes,
   });
   if (recorded?.entryAllowed) {
     logValidOpportunityBlock(recorded);
@@ -215,7 +224,7 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
       : ` | ${formatEntryReasonsForLog(entry)}`;
 
   console.log(
-    `[BOT] BTC $${tick.btc.toFixed(2)} | YES ${sides.upSidePrice.toFixed(4)} NO ${sides.downSidePrice.toFixed(4)} | ${entry.direction ?? "—"} enter=${entry.shouldEnter}${why} | ${posStr}`
+    `[BOT] ${ctx.tradeSymbol} mid $${tick.btc.toFixed(2)} bid ${sides.bestBid.toFixed(2)} ask ${sides.bestAsk.toFixed(2)} spr ${sides.spreadBps.toFixed(2)}bps | ${entry.direction ?? "—"} enter=${entry.shouldEnter}${why} | ${posStr}`
   );
 }
 

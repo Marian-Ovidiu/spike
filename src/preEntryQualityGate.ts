@@ -12,6 +12,10 @@ export const DEFAULT_TRADABLE_SPIKE_MIN_PERCENT = 0.0015;
 export const DEFAULT_MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY = 0.0015;
 const DEFAULT_EXCEPTIONAL_SPIKE_MIN_PERCENT = 0.0025;
 
+/** Added to {@link PreEntryQualityGateResult.qualityGateReasons} when opt-in allows acceptable-profile strong spikes. */
+export const ACCEPTABLE_QUALITY_STRONG_SPIKE_GATE_REASON =
+  "acceptable_quality_strong_spike_allowed_by_config";
+
 /** Structured trace for diagnostics; classification is rule-based (no numeric score). */
 export type QualityGateRuleCheck = {
   ruleId: string;
@@ -39,7 +43,8 @@ export type QualityGateDiagnostics = {
     /** Same unit as opportunity `spikePercent` (percent points, e.g. 0.18 = 0.18%). */
     spikePercent: number;
     thresholdRatio: number;
-    priorRangePercent: number;
+    /** Prior-window (max−min)/min as a fraction; compare to maxPriorRangeForNormalEntry. */
+    priorRangeFraction: number;
     stableRangeDetected: boolean;
     stableRangeQuality: EntryEvaluation["stableRangeQuality"];
     entryReasonCodes: readonly string[];
@@ -58,11 +63,16 @@ export type QualityGateDiagnostics = {
     allowWeakQualityOnlyForStrongSpikes: boolean;
     priorOrNoiseBlocksWeakBypass: boolean;
   };
+  /** Opt-in pass for `acceptable` capped profile on `strong_spike` only. */
+  acceptableStrongSpikePolicy?: {
+    allowAcceptableQualityStrongSpikes: boolean;
+    overrideApplied: boolean;
+  };
   /** Set when pipeline merges unstable-context soft handling into this snapshot. */
   unstableContextHandling?: "none" | "hard_reject" | "soft_deferred";
   unstablePreSpikeContextMetrics?: {
     stableRangeDetected: boolean;
-    priorRangePercent: number;
+    priorRangeFraction: number;
     threshold: number;
   };
 };
@@ -105,6 +115,10 @@ export function evaluatePreEntryQualityGate(
      * When false, `borderline` with weak profile may also pass (still subject to prior/noise blocks).
      */
     allowWeakQualityOnlyForStrongSpikes?: boolean;
+    /**
+     * When true, `strong_spike` with capped profile `acceptable` may pass the gate (experimental).
+     */
+    allowAcceptableQualityStrongSpikes?: boolean;
   }
 ): PreEntryQualityGateResult {
   const reasons: string[] = [];
@@ -318,11 +332,11 @@ export function evaluatePreEntryQualityGate(
 
   ruleChecks.push({
     ruleId: "prior_range_vs_max_for_normal_entry",
-    passed: entry.priorRangePercent <= maxPriorRangeForNormalEntry,
-    detail: `priorRangePercent=${entry.priorRangePercent} max=${maxPriorRangeForNormalEntry}`,
+    passed: entry.priorRangeFraction <= maxPriorRangeForNormalEntry,
+    detail: `priorRangeFraction=${entry.priorRangeFraction} max=${maxPriorRangeForNormalEntry}`,
   });
 
-  if (entry.priorRangePercent > maxPriorRangeForNormalEntry) {
+  if (entry.priorRangeFraction > maxPriorRangeForNormalEntry) {
     const before = profile;
     profile = downgradeProfile(profile, "weak");
     if (before !== profile) {
@@ -341,6 +355,26 @@ export function evaluatePreEntryQualityGate(
     reasons.includes("trend_noise_rejection");
 
   let qualityGatePassed = profile === "strong" || profile === "exceptional";
+  const allowAcceptableStrong =
+    options?.allowAcceptableQualityStrongSpikes === true;
+  const acceptableStrongSpikeCase =
+    profile === "acceptable" && entry.movementClassification === "strong_spike";
+
+  if (
+    !qualityGatePassed &&
+    allowAcceptableStrong &&
+    acceptableStrongSpikeCase
+  ) {
+    qualityGatePassed = true;
+    reasons.push(ACCEPTABLE_QUALITY_STRONG_SPIKE_GATE_REASON);
+  }
+
+  ruleChecks.push({
+    ruleId: "acceptable_quality_strong_spike_policy",
+    passed: !acceptableStrongSpikeCase || qualityGatePassed,
+    detail: `allowAcceptableStrong=${allowAcceptableStrong} profile=${profile} movementClass=${entry.movementClassification} finalPass=${qualityGatePassed}`,
+  });
+
   const allowWeakOpt = options?.allowWeakQualityEntries === true;
   const onlyStrongOpt = options?.allowWeakQualityOnlyForStrongSpikes !== false;
 
@@ -418,7 +452,7 @@ export function evaluatePreEntryQualityGate(
       strongestMovePercent,
       spikePercent,
       thresholdRatio,
-      priorRangePercent: entry.priorRangePercent,
+      priorRangeFraction: entry.priorRangeFraction,
       stableRangeDetected: entry.stableRangeDetected,
       stableRangeQuality: entry.stableRangeQuality,
       entryReasonCodes: [...entry.reasons],
@@ -433,6 +467,12 @@ export function evaluatePreEntryQualityGate(
       allowWeakQualityEntries: allowWeakOpt,
       allowWeakQualityOnlyForStrongSpikes: onlyStrongOpt,
       priorOrNoiseBlocksWeakBypass: weakBypassDisqualified,
+    },
+    acceptableStrongSpikePolicy: {
+      allowAcceptableQualityStrongSpikes: allowAcceptableStrong,
+      overrideApplied: reasons.includes(
+        ACCEPTABLE_QUALITY_STRONG_SPIKE_GATE_REASON
+      ),
     },
   };
 

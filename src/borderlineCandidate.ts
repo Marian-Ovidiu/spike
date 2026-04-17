@@ -6,7 +6,7 @@ import {
   analyzePostSpikeConfirmation,
   type PostSpikeConfirmationResult,
 } from "./postSpikeConfirmationEngine.js";
-import { evaluateQuoteQuality } from "./quoteQualityFilter.js";
+import { evaluateSpotBookPipeline } from "./spotSpreadFilter.js";
 
 export type BorderlineCandidateStatus =
   | "watching"
@@ -29,8 +29,8 @@ export type BorderlineCandidate = {
   suggestedContrarianDirection: EntryDirection | null;
   watchTicksConfigured: number;
   watchTicksRemaining: number;
-  initialYesPrice: number;
-  initialNoPrice: number;
+  initialBestBid: number;
+  initialBestAsk: number;
   stableRangeDetected: boolean;
   watchedPrices: number[];
   status: BorderlineCandidateStatus;
@@ -89,10 +89,7 @@ export type EvaluateBorderlineWatchInput = {
     | "rangeThreshold"
     | "stableRangeSoftToleranceRatio"
     | "spikeThreshold"
-    | "entryPrice"
-    | "maxOppositeSideEntryPrice"
-    | "neutralQuoteBandMin"
-    | "neutralQuoteBandMax"
+    | "maxEntrySpreadBps"
     | "borderlineRequirePause"
     | "borderlineRequireNoContinuation"
     | "borderlineContinuationThreshold"
@@ -148,8 +145,8 @@ export function createBorderlineCandidate(
     ),
     watchTicksConfigured: Math.max(0, Math.trunc(input.watchTicks)),
     watchTicksRemaining: Math.max(0, Math.trunc(input.watchTicks)),
-    initialYesPrice: input.tick.sides.upSidePrice,
-    initialNoPrice: input.tick.sides.downSidePrice,
+    initialBestBid: input.tick.sides.bestBid,
+    initialBestAsk: input.tick.sides.bestAsk,
     stableRangeDetected: input.stableRangeDetected,
     watchedPrices: [],
     status: "watching",
@@ -417,11 +414,15 @@ export function evaluateBorderlineWatchDecision(
   if (!ws) {
     return { action: "cancel", reason: "missing_window_spike_payload" };
   }
-  if (
-    !Number.isFinite(tick.sides.upSidePrice) ||
-    !Number.isFinite(tick.sides.downSidePrice)
-  ) {
+  const bookGate = evaluateSpotBookPipeline(
+    tick.sides,
+    config.maxEntrySpreadBps
+  );
+  if (bookGate === "invalid_book") {
     return { action: "cancel", reason: "invalid_market_prices" };
+  }
+  if (bookGate === "spread_too_wide") {
+    return { action: "cancel", reason: "spread_too_wide" };
   }
 
   if (
@@ -447,22 +448,6 @@ export function evaluateBorderlineWatchDecision(
 
   if (candidate.suggestedContrarianDirection === null) {
     return { action: "expire", reason: "no_contrarian_direction" };
-  }
-
-  const quoteBlocker = evaluateQuoteQuality({
-    upSidePrice: tick.sides.upSidePrice,
-    downSidePrice: tick.sides.downSidePrice,
-    direction: candidate.suggestedContrarianDirection,
-    entryPrice: config.entryPrice,
-    maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-    neutralQuoteBandMin: config.neutralQuoteBandMin,
-    neutralQuoteBandMax: config.neutralQuoteBandMax,
-  });
-  if (quoteBlocker === "market_quotes_too_neutral") {
-    return { action: "cancel", reason: "market_quotes_too_neutral" };
-  }
-  if (quoteBlocker === "opposite_side_price_too_high") {
-    return { action: "cancel", reason: "opposite_side_too_expensive" };
   }
 
   if (cooldownBlocked) {
@@ -527,7 +512,7 @@ export function buildPromotedEntryEvaluation(
     direction: candidate.suggestedContrarianDirection,
     reasons: [],
     stableRangeDetected: baseEntry.stableRangeDetected,
-    priorRangePercent: baseEntry.priorRangePercent,
+    priorRangeFraction: baseEntry.priorRangeFraction,
     stableRangeQuality: baseEntry.stableRangeQuality,
     rangeDecisionNote: baseEntry.rangeDecisionNote,
     movementClassification: baseEntry.movementClassification,

@@ -8,6 +8,7 @@
     "dev": "tsc --watch",
     "monitor": "npm run build && node dist/liveMonitor.js",
     "backtest": "npm run build && node dist/backtestRunner.js",
+    "replay-opportunities": "npm run build && node dist/replayOpportunities.js",
     "test": "vitest run"
   },
   "keywords": [],
@@ -21,6 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.2",
     "vitest": "^3.2.4"

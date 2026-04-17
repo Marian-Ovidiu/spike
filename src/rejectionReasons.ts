@@ -15,7 +15,9 @@ export type NormalizedRejectionReason =
   | "strong_spike_continuation"
   | "opposite_side_price_too_high"
   | "market_quotes_too_neutral"
-  | "no_signal_below_borderline";
+  | "no_signal_below_borderline"
+  | "feed_stale"
+  | "quote_feed_stale";
 
 const ORDER: readonly NormalizedRejectionReason[] = [
   "missing_quote_data",
@@ -32,6 +34,8 @@ const ORDER: readonly NormalizedRejectionReason[] = [
   "opposite_side_price_too_high",
   "market_quotes_too_neutral",
   "no_signal_below_borderline",
+  "feed_stale",
+  "quote_feed_stale",
 ];
 
 export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string> = {
@@ -51,6 +55,9 @@ export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string
   opposite_side_price_too_high: "opposite-side quote too high",
   market_quotes_too_neutral: "market quotes too neutral",
   no_signal_below_borderline: "no signal: movement below borderline threshold",
+  feed_stale: "market data feed stale (no recent Binance book/trade updates)",
+  quote_feed_stale:
+    "legacy: binary quote feed stale (maps to feed_stale in new logs)",
 };
 
 function dedupeAndOrder(
@@ -69,6 +76,8 @@ function normalizeRawReason(
     return "opposite_side_price_too_high";
   }
   if (raw === "market_quotes_too_neutral") return "market_quotes_too_neutral";
+  if (raw === "feed_stale") return "feed_stale";
+  if (raw === "quote_feed_stale") return "quote_feed_stale";
   if (raw === "market_not_stable" || raw === "range_too_noisy_for_entry") {
     return "pre_spike_range_too_noisy";
   }
@@ -167,6 +176,10 @@ export function normalizeDecisionRejectionReasons(input: {
     decision.criticalBlockerUsed === "hard_reject_unstable_pre_spike_context"
   ) {
     out.push("hard_reject_unstable_pre_spike_context");
+  } else if (decision.criticalBlockerUsed === "feed_stale") {
+    out.push("feed_stale");
+  } else if (decision.criticalBlockerUsed === "quote_feed_stale") {
+    out.push("quote_feed_stale");
   } else if (decision.criticalBlockerUsed === "poor_range_hard_reject") {
     out.push("pre_spike_range_too_noisy");
   }

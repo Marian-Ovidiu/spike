@@ -5,6 +5,7 @@ import {
   type BotContext,
 } from "./botLoop.js";
 import { config, debugMonitor, logConfig } from "./config.js";
+import { aggregateHoldExitAudits } from "./holdExitAudit.js";
 import {
   buildMonitorSessionSummary,
   MonitorFilePersistence,
@@ -30,7 +31,7 @@ import { computeStrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulatedTrade } from "./simulationEngine.js";
 import { SimulationEngine } from "./simulationEngine.js";
-import { isPolymarketGammaEnabled } from "./polymarketGamma.js";
+import { BinanceSpotFeed } from "./adapters/binanceSpotFeed.js";
 import { OpportunityTracker } from "./opportunityTracker.js";
 import {
   evaluateSession,
@@ -42,6 +43,8 @@ import {
 } from "./borderlineCandidateStore.js";
 import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
 import {
+  applyFeedStaleEntryBlock,
+  entryEvaluationForPipelinePaperExecution,
   formatStrategyDecisionLog,
   runStrategyDecisionPipeline,
 } from "./strategyDecisionPipeline.js";
@@ -50,13 +53,14 @@ const runtimeStats = new MonitorRuntimeStats({
   exceptionalSpikePercent: config.exceptionalSpikePercent,
 });
 const persistence = new MonitorFilePersistence();
+const binanceFeed = new BinanceSpotFeed();
 const spikeDebug = new SpikeDebugTracker();
 const borderlineManager = new BorderlineCandidateStore({
-  symbol: "BTCUSD",
+  symbol: binanceFeed.getSymbol(),
   watchTicks: config.borderlineWatchTicks,
 });
 const strongSpikeManager = new StrongSpikeCandidateStore({
-  symbol: "BTCUSD",
+  symbol: binanceFeed.getSymbol(),
   watchTicks: config.strongSpikeConfirmationTicks,
 });
 
@@ -73,7 +77,7 @@ function buildInterpretationLines(): string[] {
   ) {
     lines.push("market too flat");
   }
-  const blockedByQuotes =
+  const blockedByBook =
     runtimeStats.blockedByInvalidQuotes +
     runtimeStats.blockedByExpensiveOppositeSide +
     runtimeStats.blockedByNeutralQuotes;
@@ -85,8 +89,8 @@ function buildInterpretationLines(): string[] {
   if (trendNoiseFiltered >= runtimeStats.validOpportunities) {
     lines.push("trend/noise filter removed most signals");
   }
-  if (blockedByQuotes > 0 && blockedByQuotes >= runtimeStats.validOpportunities) {
-    lines.push("quote quality blocked most entries");
+  if (blockedByBook > 0 && blockedByBook >= runtimeStats.validOpportunities) {
+    lines.push("wide spread or invalid book blocked most entries");
   }
   if (runtimeStats.cooldownOverridesUsed > 0 && runtimeStats.exceptionalSpikeEntries > 0) {
     lines.push("exceptional spikes bypassed cooldown successfully");
@@ -134,7 +138,9 @@ function gracefulShutdown(): void {
     opportunities: ctx.opportunityTracker.getOpportunities(),
     borderlineCandidatesCreated: runtimeStats.borderlineCandidatesCreated,
     tradesExecuted: runtimeStats.tradesExecuted,
+    strategyApprovedEntryTicks: runtimeStats.validOpportunities,
   });
+  const exitThresholdAudit = aggregateHoldExitAudits(simulation.getTradeHistory());
   printShutdownReport(
     monitorStartedAtMs,
     {
@@ -162,6 +168,12 @@ function gracefulShutdown(): void {
       verdict: borderlineImpactVerdict(),
       gateFunnel,
       testMode: config.testMode,
+      exitThresholdAudit,
+      binanceFeedDiagnostics: {
+        symbol: binanceFeed.getSymbol(),
+        health: binanceFeed.getHealth(),
+        lastMessageAgeMs: binanceFeed.getLastMessageAgeMs(),
+      },
     }
   );
   for (const line of buildInterpretationLines()) {
@@ -248,9 +260,15 @@ function gracefulShutdown(): void {
           interpretation: buildInterpretationLines(),
           gateFunnel,
           testMode: config.testMode,
+          exitThresholdAudit,
           ...(config.testMode
             ? { testModeLabel: "TEST MODE ACTIVE" as const }
             : {}),
+          binanceFeedDiagnostics: {
+            symbol: binanceFeed.getSymbol(),
+            health: binanceFeed.getHealth(),
+            lastMessageAgeMs: binanceFeed.getLastMessageAgeMs(),
+          },
         },
       })
     );
@@ -349,9 +367,7 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
           ctx.config.tradableSpikeMinPercent,
           ctx.config.maxPriorRangeForNormalEntry,
           ctx.config.hardRejectPriorRangePercent,
-          ctx.config.maxOppositeSideEntryPrice,
-          ctx.config.neutralQuoteBandMin,
-          ctx.config.neutralQuoteBandMax,
+          ctx.config.maxEntrySpreadBps,
           tick.entry.windowSpike
             ? {
                 classification: tick.entry.windowSpike.classification,
@@ -385,10 +401,7 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
         strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
         exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
-        entryPrice: ctx.config.entryPrice,
-        maxOppositeSideEntryPrice: ctx.config.maxOppositeSideEntryPrice,
-        neutralQuoteBandMin: ctx.config.neutralQuoteBandMin,
-        neutralQuoteBandMax: ctx.config.neutralQuoteBandMax,
+        maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
         entryCooldownMs: ctx.config.entryCooldownMs,
         borderlineRequirePause: ctx.config.borderlineRequirePause,
         borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
@@ -399,6 +412,8 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
         allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
         allowWeakQualityOnlyForStrongSpikes:
           ctx.config.allowWeakQualityOnlyForStrongSpikes,
+        allowAcceptableQualityStrongSpikes:
+          ctx.config.allowAcceptableQualityStrongSpikes,
         unstableContextMode: ctx.config.unstableContextMode,
       },
     });
@@ -414,7 +429,13 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
     return;
   }
 
-  const pipeline = runStrategyDecisionPipeline({
+  persistence.ensureReady();
+
+  const feedStale =
+    tick.market.feedPossiblyStale ||
+    ctx.marketFeed.getLastMessageAgeMs() > ctx.config.feedStaleMaxAgeMs;
+
+  let pipeline = runStrategyDecisionPipeline({
     now,
     tick,
     manager: borderlineManager,
@@ -431,10 +452,7 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
       exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
       exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
-      entryPrice: ctx.config.entryPrice,
-      maxOppositeSideEntryPrice: ctx.config.maxOppositeSideEntryPrice,
-      neutralQuoteBandMin: ctx.config.neutralQuoteBandMin,
-      neutralQuoteBandMax: ctx.config.neutralQuoteBandMax,
+      maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
       entryCooldownMs: ctx.config.entryCooldownMs,
       borderlineRequirePause: ctx.config.borderlineRequirePause,
       borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
@@ -444,8 +462,16 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
       allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
       allowWeakQualityOnlyForStrongSpikes:
         ctx.config.allowWeakQualityOnlyForStrongSpikes,
+      allowAcceptableQualityStrongSpikes:
+        ctx.config.allowAcceptableQualityStrongSpikes,
       unstableContextMode: ctx.config.unstableContextMode,
     },
+  });
+  pipeline = applyFeedStaleEntryBlock(pipeline, {
+    tick,
+    simulation: sim,
+    config: ctx.config,
+    feedStale,
   });
   for (const ev of pipeline.borderlineLifecycleEvents) {
     logBorderlineLifecycleBlock(ev);
@@ -484,6 +510,10 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
   }
 
   const entryForSimulation = pipeline.entryForSimulation ?? tick.entry;
+  const paperEntry = entryEvaluationForPipelinePaperExecution(
+    pipeline.decision,
+    entryForSimulation
+  );
   if (debugMonitor && tick.entry.spikeDetected) {
     logSpikeDecisionTrace(
       buildSpikeDecisionTracePayload({
@@ -502,15 +532,18 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
   const promoting = action === "promote_borderline_candidate";
   sim.onTick({
     now,
-    entry: entryForSimulation,
+    entry: paperEntry,
     entryPath,
     ...(pipeline.decision.qualityProfile !== undefined
       ? { entryQualityProfile: pipeline.decision.qualityProfile }
       : {}),
     sides: tick.sides,
+    symbol: ctx.tradeSymbol,
     config: {
-      exitPrice: ctx.config.exitPrice,
-      stopLoss: ctx.config.stopLoss,
+      takeProfitBps: ctx.config.takeProfitBps,
+      stopLossBps: ctx.config.stopLossBps,
+      paperSlippageBps: ctx.config.paperSlippageBps,
+      paperFeeRoundTripBps: ctx.config.paperFeeRoundTripBps,
       exitTimeoutMs: ctx.config.exitTimeoutMs,
       entryCooldownMs: ctx.config.entryCooldownMs,
       stakePerTrade: ctx.config.stakePerTrade,
@@ -555,6 +588,8 @@ async function runMonitorTick(ctx: BotContext): Promise<void> {
     allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
     allowWeakQualityOnlyForStrongSpikes:
       ctx.config.allowWeakQualityOnlyForStrongSpikes,
+    allowAcceptableQualityStrongSpikes:
+      ctx.config.allowAcceptableQualityStrongSpikes,
     decision: pipeline.decision,
   });
   if (recorded !== null) {
@@ -581,9 +616,7 @@ function startLiveMonitor(ctx: BotContext): void {
   persistence.ensureReady();
   logConfig();
   printLiveMonitorBanner({
-    quotesDetail: isPolymarketGammaEnabled()
-      ? "Polymarket Gamma YES/NO"
-      : "UP_SIDE_PRICE / DOWN_SIDE_PRICE (env)",
+    dataSourceDetail: `Binance Spot ${binanceFeed.getSymbol()} (bookTicker + aggTrade WS, REST bootstrap)`,
     tickIntervalSec: BOT_TICK_INTERVAL_MS / 1000,
     bufferSlots: config.priceBufferSize,
     minSamples: MIN_SAMPLES_FOR_STRATEGY,
@@ -594,9 +627,7 @@ function startLiveMonitor(ctx: BotContext): void {
     strongSpikeConfirmationTicks: config.strongSpikeConfirmationTicks,
     exceptionalSpikePercent: config.exceptionalSpikePercent,
     exceptionalSpikeOverridesCooldown: config.exceptionalSpikeOverridesCooldown,
-    maxOppositeSideEntryPrice: config.maxOppositeSideEntryPrice,
-    neutralQuoteBandMin: config.neutralQuoteBandMin,
-    neutralQuoteBandMax: config.neutralQuoteBandMax,
+    maxEntrySpreadBps: config.maxEntrySpreadBps,
     persistPath: `${persistence.getOutputDir()} (JSONL + session-summary on exit)`,
     debugMode: debugMonitor,
     testMode: config.testMode,
@@ -666,6 +697,7 @@ const simulation = new SimulationEngine({
   silent: true,
   initialEquity: config.initialCapital,
   onTradeClosed: onPaperTradeClosed,
+  paperPositionMtmDiagnostics: config.paperPositionMtmDebug,
 });
 
 const ctx: BotContext = {
@@ -673,6 +705,14 @@ const ctx: BotContext = {
   simulation,
   opportunityTracker: new OpportunityTracker(),
   config,
+  marketFeed: binanceFeed,
+  tradeSymbol: binanceFeed.getSymbol(),
 };
 
-startLiveMonitor(ctx);
+void binanceFeed.bootstrapRest().then((ok) => {
+  if (!ok) {
+    console.warn("[monitor] REST bookTicker bootstrap failed — waiting for WebSocket");
+  }
+  binanceFeed.start();
+  startLiveMonitor(ctx);
+});

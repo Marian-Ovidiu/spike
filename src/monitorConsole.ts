@@ -4,6 +4,7 @@ import {
   type EntryEvaluation,
 } from "./entryConditions.js";
 import type { Opportunity } from "./opportunityTracker.js";
+import type { HoldExitAudit, HoldExitAuditSummary } from "./holdExitAudit.js";
 import {
   SimulationEngine,
   buildTransparentTradeLog,
@@ -13,6 +14,7 @@ import type {
   BorderlineLifecycleRenderEvent,
   StrategyDecision,
 } from "./strategyDecisionPipeline.js";
+import type { BinanceFeedHealth } from "./adapters/binanceSpotFeed.js";
 import {
   REJECTION_REASON_MESSAGES,
   type NormalizedRejectionReason,
@@ -122,20 +124,22 @@ export function formatMonitorTickLine(
 ): string {
   const t = fmtTime();
   if (tick.kind === "no_btc") {
-    return `[live] ${t}  │  BTC fetch failed`;
+    return `[live] ${t}  │  no spot book / feed`;
   }
   if (tick.kind === "warming") {
-    return `[live] ${t}  │  BTC $${fmtBtcUsd(tick.btc)}  │  warmup ${tick.n}/${minSamples}`;
+    return `[live] ${t}  │  mid $${fmtBtcUsd(tick.btc)}  │  warmup ${tick.n}/${minSamples}`;
   }
-  if (tick.kind === "no_sides") {
-    return `[live] ${t}  │  BTC $${fmtBtcUsd(tick.btc)}  │  no quotes  │  buf ${tick.n}/${tick.cap}`;
+  if (tick.kind === "no_book") {
+    return `[live] ${t}  │  mid $${fmtBtcUsd(tick.btc)}  │  invalid book  │  buf ${tick.n}/${tick.cap}`;
   }
 
   const { btc, n, cap, sides, entry } = tick;
   const rangeQuality = entry.stableRangeQuality ?? "poor";
   const movement = entry.movementClassification ?? "no_signal";
-  const y = fmtPrice(sides.upSidePrice);
-  const no = fmtPrice(sides.downSidePrice);
+  const bid = fmtPrice(sides.bestBid);
+  const ask = fmtPrice(sides.bestAsk);
+  const spr =
+    Number.isFinite(sides.spreadBps) ? `${sides.spreadBps.toFixed(2)}bps` : "n/a";
   const pos = sim.getOpenPosition();
   const simHint = pos
     ? `open ${pos.direction} stake ${pos.stake.toFixed(2)} sh ${pos.shares.toFixed(4)} @ ${fmtPrice(pos.entryPrice)}`
@@ -158,7 +162,7 @@ export function formatMonitorTickLine(
     sig += ` [move ${fmtPct4(entry.movement.strongestMovePercent * 100)} cls ${entry.movement.classification}]`;
   }
 
-  return `[live] ${t}  │  BTC $${fmtBtcUsd(btc)}  │  YES ${y}  NO ${no}  │  buf ${n}/${cap}  │  ${sig}  │  sim ${simHint}`;
+  return `[live] ${t}  │  mid $${fmtBtcUsd(btc)}  bid ${bid} ask ${ask} spr ${spr}  │  buf ${n}/${cap}  │  ${sig}  │  sim ${simHint}`;
 }
 
 /**
@@ -174,9 +178,7 @@ export function formatDebugTickExtras(
   tradableSpikeMinPercent: number,
   maxPriorRangeForNormalEntry: number,
   hardRejectPriorRangePercent: number,
-  maxOppositeSideEntryPrice: number,
-  neutralQuoteBandMin: number,
-  neutralQuoteBandMax: number,
+  maxEntrySpreadBps: number,
   movement?: {
     classification: "no_signal" | "borderline" | "strong_spike";
     thresholdRatio: number;
@@ -214,8 +216,6 @@ export function formatDebugTickExtras(
   const tradableSpikeMinPct = tradableSpikeMinPercent * 100;
   const priorRangeMaxPct = maxPriorRangeForNormalEntry * 100;
   const hardRejectPriorRangePct = hardRejectPriorRangePercent * 100;
-  const neutralMin = Math.min(neutralQuoteBandMin, neutralQuoteBandMax);
-  const neutralMax = Math.max(neutralQuoteBandMin, neutralQuoteBandMax);
   const priorRangeRatio =
     priorRangeMaxPct > 0
       ? rangePct / priorRangeMaxPct
@@ -232,7 +232,7 @@ export function formatDebugTickExtras(
     `  │  tradable min ${tradableSpikeMinPct.toFixed(4)}%` +
     `  │  prior max ${priorRangeMaxPct.toFixed(4)}% (${priorRangeRatio.toFixed(2)}x)` +
     `  │  hard reject ${hardRejectPriorRangePct.toFixed(4)}%` +
-    `  │  maxOpp ${maxOppositeSideEntryPrice.toFixed(4)} neutral [${neutralMin.toFixed(4)}, ${neutralMax.toFixed(4)}]` +
+    `  │  maxEntrySpr ${maxEntrySpreadBps.toFixed(2)}bps` +
     `  │  cls ${cls} (${ratio.toFixed(2)}x, src ${src})`,
   ].join("");
 }
@@ -255,9 +255,12 @@ function opportunityDetailRows(o: Opportunity): string[] {
     ),
     row("Quality", `${o.qualityProfile} (min ${fmtPct4(o.tradableSpikeMinPercent * 100)})`),
     row("Type / out", `${o.opportunityType} / ${o.opportunityOutcome}`),
-    row("Prior range", fmtPct4(o.priorRangePercent)),
+    row("Prior range", fmtPct4(o.priorRangeFraction * 100)),
     row("Range quality", o.stableRangeQuality),
-    row("YES / NO", `${fmtPrice(o.upSidePrice)} / ${fmtPrice(o.downSidePrice)}`),
+    row(
+      "Bid / ask / spr",
+      `${fmtPrice(o.bestBid)} / ${fmtPrice(o.bestAsk)} (${fmtPrice(o.midPrice)} mid, ${o.spreadBps.toFixed(2)} bps)`
+    ),
     row("Stable prior", o.stableRangeDetected ? "yes" : "no"),
     row("Ctx spike", o.spikeDetected ? "yes" : "no"),
     ...(o.qualityGateDiagnostics
@@ -375,10 +378,10 @@ export function formatBorderlineLifecycleBlock(
       e.currentBtcPrice === null ? "n/a" : `$${fmtBtcUsd(e.currentBtcPrice)}`
     ),
     row(
-      "YES / NO",
-      e.yesPrice === null || e.noPrice === null
+      "Bid / ask / spr",
+      e.bestBid === null || e.bestAsk === null
         ? "n/a"
-        : `${fmtPrice(e.yesPrice)} / ${fmtPrice(e.noPrice)}`
+        : `${fmtPrice(e.bestBid)} / ${fmtPrice(e.bestAsk)} (${e.midPrice !== null ? fmtBtcUsd(e.midPrice) : "n/a"} mid, ${e.spreadBps !== null ? `${e.spreadBps.toFixed(2)} bps` : "n/a"})`
     ),
     row("Post move", e.postMoveClassification ?? "n/a"),
     row("Reason", e.reason),
@@ -397,6 +400,24 @@ export function logBorderlineLifecycleBlock(
 /**
  * Expanded block when a paper trade closes.
  */
+function formatHoldExitAuditRows(a: HoldExitAudit): string[] {
+  return [
+    "",
+    "  ── Exit threshold audit (hold min/max vs EXIT / STOP) ──",
+    row("TP price (cfg)", fmtPrice(a.configExitPrice)),
+    row("SL price (cfg)", fmtPrice(a.configStopLoss)),
+    row("Hold mark lo", fmtPrice(a.holdMarkMin)),
+    row("Hold mark hi", fmtPrice(a.holdMarkMax)),
+    row("MFE (long)", fmtPrice(a.maxFavorableExcursion)),
+    row("MAE (long)", fmtPrice(a.maxAdverseExcursion)),
+    row("Min gap→TP", fmtPrice(a.minGapToProfitTarget)),
+    row("Min buf→SL", fmtPrice(a.minBufferAboveStop)),
+    row("Near target", a.targetWithinNearPriceBand ? "yes" : "no"),
+    row("Near stop", a.stopWithinNearPriceBand ? "yes" : "no"),
+    row("Timeout-only?", a.timeoutLikelyOnlyViableExit ? "likely" : "no"),
+  ];
+}
+
 export function formatPaperTradeClosedBlock(trade: SimulatedTrade): string {
   const holdMs = trade.closedAt - trade.openedAt;
   const log = buildTransparentTradeLog(trade);
@@ -418,6 +439,9 @@ export function formatPaperTradeClosedBlock(trade: SimulatedTrade): string {
     row("Hold time", formatHoldDurationMs(holdMs)),
     row("Opened at", new Date(trade.openedAt).toISOString()),
     row("Closed at", new Date(trade.closedAt).toISOString()),
+    ...(trade.holdExitAudit !== undefined
+      ? formatHoldExitAuditRows(trade.holdExitAudit)
+      : []),
     "",
     "  Full log (JSON, recalculable):",
     ...JSON.stringify(log, null, 2)
@@ -434,7 +458,8 @@ export function logPaperTradeClosedBlock(trade: SimulatedTrade): void {
 }
 
 export function printLiveMonitorBanner(params: {
-  quotesDetail: string;
+  /** e.g. Binance Spot bookTicker + aggTrade */
+  dataSourceDetail: string;
   tickIntervalSec: number;
   bufferSlots: number;
   minSamples: number;
@@ -445,9 +470,7 @@ export function printLiveMonitorBanner(params: {
   strongSpikeConfirmationTicks: number;
   exceptionalSpikePercent: number;
   exceptionalSpikeOverridesCooldown: boolean;
-  maxOppositeSideEntryPrice: number;
-  neutralQuoteBandMin: number;
-  neutralQuoteBandMax: number;
+  maxEntrySpreadBps: number;
   persistPath: string;
   debugMode?: boolean;
   /** When true, prints an explicit diagnostic banner (TEST_MODE=1). */
@@ -459,7 +482,7 @@ export function printLiveMonitorBanner(params: {
   if (params.testMode === true) {
     console.log(`${"Mode".padEnd(L)} TEST MODE ACTIVE — diagnostic preset (not production)`);
   }
-  console.log(`${"Quotes".padEnd(L)} ${params.quotesDetail}`);
+  console.log(`${"Data".padEnd(L)} ${params.dataSourceDetail}`);
   console.log(`${"Tick".padEnd(L)} every ${params.tickIntervalSec}s`);
   console.log(
     `${"Buffer".padEnd(L)} ${params.bufferSlots} slots (min ${params.minSamples} samples)`
@@ -478,7 +501,7 @@ export function printLiveMonitorBanner(params: {
     `${"Exceptional".padEnd(L)} >= ${fmtPct4(params.exceptionalSpikePercent * 100)} | cooldown override ${params.exceptionalSpikeOverridesCooldown ? "ON" : "OFF"}`
   );
   console.log(
-    `${"Quote caps".padEnd(L)} opposite<=${fmtPrice(params.maxOppositeSideEntryPrice)} | neutral [${fmtPrice(Math.min(params.neutralQuoteBandMin, params.neutralQuoteBandMax))}, ${fmtPrice(Math.max(params.neutralQuoteBandMin, params.neutralQuoteBandMax))}]`
+    `${"Spread cap".padEnd(L)} max entry spread ${params.maxEntrySpreadBps.toFixed(2)} bps (bid/ask)`
   );
   console.log(`${"Orders".padEnd(L)} none — monitor never sends real orders`);
   console.log(`${"Paper sim".padEnd(L)} strategy entries; trade block on each close`);
@@ -649,6 +672,13 @@ export function printShutdownReport(
     gateFunnel?: StrongSpikeGateFunnel;
     /** When true, every shutdown report line is clearly marked as diagnostic. */
     testMode?: boolean;
+    exitThresholdAudit?: HoldExitAuditSummary | null;
+    /** Binance public WS health at shutdown (live monitor). */
+    binanceFeedDiagnostics?: {
+      symbol: string;
+      health: BinanceFeedHealth;
+      lastMessageAgeMs: number;
+    };
   }
 ): void {
   const durationMs = Math.max(0, Date.now() - startedAtMs);
@@ -716,6 +746,48 @@ export function printShutdownReport(
         console.log(ln);
       }
     }
+    if (extended.binanceFeedDiagnostics !== undefined) {
+      const { symbol, health, lastMessageAgeMs } = extended.binanceFeedDiagnostics;
+      console.log("");
+      console.log("──────── Binance Spot feed (session) ────────");
+      console.log(
+        `${"Symbol".padEnd(14)} ${symbol}  connected=${health.connected}  lastMsgAge≈${Math.round(lastMessageAgeMs)}ms`
+      );
+      console.log(
+        `${"WS stats".padEnd(14)} connects ${health.connectCount}  disconnects ${health.disconnectCount}  msgs ${health.messagesTotal}`
+      );
+      if (health.lastError !== null) {
+        console.log(`${"Last WS err".padEnd(14)} ${health.lastError}`);
+      }
+      console.log("────────────────────────────────────────────────────────────────────");
+    }
+    if (extended.exitThresholdAudit !== undefined && extended.exitThresholdAudit !== null) {
+      const a = extended.exitThresholdAudit;
+      console.log("");
+      console.log("──────── Exit thresholds vs observed marks (closed trades) ────────");
+      console.log(
+        `${"Audited".padEnd(14)} ${a.tradesAudited} closed trade(s) with hold min/max marks`
+      );
+      console.log(
+        `${"Timeouts".padEnd(14)} ${a.closedByTimeout}  │  likely only viable exit: ${a.timeoutsLikelyOnlyViableExit} (${a.pctTimeoutsOnlyViableExit.toFixed(1)}% of timeouts, ${a.pctAllTradesTimeoutOnlyViable.toFixed(1)}% of all)`
+      );
+      console.log(
+        `${"Near target".padEnd(14)} ${a.tradesEverNearTarget} trade(s) (best gap ≤ ${a.nearTargetPriceThreshold.toFixed(4)} to EXIT_PRICE)`
+      );
+      console.log(
+        `${"Near stop".padEnd(14)} ${a.tradesEverNearStop} trade(s) (tightest buffer ≤ ${a.nearStopPriceThreshold.toFixed(4)} above STOP_LOSS)`
+      );
+      console.log(
+        `${"Avg gap→TP".padEnd(14)} ${a.avgMinGapToProfitTarget.toFixed(4)} (lower = closer to target at high mark)`
+      );
+      console.log(
+        `${"Avg buffer→SL".padEnd(14)} ${a.avgMinBufferAboveStop.toFixed(4)} (lower = closer to stop at low mark)`
+      );
+      console.log(
+        `${"Avg MFE / MAE".padEnd(14)} ${a.avgMaxFavorableExcursion.toFixed(4)} / ${a.avgMaxAdverseExcursion.toFixed(4)}`
+      );
+      console.log("────────────────────────────────────────────────────────────────────");
+    }
   }
   console.log("══════════════════════════════════════════════════════════════");
   console.log("");
@@ -723,9 +795,9 @@ export function printShutdownReport(
 
 /** JSON-serializable spike snapshot for DEBUG_MONITOR decision tracing. */
 export type SpikeDecisionTracePayload = {
-  /** Strongest window move as percent (e.g. 0.42 = 0.42%). */
+  /** Strongest window move as percent points (e.g. 0.42 = 0.42%). */
   spikePercent: number;
-  /** Prior-window relative range percent (context chop). */
+  /** Prior-window relative range as percent points (fraction × 100), same convention as spikePercent. */
   priorRange: number;
   /** Whether pre-spike range passed stability detection. */
   stableRange: boolean;
@@ -766,7 +838,7 @@ export function buildSpikeDecisionTracePayload(input: {
     decision.action === "promote_borderline_candidate";
   return {
     spikePercent: entry.movement.strongestMovePercent * 100,
-    priorRange: entry.priorRangePercent,
+    priorRange: entry.priorRangeFraction * 100,
     stableRange: entry.stableRangeDetected,
     classification: entry.movementClassification,
     entryAllowed,

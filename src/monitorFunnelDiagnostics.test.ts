@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { Opportunity } from "./opportunityTracker.js";
-import { computeStrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
+import {
+  computeStrongSpikeGateFunnel,
+  formatGateFunnelSection,
+} from "./monitorFunnelDiagnostics.js";
 
 function diag(passed: boolean) {
   return {
@@ -15,7 +18,7 @@ function diag(passed: boolean) {
       strongestMovePercent: 0.002,
       spikePercent: 0.2,
       thresholdRatio: 2,
-      priorRangePercent: 0.001,
+      priorRangeFraction: 0.001,
       stableRangeDetected: true,
       stableRangeQuality: "good" as const,
       entryReasonCodes: [],
@@ -39,7 +42,7 @@ function strongBase(over: Partial<Opportunity>): Opportunity {
     spikePercent: 0.2,
     spikeSource: "tick-1",
     spikeReferencePrice: 100_000,
-    priorRangePercent: 0.0005,
+    priorRangeFraction: 0.0005,
     upSidePrice: 0.35,
     downSidePrice: 0.65,
     stableRangeDetected: true,
@@ -116,5 +119,19 @@ describe("computeStrongSpikeGateFunnel", () => {
       tradesExecuted: 0,
     });
     expect(f.spikesDetected).toBe(0);
+  });
+
+  it("uses runtime strategy-approved ticks so opened % is not inflated vs zero JSONL-valid", () => {
+    const f = computeStrongSpikeGateFunnel({
+      opportunities: [],
+      borderlineCandidatesCreated: 0,
+      tradesExecuted: 3,
+      strategyApprovedEntryTicks: 3,
+    });
+    expect(f.validOpportunities).toBe(0);
+    expect(f.strategyApprovedEntryTicks).toBe(3);
+    const block = formatGateFunnelSection(f).join("\n");
+    expect(block).toContain("Opened trades (paper sim)");
+    expect(block).toMatch(/100\.0% of max\(JSONL-valid, runtime-approved\)/);
   });
 });

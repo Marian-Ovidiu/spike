@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  computeExitDiagnosticsFlags,
   DEFAULT_EXIT_TIMEOUT_MS,
   evaluateExitConditions,
 } from "./exitConditions.js";
@@ -88,5 +89,34 @@ describe("evaluateExitConditions", () => {
         currentPrice: Number.NaN,
       }).shouldExit
     ).toBe(false);
+  });
+});
+
+describe("computeExitDiagnosticsFlags", () => {
+  it("reports independent target/stop/timeout booleans", () => {
+    const d = computeExitDiagnosticsFlags({
+      currentPrice: 0.3,
+      exitPrice: 0.5,
+      stopLoss: 0.1,
+      openedAt: 1_000_000,
+      now: 1_000_000 + DEFAULT_EXIT_TIMEOUT_MS,
+      timeoutMs: DEFAULT_EXIT_TIMEOUT_MS,
+    });
+    expect(d.inputsValid).toBe(true);
+    expect(d.targetHit).toBe(false);
+    expect(d.stopHit).toBe(false);
+    expect(d.timeoutReached).toBe(true);
+    expect(d.elapsedMs).toBe(DEFAULT_EXIT_TIMEOUT_MS);
+  });
+
+  it("returns inputsValid false for NaN mark", () => {
+    const d = computeExitDiagnosticsFlags({
+      currentPrice: Number.NaN,
+      exitPrice: 0.5,
+      stopLoss: 0.1,
+      openedAt: 1_000_000,
+      now: 1_000_001,
+    });
+    expect(d.inputsValid).toBe(false);
   });
 });

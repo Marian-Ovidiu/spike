@@ -1,7 +1,5 @@
 import type { EntryEvaluation } from "./entryConditions.js";
-import type {
-  BorderlineLifecycleRenderEvent,
-} from "./strategyDecisionPipeline.js";
+import type { BorderlineLifecycleRenderEvent } from "./strategyDecisionPipeline.js";
 import type { PostMoveClassification } from "./borderlineCandidate.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 import { type MovementClassification, type WindowSpikeSource } from "./strategy.js";
@@ -45,10 +43,12 @@ export type Opportunity = {
   spikeSource: WindowSpikeSource | null;
   /** Reference price that produced the strongest move. */
   spikeReferencePrice: number;
-  /** Prior-window relative range (max−min)/min as a percent (chop context). */
-  priorRangePercent: number;
-  upSidePrice: number;
-  downSidePrice: number;
+  /** Prior-window relative range (max−min)/min as a fraction (chop context). */
+  priorRangeFraction: number;
+  bestBid: number;
+  bestAsk: number;
+  midPrice: number;
+  spreadBps: number;
   stableRangeDetected: boolean;
   stableRangeQuality: StableRangeQuality;
   /** Contextual spike (strong vs prior chop). */
@@ -88,13 +88,19 @@ export type RecordReadyTickInput = {
   prices: readonly number[];
   previousPrice: number;
   currentPrice: number;
-  sides: { upSidePrice: number; downSidePrice: number };
+  sides: {
+    bestBid: number;
+    bestAsk: number;
+    midPrice: number;
+    spreadBps: number;
+  };
   entry: EntryEvaluation;
   tradableSpikeMinPercent?: number;
   maxPriorRangeForNormalEntry?: number;
   exceptionalSpikeMinPercent?: number;
   allowWeakQualityEntries?: boolean;
   allowWeakQualityOnlyForStrongSpikes?: boolean;
+  allowAcceptableQualityStrongSpikes?: boolean;
   decision?: Pick<
     StrategyDecision,
     | "action"
@@ -107,7 +113,7 @@ export type RecordReadyTickInput = {
   >;
 };
 
-function priorWindowRelativeRangePercent(
+function priorWindowRelativeRangeFraction(
   prices: readonly number[]
 ): number {
   const priorWindow = prices.slice(0, -1);
@@ -117,7 +123,7 @@ function priorWindowRelativeRangePercent(
   if (!(min > 0 && Number.isFinite(min) && Number.isFinite(max))) {
     return 0;
   }
-  return ((max - min) / min) * 100;
+  return (max - min) / min;
 }
 
 /**
@@ -148,7 +154,8 @@ export function buildOpportunityFromReadyTick(
   const stableRangeQuality = entry.stableRangeQuality ?? "poor";
   const spikeDetected = entry.spikeDetected;
   const spikePercent = movement.strongestMovePercent * 100;
-  const priorRangePercent = entry.priorRangePercent ?? priorWindowRelativeRangePercent(prices);
+  const priorRangeFraction =
+    entry.priorRangeFraction ?? priorWindowRelativeRangeFraction(prices);
   const spikeDirection =
     movement.strongestMoveDirection === "UP"
       ? "UP"
@@ -156,7 +163,10 @@ export function buildOpportunityFromReadyTick(
         ? "DOWN"
         : null;
   const entryAllowed =
-    decision !== undefined ? decision.action === "enter_immediate" : entry.shouldEnter;
+    decision !== undefined
+      ? decision.action === "enter_immediate" ||
+        decision.action === "promote_borderline_candidate"
+      : entry.shouldEnter;
   const entryRejectionReasons =
     entryAllowed ? [] : [...(decision?.reasons ?? entry.reasons)];
   const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
@@ -177,6 +187,12 @@ export function buildOpportunityFromReadyTick(
       ? {
           allowWeakQualityOnlyForStrongSpikes:
             input.allowWeakQualityOnlyForStrongSpikes,
+        }
+      : {}),
+    ...(input.allowAcceptableQualityStrongSpikes !== undefined
+      ? {
+          allowAcceptableQualityStrongSpikes:
+            input.allowAcceptableQualityStrongSpikes,
         }
       : {}),
   };
@@ -201,9 +217,11 @@ export function buildOpportunityFromReadyTick(
         : movement.strongestMoveDirection === "UP"
           ? currentPrice - movement.strongestMoveAbsolute
           : currentPrice + movement.strongestMoveAbsolute,
-    priorRangePercent,
-    upSidePrice: sides.upSidePrice,
-    downSidePrice: sides.downSidePrice,
+    priorRangeFraction,
+    bestBid: sides.bestBid,
+    bestAsk: sides.bestAsk,
+    midPrice: sides.midPrice,
+    spreadBps: sides.spreadBps,
     stableRangeDetected,
     stableRangeQuality,
     spikeDetected,
@@ -315,9 +333,11 @@ export class OpportunityTracker {
         | "window-oldest"
         | null,
       spikeReferencePrice: e.currentBtcPrice ?? 0,
-      priorRangePercent: 0,
-      upSidePrice: e.yesPrice ?? Number.NaN,
-      downSidePrice: e.noPrice ?? Number.NaN,
+      priorRangeFraction: 0,
+      bestBid: e.bestBid ?? Number.NaN,
+      bestAsk: e.bestAsk ?? Number.NaN,
+      midPrice: e.midPrice ?? Number.NaN,
+      spreadBps: e.spreadBps ?? Number.NaN,
       stableRangeDetected: true,
       stableRangeQuality: "good",
       spikeDetected: false,

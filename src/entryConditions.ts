@@ -12,7 +12,7 @@ import {
   toMovementAnalysis,
   type MovementAnalysis,
 } from "./movementAnalysis.js";
-import { evaluateQuoteQuality } from "./quoteQualityFilter.js";
+import { evaluateSpotSpreadFilter } from "./spotSpreadFilter.js";
 
 export type EntryDirection = "UP" | "DOWN";
 
@@ -21,9 +21,8 @@ export const ENTRY_REASON_CODES = {
   MARKET_NOT_STABLE: "market_not_stable",
   RANGE_TOO_NOISY: "range_too_noisy_for_entry",
   SPIKE_NOT_STRONG_ENOUGH: "spike_not_strong_enough",
-  OPPOSITE_SIDE_PRICE_TOO_HIGH: "opposite_side_price_too_high",
-  MARKET_QUOTES_TOO_NEUTRAL: "market_quotes_too_neutral",
-  INVALID_MARKET_PRICES: "invalid_market_prices",
+  SPREAD_TOO_WIDE: "spread_too_wide",
+  INVALID_BOOK: "invalid_book",
   NO_SPIKE_DIRECTION: "no_spike_direction",
 } as const;
 
@@ -33,7 +32,8 @@ export type EntryEvaluation = {
   /** Non-empty when `shouldEnter` is false; empty when entry is allowed. */
   reasons: string[];
   stableRangeDetected: boolean;
-  priorRangePercent: number;
+  /** Prior-window relative range (max−min)/min as a fraction; compare to config thresholds as fractions. */
+  priorRangeFraction: number;
   stableRangeQuality: StableRangeQuality;
   rangeDecisionNote: string;
   movementClassification: "no_signal" | "borderline" | "strong_spike";
@@ -58,14 +58,13 @@ export type EvaluateEntryConditionsInput = {
   spikeMinRangeMultiple: number;
   /** Borderline lower bound as ratio of `spikeThreshold` (e.g. 0.85). */
   borderlineMinRatio: number;
-  entryPrice: number;
-  maxOppositeSideEntryPrice: number;
-  neutralQuoteBandMin: number;
-  neutralQuoteBandMax: number;
-  /** Quote for the "UP" / YES-style leg (used when the spike is down → enter opposite UP). */
-  upSidePrice: number;
-  /** Quote for the "DOWN" / NO-style leg (used when the spike is up → enter opposite DOWN). */
-  downSidePrice: number;
+  /** Max bid/ask spread (bps) allowed for entry; wider = blocked. */
+  maxEntrySpreadBps: number;
+  /** Best bid, best ask, mid, spread (bps) from spot book. */
+  bestBid: number;
+  bestAsk: number;
+  midPrice: number;
+  spreadBps: number;
 };
 
 /** Short human-readable lines for console / logs (codes → English). */
@@ -76,12 +75,10 @@ export const ENTRY_REASON_MESSAGES: Record<string, string> = {
     "range too noisy for entry",
   [ENTRY_REASON_CODES.SPIKE_NOT_STRONG_ENOUGH]:
     "movement below required strength for immediate strong-spike entry",
-  [ENTRY_REASON_CODES.OPPOSITE_SIDE_PRICE_TOO_HIGH]:
-    "opposite-side quote above allowed cap",
-  [ENTRY_REASON_CODES.MARKET_QUOTES_TOO_NEUTRAL]:
-    "YES/NO quotes too neutral for contrarian edge",
-  [ENTRY_REASON_CODES.INVALID_MARKET_PRICES]:
-    "YES/NO quotes missing or non-finite",
+  [ENTRY_REASON_CODES.SPREAD_TOO_WIDE]:
+    "bid/ask spread wider than allowed for entry",
+  [ENTRY_REASON_CODES.INVALID_BOOK]:
+    "spot book missing or non-finite (bid/ask)",
   [ENTRY_REASON_CODES.NO_SPIKE_DIRECTION]:
     "no one-tick direction (flat candle)",
 };
@@ -117,21 +114,26 @@ export function evaluateEntryConditions(
     spikeThreshold,
     spikeMinRangeMultiple,
     borderlineMinRatio,
-    entryPrice,
-    maxOppositeSideEntryPrice,
-    neutralQuoteBandMin,
-    neutralQuoteBandMax,
-    upSidePrice,
-    downSidePrice,
+    maxEntrySpreadBps,
+    bestBid,
+    bestAsk,
+    midPrice,
+    spreadBps,
   } = input;
 
-  if (!Number.isFinite(upSidePrice) || !Number.isFinite(downSidePrice)) {
+  if (
+    !Number.isFinite(bestBid) ||
+    !Number.isFinite(bestAsk) ||
+    !Number.isFinite(midPrice) ||
+    !Number.isFinite(spreadBps) ||
+    bestAsk < bestBid
+  ) {
     return {
       shouldEnter: false,
       direction: null,
-      reasons: [ENTRY_REASON_CODES.INVALID_MARKET_PRICES],
+      reasons: [ENTRY_REASON_CODES.INVALID_BOOK],
       stableRangeDetected: false,
-      priorRangePercent: 0,
+      priorRangeFraction: 0,
       stableRangeQuality: "poor",
       rangeDecisionNote: "invalid market prices",
       movementClassification: "no_signal",
@@ -212,7 +214,7 @@ export function evaluateEntryConditions(
       direction: null,
       reasons: gateReasons,
       stableRangeDetected: rangeAssessment.stableRangeDetected,
-      priorRangePercent: rangeAssessment.priorRangePercent,
+      priorRangeFraction: rangeAssessment.priorRangeFraction,
       stableRangeQuality: rangeAssessment.stableRangeQuality,
       rangeDecisionNote,
       movementClassification: windowSpike.classification,
@@ -223,28 +225,17 @@ export function evaluateEntryConditions(
   }
 
   if (windowSpike.strongestMoveDirection === "UP") {
-    const quoteBlocker = evaluateQuoteQuality({
-      upSidePrice,
-      downSidePrice,
-      direction: "DOWN",
-      entryPrice,
-      maxOppositeSideEntryPrice,
-      neutralQuoteBandMin,
-      neutralQuoteBandMax,
+    const spreadBlock = evaluateSpotSpreadFilter({
+      spreadBps,
+      maxEntrySpreadBps,
     });
-    const priceOk = quoteBlocker === null;
+    const priceOk = spreadBlock === null;
     return {
       shouldEnter: priceOk,
       direction: "DOWN",
-      reasons: priceOk
-        ? []
-        : [
-            quoteBlocker === "market_quotes_too_neutral"
-              ? ENTRY_REASON_CODES.MARKET_QUOTES_TOO_NEUTRAL
-              : ENTRY_REASON_CODES.OPPOSITE_SIDE_PRICE_TOO_HIGH,
-          ],
+      reasons: priceOk ? [] : [ENTRY_REASON_CODES.SPREAD_TOO_WIDE],
       stableRangeDetected: rangeAssessment.stableRangeDetected,
-      priorRangePercent: rangeAssessment.priorRangePercent,
+      priorRangeFraction: rangeAssessment.priorRangeFraction,
       stableRangeQuality: rangeAssessment.stableRangeQuality,
       rangeDecisionNote,
       movementClassification: windowSpike.classification,
@@ -255,28 +246,17 @@ export function evaluateEntryConditions(
   }
 
   if (windowSpike.strongestMoveDirection === "DOWN") {
-    const quoteBlocker = evaluateQuoteQuality({
-      upSidePrice,
-      downSidePrice,
-      direction: "UP",
-      entryPrice,
-      maxOppositeSideEntryPrice,
-      neutralQuoteBandMin,
-      neutralQuoteBandMax,
+    const spreadBlock = evaluateSpotSpreadFilter({
+      spreadBps,
+      maxEntrySpreadBps,
     });
-    const priceOk = quoteBlocker === null;
+    const priceOk = spreadBlock === null;
     return {
       shouldEnter: priceOk,
       direction: "UP",
-      reasons: priceOk
-        ? []
-        : [
-            quoteBlocker === "market_quotes_too_neutral"
-              ? ENTRY_REASON_CODES.MARKET_QUOTES_TOO_NEUTRAL
-              : ENTRY_REASON_CODES.OPPOSITE_SIDE_PRICE_TOO_HIGH,
-          ],
+      reasons: priceOk ? [] : [ENTRY_REASON_CODES.SPREAD_TOO_WIDE],
       stableRangeDetected: rangeAssessment.stableRangeDetected,
-      priorRangePercent: rangeAssessment.priorRangePercent,
+      priorRangeFraction: rangeAssessment.priorRangeFraction,
       stableRangeQuality: rangeAssessment.stableRangeQuality,
       rangeDecisionNote,
       movementClassification: windowSpike.classification,
@@ -291,7 +271,7 @@ export function evaluateEntryConditions(
     direction: null,
     reasons: [ENTRY_REASON_CODES.NO_SPIKE_DIRECTION],
     stableRangeDetected: rangeAssessment.stableRangeDetected,
-    priorRangePercent: rangeAssessment.priorRangePercent,
+    priorRangeFraction: rangeAssessment.priorRangeFraction,
     stableRangeQuality: rangeAssessment.stableRangeQuality,
     rangeDecisionNote,
     movementClassification: windowSpike.classification,

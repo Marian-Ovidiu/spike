@@ -4,17 +4,39 @@ import {
   buildTransparentTradeLog,
   computePerformanceFromClosedTrades,
   computeSimulationPerformance,
+  quotePriceForPositionDirection,
+  selectPositionQuote,
   SimulationEngine,
 } from "./simulationEngine.js";
+import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
+
+const SYM = "BTCUSDT";
+
+const spotTickConfig = {
+  takeProfitBps: 35,
+  stopLossBps: 25,
+  paperSlippageBps: 0,
+  paperFeeRoundTripBps: 0,
+  exitTimeoutMs: 0,
+  entryCooldownMs: 0,
+  stakePerTrade: 5,
+  allowWeakQualityEntries: false,
+  weakQualitySizeMultiplier: 0.5,
+  strongQualitySizeMultiplier: 1,
+  exceptionalQualitySizeMultiplier: 1,
+} as const;
 
 function trade(pl: number): SimulatedTrade {
   return {
     id: 1,
+    symbol: SYM,
     direction: "UP",
     stake: 1,
     shares: 1,
     entryPrice: 0,
     exitPrice: pl,
+    grossPnl: pl,
+    feesEstimate: 0,
     profitLoss: pl,
     equityBefore: 1000,
     equityAfter: 1000 + pl,
@@ -30,11 +52,14 @@ describe("buildTransparentTradeLog", () => {
   it("matches manual pnl and equity roll-forward", () => {
     const t: SimulatedTrade = {
       id: 7,
+      symbol: SYM,
       direction: "UP",
       stake: 5,
       shares: 5 / 0.48,
       entryPrice: 0.48,
       exitPrice: 0.52,
+      grossPnl: (5 / 0.48) * (0.52 - 0.48),
+      feesEstimate: 0,
       profitLoss: (5 / 0.48) * (0.52 - 0.48),
       equityBefore: 10_000,
       equityAfter: 10_000 + (5 / 0.48) * (0.52 - 0.48),
@@ -59,11 +84,14 @@ describe("computePerformanceFromClosedTrades", () => {
     const trades = [
       {
         id: 1,
+        symbol: SYM,
         direction: "UP" as const,
         stake: 5,
         shares: 10,
         entryPrice: 0.5,
         exitPrice: 0.55,
+        grossPnl: 0.5,
+        feesEstimate: 0,
         profitLoss: 0.5,
         equityBefore: initial,
         equityAfter: initial + 0.5,
@@ -75,11 +103,14 @@ describe("computePerformanceFromClosedTrades", () => {
       },
       {
         id: 2,
+        symbol: SYM,
         direction: "UP" as const,
         stake: 5,
         shares: 10,
         entryPrice: 0.5,
         exitPrice: 0.45,
+        grossPnl: -0.5,
+        feesEstimate: 0,
         profitLoss: -0.5,
         equityBefore: initial + 0.5,
         equityAfter: initial,
@@ -128,20 +159,53 @@ describe("computeSimulationPerformance", () => {
   });
 });
 
+const entryOpenUp = {
+  shouldEnter: true,
+  direction: "UP" as const,
+  reasons: [] as string[],
+  stableRangeDetected: true,
+  priorRangeFraction: 0.1,
+  stableRangeQuality: "good" as const,
+  rangeDecisionNote: "test",
+  movementClassification: "strong_spike" as const,
+  spikeDetected: true,
+  movement: {
+    strongestMovePercent: 0.01,
+    strongestMoveAbsolute: 0.2,
+    strongestMoveDirection: "UP" as const,
+    thresholdPercent: 0.005,
+    thresholdRatio: 2,
+    classification: "strong_spike" as const,
+    sourceWindowLabel: "tick-1",
+  },
+  windowSpike: undefined,
+};
+
+const entryFlat = {
+  shouldEnter: false,
+  direction: null,
+  reasons: ["market_not_stable"],
+  stableRangeDetected: false,
+  priorRangeFraction: 1.2,
+  stableRangeQuality: "poor" as const,
+  rangeDecisionNote: "test",
+  movementClassification: "no_signal" as const,
+  spikeDetected: false,
+  movement: {
+    strongestMovePercent: 0,
+    strongestMoveAbsolute: 0,
+    strongestMoveDirection: null,
+    thresholdPercent: 0.005,
+    thresholdRatio: 0,
+    classification: "no_signal" as const,
+    sourceWindowLabel: null,
+  },
+  windowSpike: undefined,
+};
+
 describe("SimulationEngine.onTradeClosed", () => {
   it("invokes callback when a silent engine closes a trade", () => {
     const closed: SimulatedTrade[] = [];
-    const tickConfig = {
-      exitPrice: 0.52,
-      stopLoss: 0.085,
-      exitTimeoutMs: 90_000,
-      entryCooldownMs: 0,
-      stakePerTrade: 5,
-      allowWeakQualityEntries: false,
-      weakQualitySizeMultiplier: 0.5,
-      strongQualitySizeMultiplier: 1,
-      exceptionalQualitySizeMultiplier: 1,
-    };
     const sim = new SimulationEngine({
       silent: true,
       initialEquity: 10_000,
@@ -150,63 +214,26 @@ describe("SimulationEngine.onTradeClosed", () => {
       },
     });
 
+    const openBk = syntheticSpotBookFromMid(100, 5);
     sim.onTick({
       now: 1_000,
-      entry: {
-        shouldEnter: true,
-        direction: "UP",
-        reasons: [],
-        stableRangeDetected: true,
-        priorRangePercent: 0.1,
-        stableRangeQuality: "good",
-        rangeDecisionNote: "test",
-        movementClassification: "strong_spike",
-        spikeDetected: true,
-        movement: {
-          strongestMovePercent: 0.01,
-          strongestMoveAbsolute: 0.2,
-          strongestMoveDirection: "UP",
-          thresholdPercent: 0.005,
-          thresholdRatio: 2,
-          classification: "strong_spike",
-          sourceWindowLabel: "tick-1",
-        },
-        windowSpike: undefined,
-      },
-      sides: { upSidePrice: 0.2, downSidePrice: 0.5 },
-      config: tickConfig,
+      entry: entryOpenUp,
+      sides: openBk,
+      symbol: SYM,
+      config: spotTickConfig,
     });
     expect(sim.getOpenPosition()).not.toBeNull();
 
     sim.onTick({
       now: 2_000,
-      entry: {
-        shouldEnter: false,
-        direction: null,
-        reasons: ["market_not_stable"],
-        stableRangeDetected: false,
-        priorRangePercent: 1.2,
-        stableRangeQuality: "poor",
-        rangeDecisionNote: "test",
-        movementClassification: "no_signal",
-        spikeDetected: false,
-        movement: {
-          strongestMovePercent: 0,
-          strongestMoveAbsolute: 0,
-          strongestMoveDirection: null,
-          thresholdPercent: 0.005,
-          thresholdRatio: 0,
-          classification: "no_signal",
-          sourceWindowLabel: null,
-        },
-        windowSpike: undefined,
-      },
-      sides: { upSidePrice: 0.55, downSidePrice: 0.45 },
-      config: tickConfig,
+      entry: entryFlat,
+      sides: syntheticSpotBookFromMid(100.2, 5),
+      symbol: SYM,
+      config: spotTickConfig,
     });
 
     expect(closed).toHaveLength(1);
-    expect(closed[0]!.exitReason).toBe("profit");
+    expect(closed[0]!.exitReason).toBe("timeout");
     expect(closed[0]!.id).toBe(1);
     expect(closed[0]!.equityAfter).toBeCloseTo(
       closed[0]!.equityBefore + closed[0]!.profitLoss,
@@ -214,147 +241,51 @@ describe("SimulationEngine.onTradeClosed", () => {
     );
   });
 
-  it("uses fixed stake: 0.48→0.52 with stake 5 yields ~0.4167 P/L", () => {
-    const tickConfig = {
-      exitPrice: 0.52,
-      stopLoss: 0.1,
-      exitTimeoutMs: 90_000,
-      entryCooldownMs: 0,
-      stakePerTrade: 5,
-      allowWeakQualityEntries: false,
-      weakQualitySizeMultiplier: 0.5,
-      strongQualitySizeMultiplier: 1,
-      exceptionalQualitySizeMultiplier: 1,
-    };
+  it("uses fixed stake with spot fill and timeout exit", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
-    const entryBase = {
-      shouldEnter: true,
-      direction: "UP" as const,
-      reasons: [] as string[],
-      stableRangeDetected: true,
-      priorRangePercent: 0.1,
-      stableRangeQuality: "good" as const,
-      rangeDecisionNote: "test",
-      movementClassification: "strong_spike" as const,
-      spikeDetected: true,
-      movement: {
-        strongestMovePercent: 0.01,
-        strongestMoveAbsolute: 0.2,
-        strongestMoveDirection: "UP" as const,
-        thresholdPercent: 0.005,
-        thresholdRatio: 2,
-        classification: "strong_spike" as const,
-        sourceWindowLabel: "tick-1",
-      },
-      windowSpike: undefined,
-    };
+    const openBk = syntheticSpotBookFromMid(100, 5);
     sim.onTick({
       now: 1_000,
-      entry: entryBase,
-      sides: { upSidePrice: 0.48, downSidePrice: 0.52 },
-      config: tickConfig,
+      entry: entryOpenUp,
+      sides: openBk,
+      symbol: SYM,
+      config: spotTickConfig,
     });
     expect(sim.getOpenPosition()).not.toBeNull();
     sim.onTick({
       now: 2_000,
-      entry: {
-        shouldEnter: false,
-        direction: null,
-        reasons: ["market_not_stable"],
-        stableRangeDetected: false,
-        priorRangePercent: 1.2,
-        stableRangeQuality: "poor",
-        rangeDecisionNote: "test",
-        movementClassification: "no_signal",
-        spikeDetected: false,
-        movement: {
-          strongestMovePercent: 0,
-          strongestMoveAbsolute: 0,
-          strongestMoveDirection: null,
-          thresholdPercent: 0.005,
-          thresholdRatio: 0,
-          classification: "no_signal",
-          sourceWindowLabel: null,
-        },
-        windowSpike: undefined,
-      },
-      sides: { upSidePrice: 0.52, downSidePrice: 0.48 },
-      config: tickConfig,
+      entry: entryFlat,
+      sides: syntheticSpotBookFromMid(100.2, 5),
+      symbol: SYM,
+      config: spotTickConfig,
     });
     const trades = sim.getTradeHistory();
     expect(trades).toHaveLength(1);
     expect(trades[0]!.stake).toBe(5);
-    expect(trades[0]!.shares).toBeCloseTo(5 / 0.48, 10);
-    expect(trades[0]!.profitLoss).toBeCloseTo((5 / 0.48) * (0.52 - 0.48), 6);
+    expect(trades[0]!.exitReason).toBe("timeout");
   });
 
   it("halves stake when weak quality and allow-weak sizing is enabled", () => {
     const tickConfig = {
-      exitPrice: 0.52,
-      stopLoss: 0.1,
-      exitTimeoutMs: 90_000,
-      entryCooldownMs: 0,
+      ...spotTickConfig,
       stakePerTrade: 10,
       allowWeakQualityEntries: true,
-      weakQualitySizeMultiplier: 0.5,
-      strongQualitySizeMultiplier: 1,
-      exceptionalQualitySizeMultiplier: 1,
     };
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
-    const entryBase = {
-      shouldEnter: true,
-      direction: "UP" as const,
-      reasons: [] as string[],
-      stableRangeDetected: true,
-      priorRangePercent: 0.1,
-      stableRangeQuality: "good" as const,
-      rangeDecisionNote: "test",
-      movementClassification: "strong_spike" as const,
-      spikeDetected: true,
-      movement: {
-        strongestMovePercent: 0.01,
-        strongestMoveAbsolute: 0.2,
-        strongestMoveDirection: "UP" as const,
-        thresholdPercent: 0.005,
-        thresholdRatio: 2,
-        classification: "strong_spike" as const,
-        sourceWindowLabel: "tick-1",
-      },
-      windowSpike: undefined,
-    };
     sim.onTick({
       now: 1_000,
-      entry: entryBase,
+      entry: entryOpenUp,
       entryQualityProfile: "weak",
-      sides: { upSidePrice: 0.48, downSidePrice: 0.52 },
+      sides: syntheticSpotBookFromMid(100, 5),
+      symbol: SYM,
       config: tickConfig,
     });
     expect(sim.getOpenPosition()?.stake).toBe(5);
-    expect(sim.getOpenPosition()?.shares).toBeCloseTo(5 / 0.48, 10);
     sim.onTick({
       now: 2_000,
-      entry: {
-        shouldEnter: false,
-        direction: null,
-        reasons: ["market_not_stable"],
-        stableRangeDetected: false,
-        priorRangePercent: 1.2,
-        stableRangeQuality: "poor",
-        rangeDecisionNote: "test",
-        movementClassification: "no_signal",
-        spikeDetected: false,
-        movement: {
-          strongestMovePercent: 0,
-          strongestMoveAbsolute: 0,
-          strongestMoveDirection: null,
-          thresholdPercent: 0.005,
-          thresholdRatio: 0,
-          classification: "no_signal",
-          sourceWindowLabel: null,
-        },
-        windowSpike: undefined,
-      },
-      sides: { upSidePrice: 0.52, downSidePrice: 0.48 },
+      entry: entryFlat,
+      sides: syntheticSpotBookFromMid(100.2, 5),
+      symbol: SYM,
       config: tickConfig,
     });
     const trades = sim.getTradeHistory();
@@ -363,5 +294,95 @@ describe("SimulationEngine.onTradeClosed", () => {
     expect(trades[0]!.qualityStakeMultiplier).toBe(0.5);
     expect(trades[0]!.entryQualityProfile).toBe("weak");
     expect(trades[0]!.riskAtEntry).toBe(5);
+  });
+});
+
+describe("quotePriceForPositionDirection", () => {
+  const book = syntheticSpotBookFromMid(100, 10);
+
+  it("UP → mark on bid", () => {
+    expect(quotePriceForPositionDirection("UP", book)).toBe(book.bestBid);
+    const s = selectPositionQuote("UP", book);
+    expect(s.entrySide).toBe("ask");
+    expect(s.markSide).toBe("bid");
+    expect(s.fillReference).toBeGreaterThan(0);
+  });
+
+  it("DOWN → mark on ask", () => {
+    expect(quotePriceForPositionDirection("DOWN", book)).toBe(book.bestAsk);
+    const s = selectPositionQuote("DOWN", book);
+    expect(s.entrySide).toBe("bid");
+    expect(s.markSide).toBe("ask");
+  });
+});
+
+describe("SimulationEngine held-leg integration", () => {
+  const tickConfig = {
+    ...spotTickConfig,
+    takeProfitBps: 500,
+    stopLossBps: 500,
+  };
+
+  it("DOWN position: profit exit when ask drops enough", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const entryDown = {
+      shouldEnter: true,
+      direction: "DOWN" as const,
+      reasons: [] as string[],
+      stableRangeDetected: true,
+      priorRangeFraction: 0.1,
+      stableRangeQuality: "good" as const,
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike" as const,
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.01,
+        strongestMoveAbsolute: 0.2,
+        strongestMoveDirection: "DOWN" as const,
+        thresholdPercent: 0.005,
+        thresholdRatio: 2,
+        classification: "strong_spike" as const,
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: undefined,
+    };
+    sim.onTick({
+      now: 1_000,
+      entry: entryDown,
+      sides: syntheticSpotBookFromMid(100, 5),
+      symbol: SYM,
+      config: tickConfig,
+    });
+    const ep = sim.getOpenPosition()!.entryPrice;
+    sim.onTick({
+      now: 2_000,
+      entry: entryFlat,
+      sides: syntheticSpotBookFromMid(94, 5),
+      symbol: SYM,
+      config: tickConfig,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.exitReason).toBe("profit");
+    expect(t.profitLoss).toBeCloseTo(t.shares * (ep - t.exitPrice), 6);
+  });
+
+  it("UP position: profit when bid rises past TP", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      now: 1_000,
+      entry: entryOpenUp,
+      sides: syntheticSpotBookFromMid(100, 5),
+      symbol: SYM,
+      config: tickConfig,
+    });
+    sim.onTick({
+      now: 2_000,
+      entry: entryFlat,
+      sides: syntheticSpotBookFromMid(106, 5),
+      symbol: SYM,
+      config: tickConfig,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.exitReason).toBe("profit");
   });
 });
