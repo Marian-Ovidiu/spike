@@ -8,7 +8,7 @@ import {
   createBorderlineCandidate,
   evaluateBorderlineWatchDecision,
 } from "./borderlineCandidate.js";
-import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
+import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
 function readyTickWithClassification(
   classification: "no_signal" | "borderline" | "strong_spike",
@@ -64,18 +64,20 @@ function readyTickWithClassification(
     },
   };
 
-  const sides = syntheticSpotBookFromMid(100_093, 5);
+  const executionBook = syntheticExecutableBookFromMid(100_093, 5);
   return {
     kind: "ready",
     btc: 100_093,
+    underlyingSignalPrice: 100_093,
     n: 12,
     cap: 20,
     prev: 100_000,
     last: 100_093,
     prices: [100_000, 100_010, 100_020, 100_093],
-    sides,
+    executionBook,
     entry,
-    market: { book: sides, feedPossiblyStale: false },
+    market: { book: executionBook, feedPossiblyStale: false },
+    binaryOutcomes: null,
   };
 }
 
@@ -157,6 +159,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.25,
         borderlineReversionThreshold: 0.2,
         borderlinePauseBandPercent: 0.00015,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -186,6 +191,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.25,
         borderlineReversionThreshold: 0.2,
         borderlinePauseBandPercent: 0.0002,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -215,6 +223,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.25,
         borderlineReversionThreshold: 0.2,
         borderlinePauseBandPercent: 0.00015,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -239,6 +250,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.25,
         borderlineReversionThreshold: 0.2,
         borderlinePauseBandPercent: 0.00015,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -269,6 +283,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.25,
         borderlineReversionThreshold: 0.2,
         borderlinePauseBandPercent: 0.00015,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -300,6 +317,9 @@ describe("borderlineCandidate", () => {
         borderlineContinuationThreshold: 0.95,
         borderlineReversionThreshold: 0.95,
         borderlinePauseBandPercent: 0.00001,
+        borderlineFastPromoteDeltaBps: 0,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
       },
       cooldownBlocked: false,
     });
@@ -434,6 +454,76 @@ describe("borderlineCandidate", () => {
       }
     );
     expect(analysis.postMoveClassification).toBe("noisy_unclear");
+  });
+
+  it("expires by max wall-clock lifetime before tick budget", () => {
+    const m = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 10,
+      maxLifetimeMs: 400,
+    });
+    m.onTick(1_000, readyTickWithClassification("borderline", 0.93));
+    expect(m.getActive()).not.toBeNull();
+    const events = m.onTick(1_500, readyTickWithClassification("no_signal", 0.5));
+    expect(m.getActive()).toBeNull();
+    expect(events.some((e) => e.type === "expired")).toBe(true);
+    expect(m.getHistory().at(-1)?.cancellationReason).toBe(
+      "borderline_max_lifetime_ms"
+    );
+  });
+
+  it("fast-promotes on small same-direction BTC extension", () => {
+    const m = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
+    m.onTick(1_000, readyTickWithClassification("borderline", 0.93));
+    const active = m.getActive()!;
+    const tick = {
+      ...readyTickWithClassification("no_signal", 0.5),
+      last: 100_093 * 1.0005,
+    };
+    const decision = evaluateBorderlineWatchDecision({
+      candidate: active,
+      tick,
+      config: {
+        rangeThreshold: 0.02,
+        stableRangeSoftToleranceRatio: 1.5,
+        spikeThreshold: 0.001,
+        maxEntrySpreadBps: 500,
+        borderlineRequirePause: true,
+        borderlineRequireNoContinuation: true,
+        borderlineContinuationThreshold: 0.25,
+        borderlineReversionThreshold: 0.2,
+        borderlinePauseBandPercent: 0.00015,
+        borderlineFastPromoteDeltaBps: 4,
+        borderlineFastPromoteProbDelta: 0,
+        borderlineFastRejectSameDirectionBps: 0,
+      },
+      cooldownBlocked: false,
+    });
+    expect(decision.action).toBe("promote");
+    expect(decision.reason).toBe("fast_same_direction_price_extension");
+  });
+
+  it("does not start borderline watch when enableBorderlineMode is false", () => {
+    const m = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+      enableBorderlineMode: false,
+    });
+    const events = m.onTick(1_000, readyTickWithClassification("borderline", 0.9));
+    expect(events.some((e) => e.type === "created")).toBe(false);
+    expect(m.getActive()).toBeNull();
+  });
+
+  it("records weak entry reject when min entry threshold is not met", () => {
+    const m = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+      enableBorderlineMode: true,
+      borderlineEntryMinThresholdRatio: 0.99,
+    });
+    m.onTick(1_000, readyTickWithClassification("borderline", 0.93));
+    expect(m.drainBorderlineEntryWeakRejections()).toHaveLength(1);
+    expect(m.getActive()).toBeNull();
   });
 });
 

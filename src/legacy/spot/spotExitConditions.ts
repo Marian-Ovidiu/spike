@@ -1,5 +1,5 @@
-import type { EntryDirection } from "./entryConditions.js";
-import type { ExitReason } from "./exitConditions.js";
+import type { EntryDirection } from "../../entryConditions.js";
+import type { ExitReason } from "../../exitConditions.js";
 
 export type SpotExitEvaluation = {
   shouldExit: boolean;
@@ -7,7 +7,7 @@ export type SpotExitEvaluation = {
 };
 
 /**
- * Take-profit / stop-loss vs entry fill, in basis points (spot-relative).
+ * Take-profit / stop-loss vs entry fill, in basis points (legacy **spot paper** position).
  * LONG: profit when bid >= entry*(1+tpBps), stop when bid <= entry*(1-slBps)
  * SHORT: profit when ask <= entry*(1-tpBps), stop when ask >= entry*(1+slBps)
  */

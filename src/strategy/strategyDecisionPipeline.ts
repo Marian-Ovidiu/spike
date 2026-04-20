@@ -1,45 +1,47 @@
-import type { StrategyTickResult } from "./botLoop.js";
-import type { AppConfig } from "./config.js";
-import type { EntryEvaluation } from "./entryConditions.js";
-import type { StableRangeQuality } from "./stableRangeQuality.js";
+import type { StrategyTickResult } from "../botLoop.js";
+import type { AppConfig } from "../config.js";
+import type { EntryEvaluation } from "../entryConditions.js";
+import type { StableRangeQuality } from "../stableRangeQuality.js";
 import type {
+  BorderlineEntryWeakRejection,
   BorderlineLifecycleEvent,
   PostMoveClassification,
-} from "./borderlineCandidate.js";
-import type { BorderlineCandidateStore } from "./borderlineCandidateStore.js";
-import { analyzeBorderlinePostMove } from "./postMoveAnalyzer.js";
+} from "../borderlineCandidate.js";
+import type { BorderlineCandidateStore } from "../borderlineCandidateStore.js";
+import { analyzeBorderlinePostMove } from "../postMoveAnalyzer.js";
 import {
   buildBorderlinePromotedEntry,
   decideBorderlineWatch,
-} from "./borderlineWatcher.js";
-import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
+} from "../borderlineWatcher.js";
+import { StrongSpikeCandidateStore } from "../strongSpikeCandidateStore.js";
 import {
   buildStrongSpikePromotedEntry,
   decideStrongSpikeWatch,
-} from "./strongSpikeWatcher.js";
-import type { SimulationEngine } from "./simulationEngine.js";
+} from "../strongSpikeWatcher.js";
+import type { SimulationEngine } from "../simulationEngine.js";
 import {
   normalizeDecisionRejectionReasons,
   type NormalizedRejectionReason,
-} from "./decisionReasonBuilder.js";
+} from "../decisionReasonBuilder.js";
 import {
   DEFAULT_MAX_PRIOR_RANGE_FOR_NORMAL_ENTRY,
   DEFAULT_TRADABLE_SPIKE_MIN_PERCENT,
   type PreEntryQualityGateResult,
   type QualityGateDiagnostics,
   type QualityProfile,
-} from "./preEntryQualityGate.js";
-import { classifySpikeQuality } from "./spikeQualityClassifier.js";
+} from "../preEntryQualityGate.js";
+import { classifySpikeQuality } from "../spikeQualityClassifier.js";
 import {
   applyUnstableSoftOverlayOnQualityGate,
   evaluateHardRejectContext,
   type HardRejectResult,
-} from "./hardRejectEngine.js";
+} from "../hardRejectEngine.js";
 import {
   shouldOverrideCooldownForExceptional,
   shouldOverrideCooldownForExceptionalCandidate,
-} from "./overridePolicyEngine.js";
-import { evaluateSpotBookPipeline } from "./spotSpreadFilter.js";
+} from "../overridePolicyEngine.js";
+import { evaluateBinaryPaperEntryQuotes } from "../binary/entry/binaryQuoteEntryFilter.js";
+import { evaluateExecutionBookPipeline } from "../executionSpreadFilter.js";
 
 export type StrategyAction =
   | "none"
@@ -238,7 +240,13 @@ function withNormalizedReasons(input: {
 }
 
 export type BorderlineLifecycleRenderEvent = {
-  type: "created" | "watch" | "promoted" | "cancelled" | "expired";
+  type:
+    | "created"
+    | "watch"
+    | "promoted"
+    | "cancelled"
+    | "expired"
+    | "entry_rejected_weak";
   candidateId: string;
   detectionTick: number;
   moveDirection: "UP" | "DOWN" | null;
@@ -258,6 +266,48 @@ export type BorderlineLifecycleRenderEvent = {
   postMoveClassification: PostMoveClassification | null;
   reason: string;
 };
+
+/** Rows recorded in opportunities.jsonl (excludes synthetic entry-gate metrics). */
+export type BorderlineLifecyclePersistedRenderEvent = Omit<
+  BorderlineLifecycleRenderEvent,
+  "type"
+> & {
+  type: "created" | "watch" | "promoted" | "cancelled" | "expired";
+};
+
+export function isPersistedBorderlineLifecycleEvent(
+  ev: BorderlineLifecycleRenderEvent
+): ev is BorderlineLifecyclePersistedRenderEvent {
+  return ev.type !== "entry_rejected_weak";
+}
+
+export function buildBorderlineEntryRejectedWeakRenderEvent(
+  tick: Extract<StrategyTickResult, { kind: "ready" }>,
+  r: BorderlineEntryWeakRejection
+): BorderlineLifecycleRenderEvent {
+  const ws = tick.entry.windowSpike;
+  return {
+    type: "entry_rejected_weak",
+    candidateId: "entry-gate",
+    detectionTick: 0,
+    moveDirection: r.moveDirection,
+    movePercent: r.movePercent,
+    thresholdPercent: ws ? ws.thresholdPercent * 100 : 0,
+    thresholdRatio: r.thresholdRatio,
+    sourceWindowLabel: r.sourceWindowLabel,
+    suggestedContrarianDirection: null,
+    watchTicksConfigured: 0,
+    watchTicksObserved: 0,
+    watchTicksRemaining: 0,
+    currentBtcPrice: tick.btc,
+    bestBid: tick.executionBook.bestBid,
+    bestAsk: tick.executionBook.bestAsk,
+    midPrice: tick.executionBook.midPrice,
+    spreadBps: tick.executionBook.spreadBps,
+    postMoveClassification: null,
+    reason: r.reason,
+  };
+}
 
 type PipelineInput = {
   now: number;
@@ -283,11 +333,21 @@ type PipelineInput = {
     | "borderlineContinuationThreshold"
     | "borderlineReversionThreshold"
     | "borderlinePauseBandPercent"
+    | "borderlineMaxLifetimeMs"
+    | "borderlineFastPromoteDeltaBps"
+    | "borderlineFastPromoteProbDelta"
+    | "borderlineFastRejectSameDirectionBps"
+    | "enableBorderlineMode"
     | "strongSpikeHardRejectPoorRange"
     | "allowWeakQualityEntries"
     | "allowWeakQualityOnlyForStrongSpikes"
     | "allowAcceptableQualityStrongSpikes"
     | "unstableContextMode"
+    | "marketMode"
+    | "binaryMaxOppositeSideEntryPrice"
+    | "binaryMaxEntrySidePrice"
+    | "binaryNeutralQuoteBandMin"
+    | "binaryNeutralQuoteBandMax"
   >;
 };
 
@@ -421,10 +481,10 @@ function toRenderEvent(
 ): BorderlineLifecycleRenderEvent | null {
   const c = event.candidate;
   const currentBtcPrice = tick.kind === "ready" ? tick.btc : null;
-  const bestBid = tick.kind === "ready" ? tick.sides.bestBid : null;
-  const bestAsk = tick.kind === "ready" ? tick.sides.bestAsk : null;
-  const midPrice = tick.kind === "ready" ? tick.sides.midPrice : null;
-  const spreadBps = tick.kind === "ready" ? tick.sides.spreadBps : null;
+  const bestBid = tick.kind === "ready" ? tick.executionBook.bestBid : null;
+  const bestAsk = tick.kind === "ready" ? tick.executionBook.bestAsk : null;
+  const midPrice = tick.kind === "ready" ? tick.executionBook.midPrice : null;
+  const spreadBps = tick.kind === "ready" ? tick.executionBook.spreadBps : null;
 
   if (event.type === "created") {
     return {
@@ -678,6 +738,11 @@ export function runStrategyDecisionPipeline(
     const r = toRenderEvent(e, tick);
     if (r !== null) renderEvents.push(r);
   }
+  if (tick.kind === "ready") {
+    for (const wr of manager.drainBorderlineEntryWeakRejections()) {
+      renderEvents.push(buildBorderlineEntryRejectedWeakRenderEvent(tick, wr));
+    }
+  }
   const lifecycleDecision = fromLastMeaningfulLifecycle(lifecycleEvents);
   const qualityGateBase = classifySpikeQuality(tick.entry, {
     tradableSpikeMinPercent: config.tradableSpikeMinPercent,
@@ -750,6 +815,54 @@ export function runStrategyDecisionPipeline(
     hardReject
   );
 
+  const tryBinaryPaperQuoteGateBlock = (
+    direction: "UP" | "DOWN",
+    fastPathUsed: boolean,
+    movementCls: StrategyDecision["movementClassification"]
+  ): StrategyDecisionPipelineResult | null => {
+    if (config.marketMode !== "binary") return null;
+    const br = evaluateBinaryPaperEntryQuotes({
+      binaryOutcomes: tick.binaryOutcomes,
+      direction,
+      maxOppositeSideEntryPrice: config.binaryMaxOppositeSideEntryPrice,
+      maxEntrySidePrice: config.binaryMaxEntrySidePrice,
+      neutralBandMin: config.binaryNeutralQuoteBandMin,
+      neutralBandMax: config.binaryNeutralQuoteBandMax,
+    });
+    if (br === null) return null;
+    strongSpikeLifecycleMessages.push(
+      `[strategy] binary_quote_gate:${br} | dir=${direction}`
+    );
+    return {
+      decision: nrm({
+        tick,
+        simulation,
+        tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+        pipelineQualityGate: qualityGate,
+        decision: {
+          action: "none",
+          direction: null,
+          stableRangeQuality,
+          movementClassification: movementCls,
+          qualityGatePassed: qualityGate.qualityGatePassed,
+          qualityGateReasons: qualityGate.qualityGateReasons,
+          qualityProfile: qualityGate.qualityProfile,
+          hardRejectApplied: false,
+          hardRejectReason: null,
+          cooldownOverridden: false,
+          overrideReason: null,
+          spikeDetected: tick.entry.spikeDetected,
+          fastPathUsed,
+          criticalBlockerUsed: null,
+          reason: br,
+        },
+      }),
+      entryForSimulation: tick.entry,
+      borderlineLifecycleEvents: renderEvents,
+      strongSpikeLifecycleMessages,
+    };
+  };
+
   const activeStrong = strongSpikeManager.getActive();
   if (
     activeStrong !== null &&
@@ -786,6 +899,12 @@ export function runStrategyDecisionPipeline(
       `[strong-confirm] classification=${postMoveClassification}`
     );
     if (strongDecision.action === "promote") {
+      const binBlockStrong = tryBinaryPaperQuoteGateBlock(
+        strongDecision.direction,
+        true,
+        "strong_spike"
+      );
+      if (binBlockStrong !== null) return binBlockStrong;
       return {
         decision: nrm({
           tick,
@@ -863,6 +982,41 @@ export function runStrategyDecisionPipeline(
     if (!tick.entry.spikeDetected) {
       throw new Error("Invariant: strong_spike must have spikeDetected=true");
     }
+    if (
+      !config.enableBorderlineMode &&
+      qualityGate.qualityProfile !== "strong" &&
+      qualityGate.qualityProfile !== "exceptional"
+    ) {
+      return {
+        decision: nrm({
+          tick,
+          simulation,
+          tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
+          decision: {
+            action: "none",
+            direction: null,
+            stableRangeQuality,
+            movementClassification: tick.entry.movementClassification,
+            qualityGatePassed: qualityGate.qualityGatePassed,
+            qualityGateReasons: qualityGate.qualityGateReasons,
+            qualityProfile: qualityGate.qualityProfile,
+            hardRejectApplied: false,
+            hardRejectReason: null,
+            cooldownOverridden: false,
+            overrideReason: null,
+            spikeDetected: tick.entry.spikeDetected,
+            fastPathUsed: true,
+            criticalBlockerUsed: "quality_gate_rejected",
+            reason:
+              "borderline_mode_off_strong_spike_requires_strong_or_exceptional_quality",
+          },
+        }),
+        entryForSimulation: tick.entry,
+        borderlineLifecycleEvents: renderEvents,
+        strongSpikeLifecycleMessages,
+      };
+    }
     if (!qualityGate.qualityGatePassed) {
       return {
         decision: nrm({
@@ -932,54 +1086,68 @@ export function runStrategyDecisionPipeline(
         strongSpikeLifecycleMessages,
       };
     }
-    const bookGate = evaluateSpotBookPipeline(tick.sides, config.maxEntrySpreadBps);
-    if (bookGate !== null) {
-      if (bookGate === "invalid_book") {
-        strongSpikeLifecycleMessages.push(
-          "[strategy] spot book invalid (bid/ask) — blocking immediate entry"
+    if (config.marketMode === "binary") {
+      if (tick.entry.direction !== null) {
+        const binBlock = tryBinaryPaperQuoteGateBlock(
+          tick.entry.direction,
+          true,
+          tick.entry.movementClassification
         );
-      } else {
-        strongSpikeLifecycleMessages.push(
-          `[strategy] spread_too_wide | spr=${tick.sides.spreadBps.toFixed(2)}bps max=${config.maxEntrySpreadBps}`
-        );
+        if (binBlock !== null) return binBlock;
       }
-      return {
-        decision: nrm({
-          tick,
-          simulation,
-          tradableSpikeMinPercent: config.tradableSpikeMinPercent,
-          pipelineQualityGate: qualityGate,
-          decision: {
-            action: "none",
-            direction: null,
-            stableRangeQuality,
-            movementClassification: tick.entry.movementClassification,
-            qualityGatePassed: qualityGate.qualityGatePassed,
-            qualityGateReasons: qualityGate.qualityGateReasons,
-            qualityProfile: qualityGate.qualityProfile,
-            pipelineQualityModifier: {
-              effectiveQualityProfile: qualityGate.qualityProfile,
-              reason: `post_gate_spot_book:${bookGate}`,
-              preModifierGateProfile: qualityGate.qualityProfile,
+    } else {
+      const bookGate = evaluateExecutionBookPipeline(
+        tick.executionBook,
+        config.maxEntrySpreadBps
+      );
+      if (bookGate !== null) {
+        if (bookGate === "invalid_book") {
+          strongSpikeLifecycleMessages.push(
+            "[strategy] spot book invalid (bid/ask) — blocking immediate entry"
+          );
+        } else {
+          strongSpikeLifecycleMessages.push(
+            `[strategy] spread_too_wide | spr=${tick.executionBook.spreadBps.toFixed(2)}bps max=${config.maxEntrySpreadBps}`
+          );
+        }
+        return {
+          decision: nrm({
+            tick,
+            simulation,
+            tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+            pipelineQualityGate: qualityGate,
+            decision: {
+              action: "none",
+              direction: null,
+              stableRangeQuality,
+              movementClassification: tick.entry.movementClassification,
+              qualityGatePassed: qualityGate.qualityGatePassed,
+              qualityGateReasons: qualityGate.qualityGateReasons,
+              qualityProfile: qualityGate.qualityProfile,
+              pipelineQualityModifier: {
+                effectiveQualityProfile: qualityGate.qualityProfile,
+                reason: `post_gate_spot_book:${bookGate}`,
+                preModifierGateProfile: qualityGate.qualityProfile,
+              },
+              hardRejectApplied: false,
+              hardRejectReason: null,
+              cooldownOverridden: false,
+              overrideReason: null,
+              spikeDetected: tick.entry.spikeDetected,
+              fastPathUsed: true,
+              criticalBlockerUsed:
+                bookGate === "invalid_book" ? "invalid_market_prices" : "quality_gate_rejected",
+              reason:
+                bookGate === "invalid_book"
+                  ? "strong spike detected but blocked by invalid spot book"
+                  : "strong spike detected but blocked by wide spread",
             },
-            hardRejectApplied: false,
-            hardRejectReason: null,
-            cooldownOverridden: false,
-            overrideReason: null,
-            spikeDetected: tick.entry.spikeDetected,
-            fastPathUsed: true,
-            criticalBlockerUsed:
-              bookGate === "invalid_book" ? "invalid_market_prices" : "quality_gate_rejected",
-            reason:
-              bookGate === "invalid_book"
-                ? "strong spike detected but blocked by invalid spot book"
-                : "strong spike detected but blocked by wide spread",
-          },
-        }),
-        entryForSimulation: tick.entry,
-        borderlineLifecycleEvents: renderEvents,
-        strongSpikeLifecycleMessages,
-      };
+          }),
+          entryForSimulation: tick.entry,
+          borderlineLifecycleEvents: renderEvents,
+          strongSpikeLifecycleMessages,
+        };
+      }
     }
     const hasOpenPosition = simulation.getOpenPosition() !== null;
     const canOpenNewPosition = simulation.canOpenNewPosition(now, config.entryCooldownMs);
@@ -1064,6 +1232,12 @@ export function runStrategyDecisionPipeline(
       };
     }
     if (tick.entry.direction !== null && tick.entry.shouldEnter) {
+      const binBlockFast = tryBinaryPaperQuoteGateBlock(
+        tick.entry.direction,
+        true,
+        tick.entry.movementClassification
+      );
+      if (binBlockFast !== null) return binBlockFast;
       return {
         decision: nrm({
           tick,
@@ -1113,8 +1287,15 @@ export function runStrategyDecisionPipeline(
         borderlineContinuationThreshold: config.borderlineContinuationThreshold,
         borderlineReversionThreshold: config.borderlineReversionThreshold,
         borderlinePauseBandPercent: config.borderlinePauseBandPercent,
+        borderlineFastPromoteDeltaBps: config.borderlineFastPromoteDeltaBps,
+        borderlineFastPromoteProbDelta: config.borderlineFastPromoteProbDelta,
+        borderlineFastRejectSameDirectionBps:
+          config.borderlineFastRejectSameDirectionBps,
       },
       cooldownBlocked: !simulation.canOpenNewPosition(now, config.entryCooldownMs),
+      ...(tick.estimatedProbabilityUp !== undefined
+        ? { estimatedProbabilityUp: tick.estimatedProbabilityUp }
+        : {}),
     });
     const movement = analyzeBorderlinePostMove({
       candidate: active,
@@ -1124,7 +1305,32 @@ export function runStrategyDecisionPipeline(
       pauseBandPercent: config.borderlinePauseBandPercent,
     });
 
-    const applied = manager.applyDecision(now, watchDecision);
+    let effectiveWatch = watchDecision;
+    if (
+      watchDecision.action === "promote" &&
+      watchDecision.direction !== null &&
+      config.marketMode === "binary"
+    ) {
+      const br = evaluateBinaryPaperEntryQuotes({
+        binaryOutcomes: tick.binaryOutcomes,
+        direction: watchDecision.direction,
+        maxOppositeSideEntryPrice: config.binaryMaxOppositeSideEntryPrice,
+        maxEntrySidePrice: config.binaryMaxEntrySidePrice,
+        neutralBandMin: config.binaryNeutralQuoteBandMin,
+        neutralBandMax: config.binaryNeutralQuoteBandMax,
+      });
+      if (br !== null) {
+        effectiveWatch = {
+          action: "cancel",
+          reason: br,
+        };
+        strongSpikeLifecycleMessages.push(
+          `[strategy] borderline promote cancelled by binary_quote_gate:${br}`
+        );
+      }
+    }
+
+    const applied = manager.applyDecision(now, effectiveWatch);
     if (applied !== null) {
       const rr = toRenderEvent(applied, tick);
       if (rr !== null) {
@@ -1133,6 +1339,18 @@ export function runStrategyDecisionPipeline(
       }
     }
     if (watchDecision.action === "promote") {
+      if (
+        effectiveWatch.action === "cancel" &&
+        config.marketMode === "binary" &&
+        watchDecision.direction !== null
+      ) {
+        const bbr = tryBinaryPaperQuoteGateBlock(
+          watchDecision.direction,
+          false,
+          tick.entry.movementClassification
+        );
+        if (bbr !== null) return bbr;
+      }
       if (!qualityGate.qualityGatePassed) {
         return {
           decision: nrm({
@@ -1274,6 +1492,14 @@ export function runStrategyDecisionPipeline(
     qualityGate.qualityGatePassed
   ) {
     if (simulation.canOpenNewPosition(now, config.entryCooldownMs)) {
+      if (tick.entry.direction !== null) {
+        const binBlockSlow = tryBinaryPaperQuoteGateBlock(
+          tick.entry.direction,
+          false,
+          tick.entry.movementClassification
+        );
+        if (binBlockSlow !== null) return binBlockSlow;
+      }
       return {
         decision: nrm({
           tick,
@@ -1285,15 +1511,15 @@ export function runStrategyDecisionPipeline(
           direction: tick.entry.direction,
           stableRangeQuality,
           movementClassification: tick.entry.movementClassification,
-          qualityGatePassed: qualityGate.qualityGatePassed,
-          qualityGateReasons: qualityGate.qualityGateReasons,
-          qualityProfile: qualityGate.qualityProfile,
-          hardRejectApplied: false,
-          hardRejectReason: null,
-          spikeDetected: tick.entry.spikeDetected,
-          fastPathUsed: false,
-          criticalBlockerUsed: null,
-          reason: "strong_spike_immediate_entry",
+            qualityGatePassed: qualityGate.qualityGatePassed,
+            qualityGateReasons: qualityGate.qualityGateReasons,
+            qualityProfile: qualityGate.qualityProfile,
+            hardRejectApplied: false,
+            hardRejectReason: null,
+            spikeDetected: tick.entry.spikeDetected,
+            fastPathUsed: false,
+            criticalBlockerUsed: null,
+            reason: "strong_spike_immediate_entry",
           },
         }),
         entryForSimulation: tick.entry,
@@ -1381,7 +1607,10 @@ export function applyFeedStaleEntryBlock(
   input: {
     tick: StrategyTickResult;
     simulation: SimulationEngine;
-    config: Pick<AppConfig, "blockEntriesOnStaleFeed" | "tradableSpikeMinPercent">;
+    config: Pick<
+      AppConfig,
+      "blockEntriesOnStaleFeed" | "tradableSpikeMinPercent"
+    > & { marketMode?: AppConfig["marketMode"] };
     feedStale: boolean;
   }
 ): StrategyDecisionPipelineResult {
@@ -1394,12 +1623,14 @@ export function applyFeedStaleEntryBlock(
     return result;
   }
   const d = result.decision;
+  const mode = input.config.marketMode ?? "binary";
+  const staleReason = mode === "binary" ? "quote_feed_stale" : "feed_stale";
   const blocked: StrategyDecision = {
     ...d,
     action: "none",
     direction: null,
-    criticalBlockerUsed: "feed_stale",
-    reason: "feed_stale",
+    criticalBlockerUsed: mode === "binary" ? "quote_feed_stale" : "feed_stale",
+    reason: staleReason,
   };
   return {
     ...result,
@@ -1426,6 +1657,7 @@ export function applyQuoteStaleEntryBlock(
       tradableSpikeMinPercent: number;
       blockEntriesOnStaleFeed?: boolean;
       blockEntriesOnStaleQuotes?: boolean;
+      marketMode?: AppConfig["marketMode"];
     };
     feedStale?: boolean;
     quoteFeedStale?: boolean;
@@ -1442,6 +1674,7 @@ export function applyQuoteStaleEntryBlock(
     config: {
       tradableSpikeMinPercent: input.config.tradableSpikeMinPercent,
       blockEntriesOnStaleFeed: block,
+      marketMode: input.config.marketMode ?? "binary",
     },
     feedStale: stale,
   });

@@ -1,5 +1,5 @@
 import type { EntryEvaluation } from "./entryConditions.js";
-import type { StrategyDecision } from "./strategyDecisionPipeline.js";
+import type { StrategyDecision } from "./strategy/strategyDecisionPipeline.js";
 
 export type NormalizedRejectionReason =
   | "invalid_market_prices"
@@ -17,7 +17,9 @@ export type NormalizedRejectionReason =
   | "market_quotes_too_neutral"
   | "no_signal_below_borderline"
   | "feed_stale"
-  | "quote_feed_stale";
+  | "quote_feed_stale"
+  | "entry_side_price_too_high"
+  | "missing_binary_quotes";
 
 const ORDER: readonly NormalizedRejectionReason[] = [
   "missing_quote_data",
@@ -36,6 +38,8 @@ const ORDER: readonly NormalizedRejectionReason[] = [
   "no_signal_below_borderline",
   "feed_stale",
   "quote_feed_stale",
+  "entry_side_price_too_high",
+  "missing_binary_quotes",
 ];
 
 export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string> = {
@@ -56,8 +60,9 @@ export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string
   market_quotes_too_neutral: "market quotes too neutral",
   no_signal_below_borderline: "no signal: movement below borderline threshold",
   feed_stale: "market data feed stale (no recent Binance book/trade updates)",
-  quote_feed_stale:
-    "legacy: binary quote feed stale (maps to feed_stale in new logs)",
+  quote_feed_stale: "binary / outcome quote feed stale",
+  entry_side_price_too_high: "bought outcome leg too expensive (binary cap)",
+  missing_binary_quotes: "YES/NO prices missing or invalid for binary entry",
 };
 
 function dedupeAndOrder(
@@ -76,6 +81,9 @@ function normalizeRawReason(
     return "opposite_side_price_too_high";
   }
   if (raw === "market_quotes_too_neutral") return "market_quotes_too_neutral";
+  if (raw === "neutral_quotes") return "market_quotes_too_neutral";
+  if (raw === "entry_side_price_too_high") return "entry_side_price_too_high";
+  if (raw === "missing_binary_quotes") return "missing_binary_quotes";
   if (raw === "feed_stale") return "feed_stale";
   if (raw === "quote_feed_stale") return "quote_feed_stale";
   if (raw === "market_not_stable" || raw === "range_too_noisy_for_entry") {
@@ -180,6 +188,10 @@ export function normalizeDecisionRejectionReasons(input: {
     out.push("feed_stale");
   } else if (decision.criticalBlockerUsed === "quote_feed_stale") {
     out.push("quote_feed_stale");
+  } else if (decision.criticalBlockerUsed === "entry_side_price_too_high") {
+    out.push("entry_side_price_too_high");
+  } else if (decision.criticalBlockerUsed === "missing_binary_quotes") {
+    out.push("missing_binary_quotes");
   } else if (decision.criticalBlockerUsed === "poor_range_hard_reject") {
     out.push("pre_spike_range_too_noisy");
   }

@@ -4,15 +4,67 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { configMeta, describeActiveConfigGroups } from "./config.js";
+import { buildNormalizedMonitorConfigSummary } from "./config/monitorNormalizedConfigSummary.js";
 import {
   buildMonitorSessionSummary,
   MonitorFilePersistence,
   opportunityToJsonlRecord,
   tradeToJsonlRecord,
 } from "./monitorPersistence.js";
+import { configDefaults, type AppConfig } from "./config.js";
 import { SimulationEngine } from "./simulationEngine.js";
 
 describe("monitorPersistence", () => {
+  it("session summary may include normalizedConfig when provided", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 1000 });
+    const cfg = {
+      ...(configDefaults as unknown as AppConfig),
+      marketMode: "binary" as const,
+    };
+    const norm = buildNormalizedMonitorConfigSummary(cfg, configMeta);
+    const s = buildMonitorSessionSummary({
+      outputDirectory: "/tmp",
+      startedAtMs: 1,
+      endedAtMs: 2,
+      ticksObserved: 0,
+      btcFetchFailures: 0,
+      spikeEventsDetected: 0,
+      candidateOpportunities: 0,
+      validOpportunities: 0,
+      rejectedOpportunities: 0,
+      tradesExecuted: 0,
+      perf: sim.getPerformanceStats(),
+      marketMode: "binary",
+      normalizedConfig: norm,
+    });
+    expect(s.normalizedConfig?.schema).toBe("normalized_monitor_config_v2");
+    expect(s.normalizedConfig?.marketMode).toBe("binary");
+    expect(s.normalizedConfig?.effectiveExits.timeoutAppliesTo).toBe(
+      "binary_outcome_leg"
+    );
+  });
+
+  it("session summary includes marketMode and configGroupSummary when provided", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 1000 });
+    const s = buildMonitorSessionSummary({
+      outputDirectory: "/tmp",
+      startedAtMs: 1,
+      endedAtMs: 2,
+      ticksObserved: 0,
+      btcFetchFailures: 0,
+      spikeEventsDetected: 0,
+      candidateOpportunities: 0,
+      validOpportunities: 0,
+      rejectedOpportunities: 0,
+      tradesExecuted: 0,
+      perf: sim.getPerformanceStats(),
+      marketMode: "binary",
+    });
+    expect(s.marketMode).toBe("binary");
+    expect(s.configGroupSummary).toBe(describeActiveConfigGroups("binary"));
+  });
+
   it("creates dir and appends JSONL lines", () => {
     const dir = mkdtempSync(join(tmpdir(), "spike-monitor-"));
     try {
@@ -218,6 +270,7 @@ describe("monitorPersistence", () => {
       status: "rejected",
     });
     expect(r.observedAt).toBe("1970-01-01T00:00:00.000Z");
+    expect(r.marketMode).toBe("binary");
     expect(r.stableRangeQuality).toBe("poor");
     expect(r.thresholdRatio).toBe(0.9);
     expect(r.movementClassification).toBe("no_signal");
@@ -240,8 +293,45 @@ describe("monitorPersistence", () => {
       openedAt: 1000,
       closedAt: 2000,
     });
+    expect(r.marketMode).toBe("spot");
     expect(r.openedAt).toBe(new Date(1000).toISOString());
     expect(r.closedAt).toBe(new Date(2000).toISOString());
     expect(r.holdDurationMs).toBe(1000);
+  });
+
+  it("tradeToJsonlRecord for binary uses binary_paper schema without spot bid/ask", () => {
+    const r = tradeToJsonlRecord({
+      id: 2,
+      direction: "UP",
+      executionModel: "binary",
+      sideBought: "YES",
+      stake: 10,
+      shares: 20,
+      entryPrice: 0.5,
+      exitPrice: 0.55,
+      entrySidePrice: 0.5,
+      exitSidePrice: 0.55,
+      yesPriceAtEntry: 0.49,
+      noPriceAtEntry: 0.51,
+      yesPriceAtExit: 0.55,
+      noPriceAtExit: 0.45,
+      grossPnl: 1,
+      feesEstimate: 0.02,
+      profitLoss: 0.98,
+      equityBefore: 1000,
+      equityAfter: 1000.98,
+      riskAtEntry: 10,
+      baseStakePerTrade: 10,
+      qualityStakeMultiplier: 1,
+      exitReason: "profit",
+      entryPath: "strong_spike_immediate",
+      openedAt: 5000,
+      closedAt: 8000,
+    });
+    expect(r.marketMode).toBe("binary");
+    expect((r as { schema?: string }).schema).toBe("binary_paper_trade_v1");
+    expect((r as { entryBid?: unknown }).entryBid).toBeUndefined();
+    expect((r as { contracts?: number }).contracts).toBe(20);
+    expect((r as { outcomeTokenBought?: string }).outcomeTokenBought).toBe("YES");
   });
 });

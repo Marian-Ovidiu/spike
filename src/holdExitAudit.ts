@@ -13,6 +13,18 @@ export const EXIT_AUDIT_NEAR_TARGET_PRICE = 0.02;
  */
 export const EXIT_AUDIT_NEAR_STOP_PRICE = 0.02;
 
+/** Binary paper: explicit price-point audit (same geometry as long-outcome, share-style labels). */
+export type BinaryPriceSideHoldExitAudit = {
+  takeProfitPriceDelta: number;
+  stopLossPriceDelta: number;
+  profitTargetPrice: number;
+  stopLossThresholdPrice: number;
+  maxFavorableExcursionPoints: number;
+  maxAdverseExcursionPoints: number;
+  minGapToTakeProfitPoints: number;
+  minGapToStopLossPoints: number;
+};
+
 /** Per closed trade: how far the mark moved vs configured exit thresholds (long on held leg). */
 export type HoldExitAudit = {
   configExitPrice: number;
@@ -45,6 +57,19 @@ export type HoldExitAudit = {
   timeoutLikelyOnlyViableExit: boolean;
   nearTargetPriceThreshold: number;
   nearStopPriceThreshold: number;
+  /** Present when the hold used binary absolute price-delta exits on the outcome side. */
+  binaryPriceSide?: BinaryPriceSideHoldExitAudit;
+};
+
+/** Aggregated binary outcome price-point audit (subset of closed trades with {@link HoldExitAudit.binaryPriceSide}). */
+export type BinaryHoldExitAuditSummary = {
+  tradesAudited: number;
+  avgConfiguredTakeProfitDelta: number;
+  avgConfiguredStopLossDelta: number;
+  avgMinGapToTakeProfitPoints: number;
+  avgMinGapToStopLossPoints: number;
+  avgMaxFavorableExcursionPoints: number;
+  avgMaxAdverseExcursionPoints: number;
 };
 
 export type HoldExitAuditSummary = {
@@ -66,9 +91,45 @@ export type HoldExitAuditSummary = {
   avgMaxAdverseExcursion: number;
   nearTargetPriceThreshold: number;
   nearStopPriceThreshold: number;
+  /** Mean gaps on the held outcome leg when binary deltas were used. */
+  binaryOutcomeExitAudit?: BinaryHoldExitAuditSummary;
 };
 
-export type BuildHoldExitAuditInput = {
+export function aggregateBinaryHoldExitAudits(
+  trades: readonly { holdExitAudit?: HoldExitAudit }[]
+): BinaryHoldExitAuditSummary | null {
+  const binaries = trades
+    .map((t) => t.holdExitAudit?.binaryPriceSide)
+    .filter((b): b is BinaryPriceSideHoldExitAudit => b !== undefined);
+  if (binaries.length === 0) return null;
+  let sumTpDelta = 0;
+  let sumSlDelta = 0;
+  let sumGapTp = 0;
+  let sumGapSl = 0;
+  let sumMfe = 0;
+  let sumMae = 0;
+  for (const b of binaries) {
+    sumTpDelta += b.takeProfitPriceDelta;
+    sumSlDelta += b.stopLossPriceDelta;
+    sumGapTp += b.minGapToTakeProfitPoints;
+    sumGapSl += b.minGapToStopLossPoints;
+    sumMfe += b.maxFavorableExcursionPoints;
+    sumMae += b.maxAdverseExcursionPoints;
+  }
+  const n = binaries.length;
+  return {
+    tradesAudited: n,
+    avgConfiguredTakeProfitDelta: sumTpDelta / n,
+    avgConfiguredStopLossDelta: sumSlDelta / n,
+    avgMinGapToTakeProfitPoints: sumGapTp / n,
+    avgMinGapToStopLossPoints: sumGapSl / n,
+    avgMaxFavorableExcursionPoints: sumMfe / n,
+    avgMaxAdverseExcursionPoints: sumMae / n,
+  };
+}
+
+export type BuildHoldExitAuditSpotInput = {
+  mode?: "spot";
   /** LONG (UP) vs SHORT (DOWN) — affects MFE/MAE sign conventions. */
   direction?: EntryDirection;
   entryPrice: number;
@@ -84,24 +145,48 @@ export type BuildHoldExitAuditInput = {
   nearStopPrice?: number;
 };
 
-/**
- * Summarizes hold-period excursions vs fixed long take-profit and stop (paper sim semantics).
- * Uses only min/max mark during the hold (exact min gap to target / min buffer above stop
- * would need tick-by-tick extrema; for monotone-ish quotes extrema at highs/lows are correct).
- */
-export function buildHoldExitAudit(input: BuildHoldExitAuditInput): HoldExitAudit {
+export type BuildHoldExitAuditBinaryInput = {
+  mode: "binary";
+  entryPrice: number;
+  exitMark: number;
+  holdMarkMin: number;
+  holdMarkMax: number;
+  takeProfitPriceDelta: number;
+  stopLossPriceDelta: number;
+  exitReason: ExitReason;
+  nearTargetPrice?: number;
+  nearStopPrice?: number;
+};
+
+export type BuildHoldExitAuditInput =
+  | BuildHoldExitAuditSpotInput
+  | BuildHoldExitAuditBinaryInput;
+
+type HoldExitAuditCoreInput = {
+  direction: EntryDirection;
+  entryPrice: number;
+  exitMark: number;
+  holdMarkMin: number;
+  holdMarkMax: number;
+  configExitPrice: number;
+  configStopLoss: number;
+  exitReason: ExitReason;
+  nearTargetPrice: number;
+  nearStopPrice: number;
+};
+
+function buildHoldExitAuditCore(input: HoldExitAuditCoreInput): HoldExitAudit {
   const {
-    direction = "UP",
+    direction,
     entryPrice,
-    exitMark,
     holdMarkMin,
     holdMarkMax,
     configExitPrice,
     configStopLoss,
     exitReason,
+    nearTargetPrice,
+    nearStopPrice,
   } = input;
-  const nearTargetPrice = input.nearTargetPrice ?? EXIT_AUDIT_NEAR_TARGET_PRICE;
-  const nearStopPrice = input.nearStopPrice ?? EXIT_AUDIT_NEAR_STOP_PRICE;
 
   const long = direction === "UP";
   const maxFavorableExcursion = long
@@ -129,7 +214,7 @@ export function buildHoldExitAudit(input: BuildHoldExitAuditInput): HoldExitAudi
     configExitPrice,
     configStopLoss,
     entryPrice,
-    exitMark,
+    exitMark: input.exitMark,
     holdMarkMin,
     holdMarkMax,
     maxFavorableExcursion,
@@ -143,6 +228,60 @@ export function buildHoldExitAudit(input: BuildHoldExitAuditInput): HoldExitAudi
     nearTargetPriceThreshold: nearTargetPrice,
     nearStopPriceThreshold: nearStopPrice,
   };
+}
+
+/**
+ * Summarizes hold-period excursions vs take-profit and stop thresholds.
+ * Spot: {@link BuildHoldExitAuditSpotInput} with bps-derived threshold prices.
+ * Binary: {@link BuildHoldExitAuditBinaryInput} with absolute price deltas on the held outcome.
+ */
+export function buildHoldExitAudit(input: BuildHoldExitAuditInput): HoldExitAudit {
+  const nearTargetPrice = input.nearTargetPrice ?? EXIT_AUDIT_NEAR_TARGET_PRICE;
+  const nearStopPrice = input.nearStopPrice ?? EXIT_AUDIT_NEAR_STOP_PRICE;
+
+  if (input.mode === "binary") {
+    const profitTargetPrice = input.entryPrice + input.takeProfitPriceDelta;
+    const stopLossThresholdPrice = input.entryPrice - input.stopLossPriceDelta;
+    const base = buildHoldExitAuditCore({
+      direction: "UP",
+      entryPrice: input.entryPrice,
+      exitMark: input.exitMark,
+      holdMarkMin: input.holdMarkMin,
+      holdMarkMax: input.holdMarkMax,
+      configExitPrice: profitTargetPrice,
+      configStopLoss: stopLossThresholdPrice,
+      exitReason: input.exitReason,
+      nearTargetPrice,
+      nearStopPrice,
+    });
+    return {
+      ...base,
+      binaryPriceSide: {
+        takeProfitPriceDelta: input.takeProfitPriceDelta,
+        stopLossPriceDelta: input.stopLossPriceDelta,
+        profitTargetPrice,
+        stopLossThresholdPrice,
+        maxFavorableExcursionPoints: base.maxFavorableExcursion,
+        maxAdverseExcursionPoints: base.maxAdverseExcursion,
+        minGapToTakeProfitPoints: base.minGapToProfitTarget,
+        minGapToStopLossPoints: base.minBufferAboveStop,
+      },
+    };
+  }
+
+  const direction = input.direction ?? "UP";
+  return buildHoldExitAuditCore({
+    direction,
+    entryPrice: input.entryPrice,
+    exitMark: input.exitMark,
+    holdMarkMin: input.holdMarkMin,
+    holdMarkMax: input.holdMarkMax,
+    configExitPrice: input.configExitPrice,
+    configStopLoss: input.configStopLoss,
+    exitReason: input.exitReason,
+    nearTargetPrice,
+    nearStopPrice,
+  });
 }
 
 export function aggregateHoldExitAudits(
@@ -177,6 +316,8 @@ export function aggregateHoldExitAudits(
   const nearT = audits[0]!.nearTargetPriceThreshold;
   const nearS = audits[0]!.nearStopPriceThreshold;
 
+  const binaryOutcomeExitAudit = aggregateBinaryHoldExitAudits(trades);
+
   return {
     tradesAudited: n,
     closedByTimeout,
@@ -192,5 +333,8 @@ export function aggregateHoldExitAudits(
     avgMaxAdverseExcursion: sumMae / n,
     nearTargetPriceThreshold: nearT,
     nearStopPriceThreshold: nearS,
+    ...(binaryOutcomeExitAudit !== null
+      ? { binaryOutcomeExitAudit }
+      : {}),
   };
 }

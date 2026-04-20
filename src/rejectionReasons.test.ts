@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeDecisionRejectionReasons } from "./rejectionReasons.js";
-import type { StrategyDecision } from "./strategyDecisionPipeline.js";
+import type { StrategyDecision } from "./strategy/strategyDecisionPipeline.js";
 
 function baseDecision(
   partial: Partial<StrategyDecision>

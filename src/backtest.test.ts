@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   maxDrawdownFromTrades,
   parseHistoricalPriceText,
   runBacktestReplay,
+  runBinaryBacktestReplay,
 } from "./backtest.js";
+import { config as defaultAppConfig } from "./config.js";
 import type { SimulatedTrade } from "./simulationEngine.js";
 
 describe("parseHistoricalPriceText", () => {
@@ -79,6 +81,15 @@ describe("maxDrawdownFromTrades", () => {
 });
 
 describe("runBacktestReplay", () => {
+  const prevLegacy = process.env.LEGACY_SPOT_MARKET_MODE;
+  beforeAll(() => {
+    process.env.LEGACY_SPOT_MARKET_MODE = "1";
+  });
+  afterAll(() => {
+    if (prevLegacy === undefined) delete process.env.LEGACY_SPOT_MARKET_MODE;
+    else process.env.LEGACY_SPOT_MARKET_MODE = prevLegacy;
+  });
+
   it("runs without throwing on synthetic prices", () => {
     const prices = Array.from({ length: 30 }, (_, i) => 40_000 + i * 2);
     const r = runBacktestReplay(prices, {
@@ -228,5 +239,20 @@ describe("runBacktestReplay", () => {
       r.movement.noSignalMoves + r.movement.borderlineMoves + r.movement.strongSpikeMoves
     ).toBeGreaterThan(0);
     expect(r.comparison?.relaxed.totalTrades).toBe(r.totalTrades);
+  });
+});
+
+describe("runBinaryBacktestReplay", () => {
+  it("exposes binary_run_analytics_v1 and marks closed trades as binary execution", () => {
+    const prices = Array.from({ length: 45 }, (_, i) => 40_000 + i * 3 + (i > 38 ? 120 : 0));
+    const r = runBinaryBacktestReplay(prices, {
+      config: defaultAppConfig,
+      includeStrictComparison: false,
+    });
+    expect(r.binaryRunAnalytics?.schema).toBe("binary_run_analytics_v1");
+    expect(r.evaluationNote).toContain("binary");
+    for (const t of r.trades) {
+      expect(t.executionModel).toBe("binary");
+    }
   });
 });

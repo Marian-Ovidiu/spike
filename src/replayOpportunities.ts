@@ -12,15 +12,21 @@ import {
 } from "./hardRejectEngine.js";
 import type { MovementAnalysis } from "./movementAnalysis.js";
 import { evaluatePreEntryQualityGate } from "./preEntryQualityGate.js";
+import { evaluateBinaryPaperEntryQuotes } from "./binary/entry/binaryQuoteEntryFilter.js";
 import {
-  evaluateSpotBookPipeline,
-  syntheticSpotBookFromMid,
-  type SpotMicrostructure,
-} from "./spotSpreadFilter.js";
+  evaluateExecutionBookPipeline,
+  syntheticExecutableBookFromMid,
+  type ExecutableBookQuote,
+} from "./executionSpreadFilter.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 
 type JsonlRow = {
+  marketMode?: string;
+  yesPrice?: number;
+  noPrice?: number;
+  entryOutcomeSide?: "YES" | "NO" | null;
   btcPrice?: number;
+  underlyingSignalPrice?: number;
   movementClassification?: string;
   spikePercent?: number;
   spikeDirection?: "UP" | "DOWN" | null;
@@ -93,7 +99,8 @@ function storedHardRejectUnstable(row: JsonlRow): boolean {
   return row.entryRejectionReasons?.includes("hard_reject_unstable_pre_spike_context") ?? false;
 }
 
-function spotBookFromRow(row: JsonlRow): SpotMicrostructure | null {
+/** Reconstruct venue top-of-book from JSONL (binary YES/NO columns or legacy spot bid/ask). */
+function executionBookQuoteFromJsonlRow(row: JsonlRow): ExecutableBookQuote | null {
   if (
     row.bestBid !== undefined &&
     row.bestAsk !== undefined &&
@@ -109,9 +116,9 @@ function spotBookFromRow(row: JsonlRow): SpotMicrostructure | null {
       spreadBps: row.spreadBps,
     };
   }
-  const mid = row.btcPrice;
+  const mid = row.underlyingSignalPrice ?? row.btcPrice;
   if (typeof mid === "number" && Number.isFinite(mid)) {
-    return syntheticSpotBookFromMid(mid, 5);
+    return syntheticExecutableBookFromMid(mid, 5);
   }
   return null;
 }
@@ -122,6 +129,41 @@ function contrarianDirection(
   if (spike === "UP") return "DOWN";
   if (spike === "DOWN") return "UP";
   return null;
+}
+
+function isBinaryRow(row: JsonlRow): boolean {
+  if (row.marketMode === "binary") return true;
+  return (
+    typeof row.yesPrice === "number" &&
+    typeof row.noPrice === "number" &&
+    Number.isFinite(row.yesPrice) &&
+    Number.isFinite(row.noPrice) &&
+    row.yesPrice > 0 &&
+    row.noPrice > 0
+  );
+}
+
+function binaryOutcomesFromRow(
+  row: JsonlRow
+): { yesPrice: number; noPrice: number } | null {
+  if (
+    typeof row.yesPrice === "number" &&
+    typeof row.noPrice === "number" &&
+    Number.isFinite(row.yesPrice) &&
+    Number.isFinite(row.noPrice) &&
+    row.yesPrice > 0 &&
+    row.noPrice > 0
+  ) {
+    return { yesPrice: row.yesPrice, noPrice: row.noPrice };
+  }
+  return null;
+}
+
+/** Direction that would buy the named outcome leg (UP→YES, DOWN→NO). */
+function directionForBinaryQuoteGate(row: JsonlRow): "UP" | "DOWN" | null {
+  if (row.entryOutcomeSide === "YES") return "UP";
+  if (row.entryOutcomeSide === "NO") return "DOWN";
+  return contrarianDirection(row.spikeDirection ?? null);
 }
 
 function buildEntryFromRow(row: JsonlRow, priorFraction: number): EntryEvaluation {
@@ -163,9 +205,11 @@ function buildEntryFromRow(row: JsonlRow, priorFraction: number): EntryEvaluatio
 function parseArgs(argv: string[]): {
   file: string;
   priorMode: "auto" | "legacy" | "current";
+  marketMode: "auto" | "spot" | "binary";
 } {
   let file = resolve("output/monitor/opportunities.jsonl");
   let priorMode: "auto" | "legacy" | "current" = "auto";
+  let marketMode: "auto" | "spot" | "binary" = "auto";
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--file" || a === "-f") {
@@ -178,6 +222,15 @@ function parseArgs(argv: string[]): {
       else
         throw new Error(
           `--prior-unit expects auto|legacy|current, got ${JSON.stringify(v)}`
+        );
+      continue;
+    }
+    if (a === "--market-mode") {
+      const v = (argv[++i] ?? "").toLowerCase();
+      if (v === "auto" || v === "spot" || v === "binary") marketMode = v;
+      else
+        throw new Error(
+          `--market-mode expects auto|spot|binary, got ${JSON.stringify(v)}`
         );
       continue;
     }
@@ -194,16 +247,19 @@ Options:
                         current — value is already a fraction
                         auto    — if value > 0.05 treat as legacy, else fraction (default)
                         When JSONL has priorRangeFraction, it is used as-is.
+  --market-mode <m>   auto (default) — infer spot vs binary from JSONL row;
+                        spot — always use synthetic bid/ask spread gate;
+                        binary — use YES/NO binary quote gate when row has prices.
   --help, -h          Show this help
 `);
       process.exit(0);
     }
   }
-  return { file, priorMode };
+  return { file, priorMode, marketMode };
 }
 
 function main(): void {
-  const { file, priorMode } = parseArgs(process.argv);
+  const { file, priorMode, marketMode: marketModeArg } = parseArgs(process.argv);
   const raw = readFileSync(file, "utf8");
   const lines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
   const jsonlLines = lines.length;
@@ -280,13 +336,37 @@ function main(): void {
     if (qualityGate.qualityGatePassed) replayQualityPass++;
 
     const exceptional = qualityGate.qualityProfile === "exceptional";
+    const rowIsBinary =
+      marketModeArg === "binary" ||
+      (marketModeArg === "auto" && isBinaryRow(row));
+    const rowIsSpot = marketModeArg === "spot" || (marketModeArg === "auto" && !rowIsBinary);
+
     if (exceptional && qualityGate.qualityGatePassed && entry.direction !== null) {
-      const book = spotBookFromRow(row);
-      const quoteBlocker =
-        book === null
-          ? "invalid_book"
-          : evaluateSpotBookPipeline(book, config.maxEntrySpreadBps);
-      if (quoteBlocker !== null) {
+      let quoteBlocked = false;
+      if (rowIsBinary) {
+        const bo = binaryOutcomesFromRow(row);
+        const dirGate = directionForBinaryQuoteGate(row);
+        const br =
+          bo === null || dirGate === null
+            ? "missing_binary_quotes"
+            : evaluateBinaryPaperEntryQuotes({
+                binaryOutcomes: bo,
+                direction: dirGate,
+                maxOppositeSideEntryPrice: config.binaryMaxOppositeSideEntryPrice,
+                maxEntrySidePrice: config.binaryMaxEntrySidePrice,
+                neutralBandMin: config.binaryNeutralQuoteBandMin,
+                neutralBandMax: config.binaryNeutralQuoteBandMax,
+              });
+        quoteBlocked = br !== null;
+      } else if (rowIsSpot) {
+        const book = executionBookQuoteFromJsonlRow(row);
+        const quoteBlocker =
+          book === null
+            ? "invalid_book"
+            : evaluateExecutionBookPipeline(book, config.maxEntrySpreadBps);
+        quoteBlocked = quoteBlocker !== null;
+      }
+      if (quoteBlocked) {
         replayQuoteBlocked++;
       } else if (
         !config.strongSpikeHardRejectPoorRange ||
@@ -311,11 +391,34 @@ function main(): void {
         } else if (entry.direction === null) {
           cohort.unlockedQuoteBlocked++;
         } else {
-          const book = spotBookFromRow(row);
-          const qb =
-            book === null
-              ? "invalid_book"
-              : evaluateSpotBookPipeline(book, config.maxEntrySpreadBps);
+          const cohortRowBinary =
+            marketModeArg === "binary" ||
+            (marketModeArg === "auto" && isBinaryRow(row));
+          const cohortRowSpot =
+            marketModeArg === "spot" ||
+            (marketModeArg === "auto" && !cohortRowBinary);
+          let qb: string | null = null;
+          if (cohortRowBinary) {
+            const bo = binaryOutcomesFromRow(row);
+            const dirGate = directionForBinaryQuoteGate(row);
+            qb =
+              bo === null || dirGate === null
+                ? "missing_binary_quotes"
+                : evaluateBinaryPaperEntryQuotes({
+                    binaryOutcomes: bo,
+                    direction: dirGate,
+                    maxOppositeSideEntryPrice: config.binaryMaxOppositeSideEntryPrice,
+                    maxEntrySidePrice: config.binaryMaxEntrySidePrice,
+                    neutralBandMin: config.binaryNeutralQuoteBandMin,
+                    neutralBandMax: config.binaryNeutralQuoteBandMax,
+                  });
+          } else if (cohortRowSpot) {
+            const book = executionBookQuoteFromJsonlRow(row);
+            qb =
+              book === null
+                ? "invalid_book"
+                : evaluateExecutionBookPipeline(book, config.maxEntrySpreadBps);
+          }
           if (qb !== null) {
             cohort.unlockedQuoteBlocked++;
           } else if (
@@ -343,6 +446,7 @@ function main(): void {
     `File: ${file}`,
     `JSONL data lines: ${jsonlLines} | strong_spike ∧ spikeDetected: ${strongSpikeRows}`,
     `Prior column mapping: ${priorMode} (use --prior-unit legacy for pre-fix JSONL that only had mis-scaled priorRangePercent)`,
+    `Market mode: ${marketModeArg} (quote gate: ${marketModeArg === "binary" ? "binary YES/NO" : marketModeArg === "spot" ? "legacy spot L1 spread" : "per-row infer"})`,
     ``,
     `Active config (.env): maxPriorRangeForNormalEntry=${config.maxPriorRangeForNormalEntry} hardRejectPriorRangePercent=${config.hardRejectPriorRangePercent} unstableContextMode=${config.unstableContextMode}`,
     ``,

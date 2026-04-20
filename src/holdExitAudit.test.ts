@@ -55,6 +55,32 @@ describe("buildHoldExitAudit", () => {
     expect(a.targetWithinNearPriceBand).toBe(true);
     expect(a.timeoutLikelyOnlyViableExit).toBe(false);
   });
+
+  it("binary mode attaches binaryPriceSide with price-point gaps and deltas", () => {
+    const a = buildHoldExitAudit({
+      mode: "binary",
+      entryPrice: 0.49,
+      exitMark: 0.52,
+      holdMarkMin: 0.48,
+      holdMarkMax: 0.53,
+      takeProfitPriceDelta: 0.05,
+      stopLossPriceDelta: 0.05,
+      exitReason: "profit",
+    });
+    expect(a.binaryPriceSide).toBeDefined();
+    expect(a.binaryPriceSide!.profitTargetPrice).toBeCloseTo(0.54, 8);
+    expect(a.binaryPriceSide!.stopLossThresholdPrice).toBeCloseTo(0.44, 8);
+    expect(a.binaryPriceSide!.maxFavorableExcursionPoints).toBeCloseTo(
+      0.53 - 0.49,
+      8
+    );
+    expect(a.binaryPriceSide!.maxAdverseExcursionPoints).toBeCloseTo(
+      0.49 - 0.48,
+      8
+    );
+    expect(a.configExitPrice).toBeCloseTo(0.54, 8);
+    expect(a.configStopLoss).toBeCloseTo(0.44, 8);
+  });
 });
 
 describe("aggregateHoldExitAudits", () => {
@@ -92,5 +118,24 @@ describe("aggregateHoldExitAudits", () => {
     expect(s!.pctTimeoutsOnlyViableExit).toBe(100);
     expect(s!.nearTargetPriceThreshold).toBe(EXIT_AUDIT_NEAR_TARGET_PRICE);
     expect(s!.nearStopPriceThreshold).toBe(EXIT_AUDIT_NEAR_STOP_PRICE);
+  });
+
+  it("adds binaryOutcomeExitAudit when binaryPriceSide audits exist", () => {
+    const b = buildHoldExitAudit({
+      mode: "binary",
+      entryPrice: 0.49,
+      exitMark: 0.52,
+      holdMarkMin: 0.48,
+      holdMarkMax: 0.53,
+      takeProfitPriceDelta: 0.05,
+      stopLossPriceDelta: 0.05,
+      exitReason: "profit",
+    });
+    const s = aggregateHoldExitAudits([
+      { holdExitAudit: b, exitReason: "profit" },
+    ]);
+    expect(s?.binaryOutcomeExitAudit).toBeDefined();
+    expect(s!.binaryOutcomeExitAudit!.tradesAudited).toBe(1);
+    expect(s!.binaryOutcomeExitAudit!.avgConfiguredTakeProfitDelta).toBeCloseTo(0.05, 8);
   });
 });

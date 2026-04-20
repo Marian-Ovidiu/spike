@@ -4,7 +4,7 @@ import {
   evaluateEntryConditions,
   type EvaluateEntryConditionsInput,
 } from "./entryConditions.js";
-import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
+import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
 /** Default tight book around mid=100 USDT. */
 function spot(
@@ -15,7 +15,7 @@ function spot(
   EvaluateEntryConditionsInput,
   "bestBid" | "bestAsk" | "midPrice" | "spreadBps" | "maxEntrySpreadBps"
 > {
-  const b = syntheticSpotBookFromMid(mid, spreadBps);
+  const b = syntheticExecutableBookFromMid(mid, spreadBps);
   return {
     ...b,
     maxEntrySpreadBps,
@@ -33,6 +33,7 @@ const base = (
   spikeThreshold: 0.01,
   spikeMinRangeMultiple: 2.2,
   borderlineMinRatio: 0.85,
+  tradableSpikeMinPercent: 0.0015,
   ...spot(mid, 5, 500),
   ...overrides,
 });
@@ -134,10 +135,27 @@ describe("evaluateEntryConditions", () => {
       currentPrice: 100.093,
       spikeThreshold: 0.001,
       borderlineMinRatio: 0.85,
+      tradableSpikeMinPercent: 0.0004,
       spikeMinRangeMultiple: 1.5,
     });
     expect(r.movement.classification).toBe("borderline");
     expect(r.spikeDetected).toBe(false);
+  });
+
+  it("demotes weak borderline to no_signal when move < tradableSpikeMinPercent * 1.2", () => {
+    const r = evaluateEntryConditions({
+      ...base(100),
+      prices: [100, 100.093],
+      previousPrice: 100,
+      currentPrice: 100.093,
+      spikeThreshold: 0.001,
+      borderlineMinRatio: 0.85,
+      tradableSpikeMinPercent: 0.0015,
+      spikeMinRangeMultiple: 1.5,
+    });
+    expect(r.movementClassification).toBe("no_signal");
+    expect(r.reasons).toContain(ENTRY_REASON_CODES.BORDERLINE_REJECTED_WEAK);
+    expect(r.windowSpike?.classification).toBe("no_signal");
   });
 
   it("movement classification below borderline is no_signal", () => {
@@ -180,6 +198,7 @@ describe("evaluateEntryConditions", () => {
       currentPrice: 100.093,
       spikeThreshold: 0.001,
       borderlineMinRatio: 0.85,
+      tradableSpikeMinPercent: 0.0004,
       spikeMinRangeMultiple: 2.2,
     });
     expect(r.shouldEnter).toBe(false);
@@ -217,7 +236,7 @@ describe("evaluateEntryConditions", () => {
   });
 
   it("rejects strong spike when bid/ask spread too wide vs maxEntrySpreadBps", () => {
-    const tight = syntheticSpotBookFromMid(100, 5);
+    const tight = syntheticExecutableBookFromMid(100, 5);
     const r = evaluateEntryConditions({
       ...base(100),
       prices: [100, 100.1, 100.05, 100.08, 105],
@@ -275,7 +294,7 @@ describe("evaluateEntryConditions", () => {
   });
 
   it("rejects invalid book (NaN bid)", () => {
-    const b = syntheticSpotBookFromMid(100, 5);
+    const b = syntheticExecutableBookFromMid(100, 5);
     const r = evaluateEntryConditions({
       ...base(100),
       prices: [100, 100.1, 100.05, 100.08, 105],

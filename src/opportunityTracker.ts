@@ -1,12 +1,13 @@
-import type { EntryEvaluation } from "./entryConditions.js";
-import type { BorderlineLifecycleRenderEvent } from "./strategyDecisionPipeline.js";
+import type { EntryDirection, EntryEvaluation } from "./entryConditions.js";
+import type { BinaryOutcomePrices } from "./market/types.js";
+import type { BorderlineLifecyclePersistedRenderEvent } from "./strategy/strategyDecisionPipeline.js";
 import type { PostMoveClassification } from "./borderlineCandidate.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 import { type MovementClassification, type WindowSpikeSource } from "./strategy.js";
 import type {
   PipelineQualityModifier,
   StrategyDecision,
-} from "./strategyDecisionPipeline.js";
+} from "./strategy/strategyDecisionPipeline.js";
 import { normalizeBorderlineLifecycleRejection } from "./decisionReasonBuilder.js";
 import {
   DEFAULT_TRADABLE_SPIKE_MIN_PERCENT,
@@ -31,9 +32,20 @@ export type OpportunityOutcome =
   | "expired"
   | "rejected";
 
+function entryOutcomeSideFromDirection(
+  dir: EntryDirection | null
+): "YES" | "NO" | null {
+  if (dir === "UP") return "YES";
+  if (dir === "DOWN") return "NO";
+  return null;
+}
+
 export type Opportunity = {
   timestamp: number;
+  /** BTC signal mid at decision time (rolling-buffer / spike layer); not venue YES/NO. */
   btcPrice: number;
+  /** Binary: duplicate of `btcPrice` when both populated (signal = BTC spot). */
+  underlyingSignalPrice?: number;
   previousPrice: number;
   currentPrice: number;
   spikeDirection: SpikeDirection | null;
@@ -45,6 +57,7 @@ export type Opportunity = {
   spikeReferencePrice: number;
   /** Prior-window relative range (max−min)/min as a fraction (chop context). */
   priorRangeFraction: number;
+  /** Execution venue executable book (binary venue bid/ask; not BTC signal). */
   bestBid: number;
   bestAsk: number;
   midPrice: number;
@@ -80,15 +93,36 @@ export type Opportunity = {
   /** Same codes as {@link EntryEvaluation.reasons} when rejected. */
   entryRejectionReasons: readonly string[];
   status: OpportunityStatus;
+  /** Session universe; omitted on legacy rows (treated as spot). */
+  marketMode?: "spot" | "binary";
+  /** Binary: YES mid at tick. */
+  yesPrice?: number;
+  /** Binary: NO mid at tick. */
+  noPrice?: number;
+  binaryQuoteAgeMs?: number | null;
+  binaryQuoteStale?: boolean;
+  binaryMarketId?: string;
+  binarySlug?: string;
+  binaryQuestion?: string;
+  binaryConditionId?: string | null;
+  /** Outcome token that would be bought for this strategy direction (UP→YES, DOWN→NO). */
+  entryOutcomeSide?: "YES" | "NO" | null;
+  /** Binary: model P(up) at this observation (calibration). */
+  estimatedProbabilityUp?: number;
+  /** Binary: horizon used with realized BTC path for calibration labels. */
+  probabilityTimeHorizonMs?: number;
 };
 
 export type RecordReadyTickInput = {
   timestamp: number;
   btcPrice: number;
+  /** Binary: explicit BTC signal price (defaults to `btcPrice` if omitted). */
+  underlyingSignalPrice?: number;
   prices: readonly number[];
   previousPrice: number;
   currentPrice: number;
-  sides: {
+  /** Executable venue top-of-book (binary venue bid/ask; not the BTC signal series). */
+  executionBook: {
     bestBid: number;
     bestAsk: number;
     midPrice: number;
@@ -111,6 +145,18 @@ export type RecordReadyTickInput = {
     | "qualityGateDiagnostics"
     | "pipelineQualityModifier"
   >;
+  marketMode?: "spot" | "binary";
+  binaryOutcomes?: BinaryOutcomePrices | null;
+  binaryQuoteMeta?: {
+    quoteAgeMs: number | null;
+    quoteStale: boolean;
+    marketId?: string;
+    slug?: string;
+    question?: string;
+    conditionId?: string | null;
+  };
+  estimatedProbabilityUp?: number;
+  probabilityTimeHorizonMs?: number;
 };
 
 function priorWindowRelativeRangeFraction(
@@ -137,13 +183,25 @@ export function buildOpportunityFromReadyTick(
   const {
     timestamp,
     btcPrice,
+    underlyingSignalPrice: underlyingSignalPriceInput,
     prices,
     previousPrice,
     currentPrice,
-    sides,
+    executionBook,
     entry,
     decision,
+    marketMode,
+    binaryOutcomes,
+    binaryQuoteMeta,
+    estimatedProbabilityUp: pUpInput,
+    probabilityTimeHorizonMs: horizonInput,
   } = input;
+
+  const underlyingSignalPrice =
+    underlyingSignalPriceInput !== undefined &&
+    Number.isFinite(underlyingSignalPriceInput)
+      ? underlyingSignalPriceInput
+      : btcPrice;
 
   const movement = entry.movement;
   if (movement.classification !== "strong_spike") {
@@ -203,9 +261,21 @@ export function buildOpportunityFromReadyTick(
     decision?.qualityGateDiagnostics ?? gateEval.diagnostics;
   const pipelineQualityModifier = decision?.pipelineQualityModifier;
 
+  const bo =
+    marketMode === "binary" &&
+    binaryOutcomes !== null &&
+    binaryOutcomes !== undefined &&
+    Number.isFinite(binaryOutcomes.yesPrice) &&
+    Number.isFinite(binaryOutcomes.noPrice)
+      ? binaryOutcomes
+      : null;
+
   return {
     timestamp,
-    btcPrice,
+    btcPrice: underlyingSignalPrice,
+    ...(marketMode === "binary"
+      ? { underlyingSignalPrice }
+      : {}),
     previousPrice,
     currentPrice,
     spikeDirection,
@@ -218,10 +288,10 @@ export function buildOpportunityFromReadyTick(
           ? currentPrice - movement.strongestMoveAbsolute
           : currentPrice + movement.strongestMoveAbsolute,
     priorRangeFraction,
-    bestBid: sides.bestBid,
-    bestAsk: sides.bestAsk,
-    midPrice: sides.midPrice,
-    spreadBps: sides.spreadBps,
+    bestBid: executionBook.bestBid,
+    bestAsk: executionBook.bestAsk,
+    midPrice: executionBook.midPrice,
+    spreadBps: executionBook.spreadBps,
     stableRangeDetected,
     stableRangeQuality,
     spikeDetected,
@@ -241,6 +311,39 @@ export function buildOpportunityFromReadyTick(
     entryAllowed,
     entryRejectionReasons,
     status: entryAllowed ? "valid" : "rejected",
+    ...(marketMode === "binary"
+      ? {
+          marketMode: "binary" as const,
+          entryOutcomeSide: entryOutcomeSideFromDirection(entry.direction),
+          ...(bo !== null
+            ? { yesPrice: bo.yesPrice, noPrice: bo.noPrice }
+            : {}),
+          ...(binaryQuoteMeta !== undefined
+            ? {
+                binaryQuoteAgeMs: binaryQuoteMeta.quoteAgeMs,
+                binaryQuoteStale: binaryQuoteMeta.quoteStale,
+                ...(binaryQuoteMeta.marketId !== undefined
+                  ? { binaryMarketId: binaryQuoteMeta.marketId }
+                  : {}),
+                ...(binaryQuoteMeta.slug !== undefined
+                  ? { binarySlug: binaryQuoteMeta.slug }
+                  : {}),
+                ...(binaryQuoteMeta.question !== undefined
+                  ? { binaryQuestion: binaryQuoteMeta.question }
+                  : {}),
+                ...(binaryQuoteMeta.conditionId !== undefined
+                  ? { binaryConditionId: binaryQuoteMeta.conditionId }
+                  : {}),
+              }
+            : {}),
+          ...(pUpInput !== undefined && Number.isFinite(pUpInput)
+            ? { estimatedProbabilityUp: pUpInput }
+            : {}),
+          ...(horizonInput !== undefined && Number.isFinite(horizonInput)
+            ? { probabilityTimeHorizonMs: Math.trunc(horizonInput) }
+            : {}),
+        }
+      : {}),
   };
 }
 
@@ -298,9 +401,21 @@ export class OpportunityTracker {
    */
   recordBorderlineLifecycleEvent(input: {
     timestamp: number;
-    event: BorderlineLifecycleRenderEvent;
+    event: BorderlineLifecyclePersistedRenderEvent;
     tradableSpikeMinPercent?: number;
     maxPriorRangeForNormalEntry?: number;
+    marketMode?: "spot" | "binary";
+    binaryOutcomes?: BinaryOutcomePrices | null;
+    binaryQuoteMeta?: {
+      quoteAgeMs: number | null;
+      quoteStale: boolean;
+      marketId?: string;
+      slug?: string;
+      question?: string;
+      conditionId?: string | null;
+    };
+    estimatedProbabilityUp?: number;
+    probabilityTimeHorizonMs?: number;
   }): Opportunity {
     const e = input.event;
     const derivedOutcome: OpportunityOutcome =
@@ -319,11 +434,23 @@ export class OpportunityTracker {
     const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
       ? Math.max(0, input.tradableSpikeMinPercent ?? DEFAULT_TRADABLE_SPIKE_MIN_PERCENT)
       : DEFAULT_TRADABLE_SPIKE_MIN_PERCENT;
+    const bo =
+      input.marketMode === "binary" &&
+      input.binaryOutcomes !== null &&
+      input.binaryOutcomes !== undefined &&
+      Number.isFinite(input.binaryOutcomes.yesPrice) &&
+      Number.isFinite(input.binaryOutcomes.noPrice)
+        ? input.binaryOutcomes
+        : null;
+    const contrarian = e.suggestedContrarianDirection ?? null;
+
+    const u = e.currentBtcPrice ?? 0;
     const o: Opportunity = {
       timestamp: input.timestamp,
-      btcPrice: e.currentBtcPrice ?? 0,
-      previousPrice: e.currentBtcPrice ?? 0,
-      currentPrice: e.currentBtcPrice ?? 0,
+      btcPrice: u,
+      ...(input.marketMode === "binary" ? { underlyingSignalPrice: u } : {}),
+      previousPrice: u,
+      currentPrice: u,
       spikeDirection,
       spikePercent: e.movePercent,
       spikeSource: e.sourceWindowLabel as
@@ -362,6 +489,43 @@ export class OpportunityTracker {
               reason: e.reason,
             }),
       status: derivedOutcome === "promoted_after_watch" ? "valid" : "rejected",
+      ...(input.marketMode === "binary"
+        ? {
+            marketMode: "binary" as const,
+            entryOutcomeSide: entryOutcomeSideFromDirection(contrarian),
+            ...(bo !== null ? { yesPrice: bo.yesPrice, noPrice: bo.noPrice } : {}),
+            ...(input.binaryQuoteMeta !== undefined
+              ? {
+                  binaryQuoteAgeMs: input.binaryQuoteMeta.quoteAgeMs,
+                  binaryQuoteStale: input.binaryQuoteMeta.quoteStale,
+                  ...(input.binaryQuoteMeta.marketId !== undefined
+                    ? { binaryMarketId: input.binaryQuoteMeta.marketId }
+                    : {}),
+                  ...(input.binaryQuoteMeta.slug !== undefined
+                    ? { binarySlug: input.binaryQuoteMeta.slug }
+                    : {}),
+                  ...(input.binaryQuoteMeta.question !== undefined
+                    ? { binaryQuestion: input.binaryQuoteMeta.question }
+                    : {}),
+                  ...(input.binaryQuoteMeta.conditionId !== undefined
+                    ? { binaryConditionId: input.binaryQuoteMeta.conditionId }
+                    : {}),
+                }
+              : {}),
+          ...(input.estimatedProbabilityUp !== undefined &&
+          Number.isFinite(input.estimatedProbabilityUp)
+            ? { estimatedProbabilityUp: input.estimatedProbabilityUp }
+            : {}),
+          ...(input.probabilityTimeHorizonMs !== undefined &&
+          Number.isFinite(input.probabilityTimeHorizonMs)
+            ? {
+                probabilityTimeHorizonMs: Math.trunc(
+                  input.probabilityTimeHorizonMs
+                ),
+              }
+            : {}),
+          }
+        : {}),
     };
     if (derivedOutcome === "promoted_after_watch") {
       o.promotionReason = e.reason;

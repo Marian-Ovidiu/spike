@@ -5,7 +5,7 @@ import {
   analyzePostSpikeConfirmation,
   type PostSpikeMoveClassification,
 } from "./postSpikeConfirmationEngine.js";
-import { evaluateSpotBookPipeline } from "./spotSpreadFilter.js";
+import { evaluateExecutionBookPipeline } from "./executionSpreadFilter.js";
 export type StrongSpikePostMoveClassification = PostSpikeMoveClassification;
 
 export type StrongSpikeCandidateStatus = "watching" | "promoted" | "cancelled" | "expired";
@@ -239,8 +239,8 @@ export function evaluateStrongSpikeWatchDecision(input: {
   const pauseBandPercent = Number.isFinite(input.config.borderlinePauseBandPercent)
     ? Math.max(0, input.config.borderlinePauseBandPercent)
     : 0.00015;
-  const bookGate = evaluateSpotBookPipeline(
-    input.tick.sides,
+  const bookGate = evaluateExecutionBookPipeline(
+    input.tick.executionBook,
     input.config.maxEntrySpreadBps
   );
   if (bookGate === "invalid_book") {

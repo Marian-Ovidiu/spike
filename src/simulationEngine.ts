@@ -1,3 +1,4 @@
+import { debugMonitor } from "./config.js";
 import type { AppConfig } from "./config.js";
 import type { EntryDirection, EntryEvaluation } from "./entryConditions.js";
 import type { QualityProfile } from "./preEntryQualityGate.js";
@@ -5,22 +6,69 @@ import { resolveQualityStakeMultiplier } from "./stakeSizing.js";
 import type { ExitReason } from "./exitConditions.js";
 import { buildHoldExitAudit, type HoldExitAudit } from "./holdExitAudit.js";
 import {
+  computeBinaryExitDiagnostics,
+  evaluateBinaryExitConditions,
+} from "./binary/exit/binaryExitConditions.js";
+import {
   computeSpotExitDiagnostics,
   evaluateSpotExitConditions,
-} from "./spotExitConditions.js";
+} from "./legacy/spot/spotExitConditions.js";
 import {
-  spotEntryFillPrice,
-  spotMarkForPosition,
-  type SpotMicrostructure,
-} from "./spotSpreadFilter.js";
+  computeBinaryEntryEdge,
+  formatEdgeEntryLogLine,
+  resolveBinaryVenueAsks,
+  shouldEnterTrade,
+  binaryLegFromDirection,
+} from "./binary/entry/edgeEntryDecision.js";
+import {
+  binaryOutcomeBuyFillPrice,
+  binarySideFromStrategyDirection,
+  type BinarySideBought,
+} from "./binary/paper/binaryPaperExecution.js";
+import { logMonitorDebug } from "./monitor/monitorDebugLog.js";
+import { getPositionSize } from "./riskPositionSizing.js";
+import {
+  applyBinaryPaperVenueTick,
+  binaryPaperGrossPnlUsdt,
+  binaryPaperRoundTripFeeUsdt,
+  binaryPaperUnrealizedPnlUsdt,
+  openBinaryPaperPosition,
+  type BinaryPaperLivePosition,
+} from "./binary/paper/binaryPaperPosition.js";
+import { buildBinaryPaperTradeLog } from "./binary/paper/binaryPaperTradeLog.js";
+import type { BinaryOutcomePrices } from "./market/types.js";
+import type { ExecutableBookQuote } from "./executionSpreadFilter.js";
+import {
+  legacySpotEntryFillPrice,
+  legacySpotMarkForPosition,
+} from "./legacy/spot/spotBookQuotes.js";
 
 export type SimulatedTrade = {
   id: number;
   symbol: string;
   direction: EntryDirection;
+  /** `spot` (default) vs Polymarket-style outcome paper. */
+  executionModel?: "spot" | "binary";
+  /** When `executionModel === "binary"`, which outcome was bought. */
+  sideBought?: BinarySideBought;
+  /** Held-outcome entry / exit (same as `entryPrice`/`exitPrice` in binary mode, explicit for logs). */
+  entrySidePrice?: number;
+  exitSidePrice?: number;
+  yesPriceAtEntry?: number;
+  noPriceAtEntry?: number;
+  yesPriceAtExit?: number;
+  noPriceAtExit?: number;
+  /** Binary: underlying (e.g. BTC) signal mid at entry. */
+  underlyingSignalPriceAtEntry?: number;
+  /** Binary: underlying signal mid at exit. */
+  underlyingSignalPriceAtExit?: number;
+  /** Binary: model P(up) at entry (same tick as open). */
+  estimatedProbabilityUpAtEntry?: number;
+  /** Binary: horizon used for calibration labels (`PROBABILITY_TIME_HORIZON_MS`). */
+  probabilityTimeHorizonMs?: number;
   /** Fixed notional deployed at entry (USDT). */
   stake: number;
-  /** Position size in base asset (BTC): stake / entryPrice. */
+  /** Spot: base size (BTC). Binary: outcome contracts = stake / entrySidePrice. */
   shares: number;
   entryPrice: number;
   exitPrice: number;
@@ -43,6 +91,8 @@ export type SimulatedTrade = {
   /** Effective multiplier from {@link resolveQualityStakeMultiplier}. */
   qualityStakeMultiplier?: number;
   entryQualityProfile?: QualityProfile;
+  /** Binary: model P(bought) minus venue ask on that leg at entry (for run analytics). */
+  entryModelEdge?: number;
   exitReason: ExitReason;
   /** Which strategy path opened this trade. */
   entryPath: "strong_spike_immediate" | "borderline_delayed";
@@ -52,20 +102,17 @@ export type SimulatedTrade = {
   holdExitAudit?: HoldExitAudit;
 };
 
-/** Binance-style top of book passed into {@link SimulationEngine.onTick}. */
-export type SpotBookSides = SpotMicrostructure;
-
 /** Mark price for position: long → bid, short → ask. */
 export function quotePriceForPositionDirection(
   direction: EntryDirection,
-  book: SpotBookSides
+  book: ExecutableBookQuote
 ): number {
-  return spotMarkForPosition(direction, book);
+  return legacySpotMarkForPosition(direction, book);
 }
 
 export function selectPositionQuote(
   direction: EntryDirection,
-  book: SpotBookSides
+  book: ExecutableBookQuote
 ): {
   direction: EntryDirection;
   entrySide: "ask" | "bid";
@@ -77,14 +124,14 @@ export function selectPositionQuote(
     direction,
     entrySide: direction === "UP" ? "ask" : "bid",
     markSide: direction === "UP" ? "bid" : "ask",
-    fillReference: spotEntryFillPrice(direction, book, 0),
+    fillReference: legacySpotEntryFillPrice(direction, book, 0),
     otherSide: direction === "UP" ? book.bestAsk : book.bestBid,
   };
 }
 
 function paperQuoteFieldsForLog(
   direction: EntryDirection,
-  book: SpotBookSides
+  book: ExecutableBookQuote
 ): Record<string, unknown> {
   const s = selectPositionQuote(direction, book);
   return {
@@ -98,17 +145,29 @@ function paperQuoteFieldsForLog(
 }
 
 type OpenSimPosition = {
+  executionModel: "spot" | "binary";
   direction: EntryDirection;
+  sideBought?: BinarySideBought;
+  /** Binary paper: venue snapshot + sizing (authoritative for marks between ticks). */
+  binaryPaper?: BinaryPaperLivePosition;
+  yesPriceAtEntry?: number;
+  noPriceAtEntry?: number;
+  underlyingSignalAtEntry?: number;
   stake: number;
   shares: number;
   entryPrice: number;
-  entryBid: number;
-  entryAsk: number;
+  /** Spot only — omitted in binary mode (no BTC bid/ask book semantics). */
+  entryBid?: number;
+  entryAsk?: number;
   entryPath: "strong_spike_immediate" | "borderline_delayed";
   openedAt: number;
   baseStakePerTrade: number;
   qualityStakeMultiplier: number;
   entryQualityProfile?: QualityProfile;
+  /** Binary: model minus ask on bought leg at entry; persisted on closed trade. */
+  entryModelEdge?: number;
+  /** Binary: model P(up) at entry tick (calibration vs realized horizon). */
+  estimatedProbabilityUpAtEntry?: number;
   /** Set when {@link SimulationEngineOptions.paperPositionMtmDiagnostics} is true. */
   paperOpenSeq?: number;
   /** Min/max mark on the held leg while open (every tick; used for exit audit + MTM logs). */
@@ -123,22 +182,52 @@ export type SimulationTickInput = {
   entryPath?: "strong_spike_immediate" | "borderline_delayed";
   /** From strategy decision / gate; drives stake multiplier when enabled. */
   entryQualityProfile?: QualityProfile;
-  sides: SpotBookSides;
+  /**
+   * Executable **venue** top-of-book (binary: synthetic bid/ask around YES/NO; spot: Binance).
+   * Never used as the BTC rolling-buffer series — that comes from {@link BotContext.signalFeed}.
+   */
+  executionBook: ExecutableBookQuote;
   symbol: string;
+  /**
+   * `binary` → outcome-token paper (requires `binaryOutcomes` each tick).
+   * Omitted or `spot` → legacy spot bid/ask execution.
+   */
+  marketMode?: "spot" | "binary";
+  /** YES/NO prices for the current tick (binary mode). */
+  binaryOutcomes?: BinaryOutcomePrices | null;
+  /**
+   * Underlying signal mid this tick (binary: BTC spot; spot: same as book mid).
+   * Used for trade logs comparing signal vs venue repricing.
+   */
+  underlyingSignalPrice?: number;
+  /**
+   * Binary: model P(up) for edge vs asks (`minEdgeThreshold` in `config`).
+   * When the gate is on and this is missing/NaN, entry is skipped.
+   */
+  estimatedProbabilityUp?: number;
   /** Exit, stop (bps), sizing, cooldown, fees. */
   config: Pick<
     AppConfig,
     | "takeProfitBps"
     | "stopLossBps"
-    | "paperSlippageBps"
+    | "binaryPaperSlippageBps"
     | "paperFeeRoundTripBps"
     | "exitTimeoutMs"
+    | "binaryTakeProfitPriceDelta"
+    | "binaryStopLossPriceDelta"
+    | "binaryExitTimeoutMs"
+    | "binaryMaxEntryPrice"
     | "entryCooldownMs"
     | "stakePerTrade"
     | "allowWeakQualityEntries"
     | "weakQualitySizeMultiplier"
     | "strongQualitySizeMultiplier"
     | "exceptionalQualitySizeMultiplier"
+    | "minEdgeThreshold"
+    | "riskPercentPerTrade"
+    | "maxTradeSize"
+    | "minTradeSize"
+    | "probabilityTimeHorizonMs"
   >;
 };
 
@@ -166,6 +255,16 @@ export type TransparentTradeLog = {
   /** ISO time at exit (close). */
   timestamp: string;
   direction: EntryDirection;
+  executionModel?: "spot" | "binary";
+  sideBought?: BinarySideBought;
+  entrySidePrice?: number;
+  exitSidePrice?: number;
+  yesPriceAtEntry?: number;
+  noPriceAtEntry?: number;
+  yesPriceAtExit?: number;
+  noPriceAtExit?: number;
+  underlyingSignalPriceAtEntry?: number;
+  underlyingSignalPriceAtExit?: number;
   stake: number;
   shares: number;
   entryPrice: number;
@@ -182,6 +281,19 @@ export type TransparentTradeLog = {
   qualityStakeMultiplier?: number;
   entryQualityProfile?: QualityProfile;
   riskAtEntry?: number;
+  /** Binary trades: explicit grouping of BTC signal vs YES/NO venue in JSONL. */
+  layers?: {
+    signal: {
+      underlyingBtcMidAtEntry?: number;
+      underlyingBtcMidAtExit?: number;
+    };
+    executionVenue: {
+      yesPriceAtEntry?: number;
+      noPriceAtEntry?: number;
+      yesPriceAtExit?: number;
+      noPriceAtExit?: number;
+    };
+  };
 };
 
 export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog {
@@ -190,6 +302,20 @@ export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog
     symbol: t.symbol,
     timestamp: new Date(t.closedAt).toISOString(),
     direction: t.direction,
+    ...(t.executionModel !== undefined ? { executionModel: t.executionModel } : {}),
+    ...(t.sideBought !== undefined ? { sideBought: t.sideBought } : {}),
+    ...(t.entrySidePrice !== undefined ? { entrySidePrice: t.entrySidePrice } : {}),
+    ...(t.exitSidePrice !== undefined ? { exitSidePrice: t.exitSidePrice } : {}),
+    ...(t.yesPriceAtEntry !== undefined ? { yesPriceAtEntry: t.yesPriceAtEntry } : {}),
+    ...(t.noPriceAtEntry !== undefined ? { noPriceAtEntry: t.noPriceAtEntry } : {}),
+    ...(t.yesPriceAtExit !== undefined ? { yesPriceAtExit: t.yesPriceAtExit } : {}),
+    ...(t.noPriceAtExit !== undefined ? { noPriceAtExit: t.noPriceAtExit } : {}),
+    ...(t.underlyingSignalPriceAtEntry !== undefined
+      ? { underlyingSignalPriceAtEntry: t.underlyingSignalPriceAtEntry }
+      : {}),
+    ...(t.underlyingSignalPriceAtExit !== undefined
+      ? { underlyingSignalPriceAtExit: t.underlyingSignalPriceAtExit }
+      : {}),
     stake: t.stake,
     shares: t.shares,
     entryPrice: t.entryPrice,
@@ -211,6 +337,34 @@ export function buildTransparentTradeLog(t: SimulatedTrade): TransparentTradeLog
       ? { entryQualityProfile: t.entryQualityProfile }
       : {}),
     ...(t.riskAtEntry !== undefined ? { riskAtEntry: t.riskAtEntry } : {}),
+    ...(t.executionModel === "binary"
+      ? {
+          layers: {
+            signal: {
+              ...(t.underlyingSignalPriceAtEntry !== undefined
+                ? { underlyingBtcMidAtEntry: t.underlyingSignalPriceAtEntry }
+                : {}),
+              ...(t.underlyingSignalPriceAtExit !== undefined
+                ? { underlyingBtcMidAtExit: t.underlyingSignalPriceAtExit }
+                : {}),
+            },
+            executionVenue: {
+              ...(t.yesPriceAtEntry !== undefined
+                ? { yesPriceAtEntry: t.yesPriceAtEntry }
+                : {}),
+              ...(t.noPriceAtEntry !== undefined
+                ? { noPriceAtEntry: t.noPriceAtEntry }
+                : {}),
+              ...(t.yesPriceAtExit !== undefined
+                ? { yesPriceAtExit: t.yesPriceAtExit }
+                : {}),
+              ...(t.noPriceAtExit !== undefined
+                ? { noPriceAtExit: t.noPriceAtExit }
+                : {}),
+            },
+          },
+        }
+      : {}),
   };
 }
 
@@ -269,13 +423,35 @@ export class SimulationEngine {
     entryPrice: number;
     stake: number;
     shares: number;
+    executionModel?: "spot" | "binary";
+    sideBought?: BinarySideBought;
+    /** Binary: mark on the held outcome after the latest venue quote. */
+    currentHeldOutcomeMark?: number;
+    yesMidLast?: number;
+    noMidLast?: number;
   }> | null {
     if (!this.position) return null;
+    const bp = this.position.binaryPaper;
     return {
       direction: this.position.direction,
       entryPrice: this.position.entryPrice,
       stake: this.position.stake,
       shares: this.position.shares,
+      ...(this.position.executionModel === "binary"
+        ? {
+            executionModel: "binary" as const,
+            ...(this.position.sideBought !== undefined
+              ? { sideBought: this.position.sideBought }
+              : {}),
+            ...(bp !== undefined
+              ? {
+                  currentHeldOutcomeMark: bp.heldOutcomeMark,
+                  yesMidLast: bp.yesMidLast,
+                  noMidLast: bp.noMidLast,
+                }
+              : {}),
+          }
+        : {}),
     };
   }
 
@@ -299,14 +475,23 @@ export class SimulationEngine {
     return computePerformanceFromClosedTrades(this.trades, this.initialEquity);
   }
 
+  onTick(input: SimulationTickInput): void {
+    const mode = input.marketMode ?? "binary";
+    if (mode === "binary") {
+      this.onTickBinary(input);
+      return;
+    }
+    this.onTickSpot(input);
+  }
+
   /**
    * Paper spot execution: fill at bid/ask + slippage; exit marks on bid (long) / ask (short).
    */
-  onTick(input: SimulationTickInput): void {
-    const { now, entry, sides, config, symbol } = input;
+  private onTickSpot(input: SimulationTickInput): void {
+    const { now, entry, executionBook, config, symbol } = input;
 
     if (this.position) {
-      const mark = quotePriceForPositionDirection(this.position.direction, sides);
+      const mark = quotePriceForPositionDirection(this.position.direction, executionBook);
       if (!Number.isFinite(mark)) {
         return;
       }
@@ -347,8 +532,12 @@ export class SimulationEngine {
           direction,
           entryPrice,
           symbol,
-          ...paperQuoteFieldsForLog(direction, sides),
-          fullQuoteBook: { bestBid: sides.bestBid, bestAsk: sides.bestAsk, spreadBps: sides.spreadBps },
+          ...paperQuoteFieldsForLog(direction, executionBook),
+          fullQuoteBook: {
+            bestBid: executionBook.bestBid,
+            bestAsk: executionBook.bestAsk,
+            spreadBps: executionBook.spreadBps,
+          },
           markPrice: mark,
           markPriceSource: markPriceSourceLabel(direction),
           unrealizedPnl,
@@ -383,9 +572,11 @@ export class SimulationEngine {
           mark,
           now,
           exit.reason,
-          sides,
+          executionBook,
           symbol,
-          config
+          config,
+          null,
+          input.underlyingSignalPrice
         );
       }
       return;
@@ -398,7 +589,11 @@ export class SimulationEngine {
           return;
         }
       }
-      const fill = spotEntryFillPrice(entry.direction, sides, config.paperSlippageBps);
+      const fill = legacySpotEntryFillPrice(
+        entry.direction,
+        executionBook,
+        config.binaryPaperSlippageBps
+      );
       if (!Number.isFinite(fill) || fill <= 0) {
         return;
       }
@@ -425,18 +620,19 @@ export class SimulationEngine {
         : undefined;
 
       this.position = {
+        executionModel: "spot",
         direction: entry.direction,
         stake,
         shares,
         entryPrice: fill,
-        entryBid: sides.bestBid,
-        entryAsk: sides.bestAsk,
+        entryBid: executionBook.bestBid,
+        entryAsk: executionBook.bestAsk,
         entryPath: input.entryPath ?? "strong_spike_immediate",
         openedAt: now,
         baseStakePerTrade: baseStake,
         qualityStakeMultiplier: qualityMult,
-        holdMarkMin: quotePriceForPositionDirection(entry.direction, sides),
-        holdMarkMax: quotePriceForPositionDirection(entry.direction, sides),
+        holdMarkMin: quotePriceForPositionDirection(entry.direction, executionBook),
+        holdMarkMax: quotePriceForPositionDirection(entry.direction, executionBook),
         ...(this.paperPositionMtmDiagnostics && paperOpenSeq !== undefined
           ? { paperOpenSeq }
           : {}),
@@ -456,12 +652,12 @@ export class SimulationEngine {
           symbol,
           fillPrice: fill,
           quoteSnapshot: {
-            bestBid: sides.bestBid,
-            bestAsk: sides.bestAsk,
-            mid: sides.midPrice,
-            spreadBps: sides.spreadBps,
+            bestBid: executionBook.bestBid,
+            bestAsk: executionBook.bestAsk,
+            mid: executionBook.midPrice,
+            spreadBps: executionBook.spreadBps,
           },
-          ...paperQuoteFieldsForLog(entry.direction, sides),
+          ...paperQuoteFieldsForLog(entry.direction, executionBook),
           markPriceSource: markPriceSourceLabel(entry.direction),
           sideRationale: buildEntrySideRationale(entry, entry.direction),
           entryEvalSnapshot: {
@@ -479,9 +675,295 @@ export class SimulationEngine {
 
       if (!this.silent) {
         const prof = input.entryQualityProfile ?? "—";
-        const leg = selectPositionQuote(entry.direction, sides);
+        const leg = selectPositionQuote(entry.direction, executionBook);
         console.log(
           `[SIM] Open ${entry.direction} ${symbol} | fill@${leg.entrySide}=${fill.toFixed(2)} | sizing base=${baseStake.toFixed(2)} profile=${prof} mult=${qualityMult.toFixed(4)} → stake=${stake.toFixed(2)} qty=${shares.toFixed(6)} BTC`
+        );
+      }
+    }
+  }
+
+  private onTickBinary(input: SimulationTickInput): void {
+    const { now, entry, executionBook, config, symbol } = input;
+    const bo = input.binaryOutcomes;
+    if (
+      bo === null ||
+      bo === undefined ||
+      !Number.isFinite(bo.yesPrice) ||
+      !Number.isFinite(bo.noPrice)
+    ) {
+      return;
+    }
+
+    if (this.position) {
+      const bp = this.position.binaryPaper;
+      if (bp === undefined || this.position.sideBought === undefined) return;
+      const quote = { yesMid: bo.yesPrice, noMid: bo.noPrice };
+      const { holdMarkMin, holdMarkMax } = applyBinaryPaperVenueTick(
+        bp,
+        quote,
+        this.position.holdMarkMin,
+        this.position.holdMarkMax
+      );
+      this.position.holdMarkMin = holdMarkMin;
+      this.position.holdMarkMax = holdMarkMax;
+      const mark = bp.heldOutcomeMark;
+      if (!Number.isFinite(mark)) return;
+      const side = bp.sideBought;
+
+      if (this.paperPositionMtmDiagnostics && this.position.paperOpenSeq !== undefined) {
+        const { entryPrice, openedAt, paperOpenSeq, direction } = this.position;
+        const exitDiag = computeBinaryExitDiagnostics({
+          markPrice: mark,
+          entryFillPrice: entryPrice,
+          takeProfitPriceDelta: config.binaryTakeProfitPriceDelta,
+          stopLossPriceDelta: config.binaryStopLossPriceDelta,
+          openedAt: this.position.openedAt,
+          timeoutMs: config.binaryExitTimeoutMs,
+          now,
+        });
+        const unrealizedPnl = binaryPaperUnrealizedPnlUsdt(bp, quote);
+        const tpTarget = entryPrice + config.binaryTakeProfitPriceDelta;
+        const slThr = entryPrice - config.binaryStopLossPriceDelta;
+        logPaperMtmLine({
+          kind: "paper_mtm_tick",
+          tradeId: paperOpenSeq,
+          paperOpenSeq,
+          openCorrelationId: openedAt,
+          timestamp: new Date(now).toISOString(),
+          direction,
+          executionModel: "binary",
+          sideBought: side,
+          entryPrice,
+          symbol,
+          yesMid: bo.yesPrice,
+          noMid: bo.noPrice,
+          markPrice: mark,
+          markPriceSource: markPriceSourceBinary(side),
+          unrealizedPnl,
+          binaryTakeProfitPriceDelta: config.binaryTakeProfitPriceDelta,
+          binaryStopLossPriceDelta: config.binaryStopLossPriceDelta,
+          binaryProfitTargetPrice: tpTarget,
+          binaryStopLossThresholdPrice: slThr,
+          binaryExitTimeoutMs: config.binaryExitTimeoutMs,
+          holdDurationMs: exitDiag.elapsedMs,
+          exitConditionStatus: {
+            targetHit: exitDiag.targetHit,
+            stopHit: exitDiag.stopHit,
+            timeoutReached: exitDiag.timeoutReached,
+          },
+          markMinWhileOpen: this.position.holdMarkMin,
+          markMaxWhileOpen: this.position.holdMarkMax,
+          markRangeWhileOpen: this.position.holdMarkMax - this.position.holdMarkMin,
+          markStaticSoFar:
+            this.position.holdMarkMax - this.position.holdMarkMin < 1e-9,
+        });
+      }
+
+      const exit = evaluateBinaryExitConditions({
+        markPrice: mark,
+        entryFillPrice: this.position.entryPrice,
+        takeProfitPriceDelta: config.binaryTakeProfitPriceDelta,
+        stopLossPriceDelta: config.binaryStopLossPriceDelta,
+        openedAt: this.position.openedAt,
+        timeoutMs: config.binaryExitTimeoutMs,
+        now,
+      });
+
+      if (exit.shouldExit && exit.reason !== null) {
+        this.closePosition(
+          mark,
+          now,
+          exit.reason,
+          executionBook,
+          symbol,
+          config,
+          bo,
+          input.underlyingSignalPrice
+        );
+      }
+      return;
+    }
+
+    if (entry.shouldEnter && entry.direction !== null) {
+      if (this.lastExitAt !== null) {
+        const waited = now - this.lastExitAt;
+        if (waited < config.entryCooldownMs) {
+          return;
+        }
+      }
+      const asks = resolveBinaryVenueAsks({
+        executionBook,
+        yesMid: bo.yesPrice,
+        noMid: bo.noPrice,
+      });
+      const pUpSzEdge = input.estimatedProbabilityUp;
+      const entryModelEdge =
+        pUpSzEdge !== undefined && Number.isFinite(pUpSzEdge)
+          ? computeBinaryEntryEdge({
+              estimatedProbabilityUp: pUpSzEdge,
+              direction: entry.direction,
+              yesAsk: asks.yesAsk,
+              noAsk: asks.noAsk,
+            })
+          : Number.NaN;
+      const minThr = config.minEdgeThreshold;
+      if (minThr > 0) {
+        const pUp = input.estimatedProbabilityUp;
+        if (pUp === undefined || !Number.isFinite(pUp)) {
+          if (!this.silent) {
+            console.log(
+              "[SIM] Skip binary entry: MIN_EDGE_THRESHOLD>0 but estimatedProbabilityUp missing"
+            );
+          }
+          return;
+        }
+        const edgeResult = shouldEnterTrade({
+          estimatedProbabilityUp: pUp,
+          marketPriceYesAsk: asks.yesAsk,
+          marketPriceNoAsk: asks.noAsk,
+          minEdgeThreshold: minThr,
+          side: binaryLegFromDirection(entry.direction),
+        });
+        if (debugMonitor) {
+          logMonitorDebug(formatEdgeEntryLogLine(edgeResult));
+        } else if (!edgeResult.shouldEnter && !this.silent) {
+          console.log(`[SIM] ${formatEdgeEntryLogLine(edgeResult)}`);
+        }
+        if (!edgeResult.shouldEnter) {
+          return;
+        }
+      }
+
+      const sideBought = binarySideFromStrategyDirection(entry.direction);
+      const fill = binaryOutcomeBuyFillPrice(
+        sideBought,
+        bo.yesPrice,
+        bo.noPrice,
+        config.binaryPaperSlippageBps
+      );
+      if (!Number.isFinite(fill) || fill <= 0) {
+        return;
+      }
+
+      if (
+        config.binaryMaxEntryPrice > 0 &&
+        fill > config.binaryMaxEntryPrice
+      ) {
+        if (!this.silent) {
+          console.log(
+            `[SIM] Skip binary entry: fill ${fill.toFixed(4)} > BINARY_MAX_ENTRY_PRICE ${config.binaryMaxEntryPrice}`
+          );
+        }
+        return;
+      }
+
+      const edgeForSize = Number.isFinite(entryModelEdge) ? entryModelEdge : 0;
+      const stakeCap =
+        config.maxTradeSize > 0
+          ? config.maxTradeSize
+          : Math.max(config.stakePerTrade, config.minTradeSize, 1);
+      const baseStake = getPositionSize({
+        accountBalance: this.equity,
+        edge: edgeForSize,
+        riskPercentPerTrade: config.riskPercentPerTrade,
+        maxTradeSize: stakeCap,
+        minTradeSize: config.minTradeSize,
+      });
+      const qualityMult = resolveQualityStakeMultiplier(
+        input.entryQualityProfile,
+        config
+      );
+      const stake = baseStake * qualityMult;
+      if (!(stake > 0)) {
+        if (!this.silent) {
+          console.log(
+            `[SIM] Skip entry: effective stake must be > 0 (base=${baseStake.toFixed(2)} mult=${qualityMult.toFixed(4)})`
+          );
+        }
+        return;
+      }
+
+      const binaryPaper = openBinaryPaperPosition({
+        direction: entry.direction,
+        quote: { yesMid: bo.yesPrice, noMid: bo.noPrice },
+        slippageBps: config.binaryPaperSlippageBps,
+        stakeUsdt: stake,
+      });
+      const shares = binaryPaper.contracts;
+      const paperOpenSeq = this.paperPositionMtmDiagnostics
+        ? ++this.paperOpenSeqCounter
+        : undefined;
+
+      this.position = {
+        executionModel: "binary",
+        direction: entry.direction,
+        sideBought: binaryPaper.sideBought,
+        binaryPaper,
+        yesPriceAtEntry: binaryPaper.yesMidAtEntry,
+        noPriceAtEntry: binaryPaper.noMidAtEntry,
+        ...(input.underlyingSignalPrice !== undefined &&
+        Number.isFinite(input.underlyingSignalPrice) &&
+        input.underlyingSignalPrice > 0
+          ? { underlyingSignalAtEntry: input.underlyingSignalPrice }
+          : {}),
+        stake: binaryPaper.stakeUsdt,
+        shares,
+        entryPrice: binaryPaper.entryOutcomePrice,
+        entryPath: input.entryPath ?? "strong_spike_immediate",
+        openedAt: now,
+        baseStakePerTrade: baseStake,
+        qualityStakeMultiplier: qualityMult,
+        holdMarkMin: binaryPaper.heldOutcomeMark,
+        holdMarkMax: binaryPaper.heldOutcomeMark,
+        ...(this.paperPositionMtmDiagnostics && paperOpenSeq !== undefined
+          ? { paperOpenSeq }
+          : {}),
+        ...(input.entryQualityProfile !== undefined
+          ? { entryQualityProfile: input.entryQualityProfile }
+          : {}),
+        ...(Number.isFinite(entryModelEdge) ? { entryModelEdge } : {}),
+        ...(input.estimatedProbabilityUp !== undefined &&
+        Number.isFinite(input.estimatedProbabilityUp)
+          ? { estimatedProbabilityUpAtEntry: input.estimatedProbabilityUp }
+          : {}),
+      };
+
+      if (this.paperPositionMtmDiagnostics && paperOpenSeq !== undefined) {
+        logPaperMtmLine({
+          kind: "paper_mtm_open",
+          tradeId: paperOpenSeq,
+          paperOpenSeq,
+          openCorrelationId: now,
+          timestamp: new Date(now).toISOString(),
+          direction: entry.direction,
+          executionModel: "binary",
+          sideBought,
+          symbol,
+          fillPrice: fill,
+          binaryOutcomes: bo,
+          markPriceSource: markPriceSourceBinary(sideBought),
+          sideRationale: buildEntrySideRationale(entry, entry.direction),
+          entryEvalSnapshot: {
+            spikeDetected: entry.spikeDetected,
+            movementClassification: entry.movementClassification,
+            strongestMoveDirection:
+              entry.windowSpike?.strongestMoveDirection ?? null,
+            shouldEnter: entry.shouldEnter,
+          },
+          binaryTakeProfitPriceDelta: config.binaryTakeProfitPriceDelta,
+          binaryStopLossPriceDelta: config.binaryStopLossPriceDelta,
+          binaryProfitTargetPrice: fill + config.binaryTakeProfitPriceDelta,
+          binaryStopLossThresholdPrice: fill - config.binaryStopLossPriceDelta,
+          binaryExitTimeoutMs: config.binaryExitTimeoutMs,
+          binaryMaxEntryPrice: config.binaryMaxEntryPrice,
+        });
+      }
+
+      if (!this.silent) {
+        const prof = input.entryQualityProfile ?? "—";
+        console.log(
+          `[SIM] Open binary ${entry.direction} → buy ${sideBought} ${symbol} | fill=${fill.toFixed(4)} | base stake=${baseStake.toFixed(2)} profile=${prof} mult=${qualityMult.toFixed(4)} → stake=${stake.toFixed(2)} contracts=${shares.toFixed(4)} | TP+Δ=${(fill + config.binaryTakeProfitPriceDelta).toFixed(4)} SL−Δ=${(fill - config.binaryStopLossPriceDelta).toFixed(4)}`
         );
       }
     }
@@ -491,14 +973,21 @@ export class SimulationEngine {
     exitMark: number,
     closedAt: number,
     exitReason: ExitReason,
-    bookAtExit: SpotBookSides,
+    executionBookAtExit: ExecutableBookQuote,
     symbol: string,
-    cfg: SimulationTickInput["config"]
+    cfg: SimulationTickInput["config"],
+    binaryOutcomesAtExit: BinaryOutcomePrices | null,
+    underlyingSignalAtExit?: number
   ): void {
     if (!this.position) return;
 
     const {
+      executionModel,
       direction,
+      sideBought,
+      yesPriceAtEntry,
+      noPriceAtEntry,
+      underlyingSignalAtEntry,
       stake,
       shares,
       entryPrice,
@@ -507,6 +996,8 @@ export class SimulationEngine {
       baseStakePerTrade,
       qualityStakeMultiplier,
       entryQualityProfile,
+      entryModelEdge,
+      estimatedProbabilityUpAtEntry,
       paperOpenSeq,
       holdMarkMin,
       holdMarkMax,
@@ -515,37 +1006,55 @@ export class SimulationEngine {
     } = this.position;
     this.position = null;
 
+    const isBinary = executionModel === "binary";
+
     const equityBefore = this.equity;
-    const grossPnl =
-      direction === "UP"
+    const grossPnl = isBinary
+      ? binaryPaperGrossPnlUsdt(shares, entryPrice, exitMark)
+      : direction === "UP"
         ? shares * (exitMark - entryPrice)
         : shares * (entryPrice - exitMark);
-    const feesEstimate = stake * (cfg.paperFeeRoundTripBps / 10_000);
+    const feesEstimate = isBinary
+      ? binaryPaperRoundTripFeeUsdt(stake, cfg.paperFeeRoundTripBps)
+      : stake * (cfg.paperFeeRoundTripBps / 10_000);
     const profitLoss = grossPnl - feesEstimate;
     const equityAfter = equityBefore + profitLoss;
     const riskAtEntry = stake;
 
     this.equity = equityAfter;
 
-    const tpPx =
-      direction === "UP"
+    const tpPx = isBinary
+      ? entryPrice + cfg.binaryTakeProfitPriceDelta
+      : direction === "UP"
         ? entryPrice * (1 + cfg.takeProfitBps / 10_000)
         : entryPrice * (1 - cfg.takeProfitBps / 10_000);
-    const slPx =
-      direction === "UP"
+    const slPx = isBinary
+      ? entryPrice - cfg.binaryStopLossPriceDelta
+      : direction === "UP"
         ? entryPrice * (1 - cfg.stopLossBps / 10_000)
         : entryPrice * (1 + cfg.stopLossBps / 10_000);
 
-    const holdExitAudit = buildHoldExitAudit({
-      direction,
-      entryPrice,
-      exitMark,
-      holdMarkMin,
-      holdMarkMax,
-      configExitPrice: tpPx,
-      configStopLoss: slPx,
-      exitReason,
-    });
+    const holdExitAudit = isBinary
+      ? buildHoldExitAudit({
+          mode: "binary",
+          entryPrice,
+          exitMark,
+          holdMarkMin,
+          holdMarkMax,
+          takeProfitPriceDelta: cfg.binaryTakeProfitPriceDelta,
+          stopLossPriceDelta: cfg.binaryStopLossPriceDelta,
+          exitReason,
+        })
+      : buildHoldExitAudit({
+          direction,
+          entryPrice,
+          exitMark,
+          holdMarkMin,
+          holdMarkMax,
+          configExitPrice: tpPx,
+          configStopLoss: slPx,
+          exitReason,
+        });
 
     const closedTradeId = this.nextId++;
     const record: SimulatedTrade = {
@@ -556,10 +1065,39 @@ export class SimulationEngine {
       shares,
       entryPrice,
       exitPrice: exitMark,
-      entryBid,
-      entryAsk,
-      exitBid: bookAtExit.bestBid,
-      exitAsk: bookAtExit.bestAsk,
+      ...(!isBinary && entryBid !== undefined && entryAsk !== undefined
+        ? { entryBid, entryAsk }
+        : {}),
+      ...(isBinary
+        ? {
+            executionModel: "binary" as const,
+            ...(sideBought !== undefined ? { sideBought } : {}),
+            entrySidePrice: entryPrice,
+            exitSidePrice: exitMark,
+            ...(yesPriceAtEntry !== undefined ? { yesPriceAtEntry } : {}),
+            ...(noPriceAtEntry !== undefined ? { noPriceAtEntry } : {}),
+            ...(underlyingSignalAtEntry !== undefined &&
+            Number.isFinite(underlyingSignalAtEntry)
+              ? { underlyingSignalPriceAtEntry: underlyingSignalAtEntry }
+              : {}),
+            ...(underlyingSignalAtExit !== undefined &&
+            Number.isFinite(underlyingSignalAtExit)
+              ? { underlyingSignalPriceAtExit: underlyingSignalAtExit }
+              : {}),
+            ...(binaryOutcomesAtExit !== null
+              ? {
+                  yesPriceAtExit: binaryOutcomesAtExit.yesPrice,
+                  noPriceAtExit: binaryOutcomesAtExit.noPrice,
+                }
+              : {}),
+          }
+        : {}),
+      ...(!isBinary
+        ? {
+            exitBid: executionBookAtExit.bestBid,
+            exitAsk: executionBookAtExit.bestAsk,
+          }
+        : {}),
       grossPnl,
       feesEstimate,
       profitLoss,
@@ -570,6 +1108,20 @@ export class SimulationEngine {
       qualityStakeMultiplier,
       ...(entryQualityProfile !== undefined
         ? { entryQualityProfile }
+        : {}),
+      ...(isBinary &&
+      entryModelEdge !== undefined &&
+      Number.isFinite(entryModelEdge)
+        ? { entryModelEdge }
+        : {}),
+      ...(isBinary &&
+      estimatedProbabilityUpAtEntry !== undefined &&
+      Number.isFinite(estimatedProbabilityUpAtEntry)
+        ? {
+            estimatedProbabilityUpAtEntry,
+            probabilityTimeHorizonMs:
+              cfg.probabilityTimeHorizonMs ?? 30_000,
+          }
         : {}),
       exitReason,
       entryPath,
@@ -584,16 +1136,26 @@ export class SimulationEngine {
       const minObs = holdMarkMin;
       const maxObs = holdMarkMax;
       const rangeObs = maxObs - minObs;
-      const finalDiag = computeSpotExitDiagnostics({
-        direction,
-        markPrice: exitMark,
-        entryFillPrice: entryPrice,
-        takeProfitBps: cfg.takeProfitBps,
-        stopLossBps: cfg.stopLossBps,
-        openedAt,
-        timeoutMs: cfg.exitTimeoutMs,
-        now: closedAt,
-      });
+      const finalDiag = isBinary
+        ? computeBinaryExitDiagnostics({
+            markPrice: exitMark,
+            entryFillPrice: entryPrice,
+            takeProfitPriceDelta: cfg.binaryTakeProfitPriceDelta,
+            stopLossPriceDelta: cfg.binaryStopLossPriceDelta,
+            openedAt,
+            timeoutMs: cfg.binaryExitTimeoutMs,
+            now: closedAt,
+          })
+        : computeSpotExitDiagnostics({
+            direction,
+            markPrice: exitMark,
+            entryFillPrice: entryPrice,
+            takeProfitBps: cfg.takeProfitBps,
+            stopLossBps: cfg.stopLossBps,
+            openedAt,
+            timeoutMs: cfg.exitTimeoutMs,
+            now: closedAt,
+          });
       const flatTape = rangeObs < 1e-9;
       logPaperMtmLine({
         kind: "paper_mtm_close",
@@ -604,11 +1166,23 @@ export class SimulationEngine {
         timestamp: new Date(closedAt).toISOString(),
         direction,
         symbol,
-        quoteSnapshot: bookAtExit,
-        ...paperQuoteFieldsForLog(direction, bookAtExit),
+        ...(isBinary
+          ? {
+              executionModel: "binary",
+              sideBought,
+              binaryOutcomesAtExit: binaryOutcomesAtExit ?? undefined,
+            }
+          : {
+              quoteSnapshot: executionBookAtExit,
+              ...paperQuoteFieldsForLog(direction, executionBookAtExit),
+            }),
         exitRuleFired: exitReason,
         finalMarkPrice: exitMark,
-        markPriceSource: markPriceSourceLabel(direction),
+        markPriceSource: isBinary
+          ? sideBought !== undefined
+            ? markPriceSourceBinary(sideBought)
+            : "binary"
+          : markPriceSourceLabel(direction),
         entryPrice,
         grossPnl,
         feesEstimate,
@@ -624,7 +1198,9 @@ export class SimulationEngine {
         markTapeFlatAcrossHold: flatTape,
         exitMarkEqualsEntryMark: Math.abs(exitMark - entryPrice) < 1e-9,
         flatTapeHint: flatTape
-          ? "Mark flat while open — check Binance book feed freshness."
+          ? isBinary
+            ? "Held outcome price flat while open — check quote feed."
+            : "Mark flat while open — check Binance book feed freshness."
           : "Mark range > 0 while open.",
         holdExitAudit,
       });
@@ -667,7 +1243,15 @@ export class SimulationEngine {
 
   private printTradeResult(t: SimulatedTrade): void {
     if (this.silent) return;
-    const payload = buildTransparentTradeLog(t);
+    const payload =
+      t.executionModel === "binary"
+        ? {
+            ...buildBinaryPaperTradeLog(t),
+            openedAt: new Date(t.openedAt).toISOString(),
+            closedAt: new Date(t.closedAt).toISOString(),
+            holdExitAudit: t.holdExitAudit,
+          }
+        : buildTransparentTradeLog(t);
     console.log("[SIM] Trade closed (full log):");
     console.log(JSON.stringify(payload, null, 2));
   }
@@ -681,6 +1265,10 @@ function markPriceSourceLabel(direction: EntryDirection): string {
   return direction === "UP"
     ? "bestBid — long BTC exit/MTM"
     : "bestAsk — short BTC exit/MTM";
+}
+
+function markPriceSourceBinary(side: BinarySideBought): string {
+  return side === "YES" ? "yesPrice (held YES MTM)" : "noPrice (held NO MTM)";
 }
 
 function buildEntrySideRationale(

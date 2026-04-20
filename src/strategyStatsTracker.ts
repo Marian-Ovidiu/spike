@@ -1,5 +1,14 @@
 import type { StrategyTickResult } from "./botLoop.js";
 import type { Opportunity } from "./opportunityTracker.js";
+import type { BorderlineLifecycleRenderEvent } from "./strategy/strategyDecisionPipeline.js";
+
+const BORDERLINE_TIMEOUT_EXPIRE_REASONS = new Set([
+  "borderline_max_lifetime_ms",
+  "watch_window_elapsed",
+  "no_pause_or_reversion",
+  "acceptable_range_needs_reversion_confirmation",
+  "range_too_noisy_for_entry",
+]);
 
 /** Funnel levels (increment only via {@link StrategyStatsTracker.observeReadyTickFunnel}). */
 export type ReadyTickFunnelSnapshot = {
@@ -70,6 +79,12 @@ export class StrategyStatsTracker {
   borderlinePromotions = 0;
   borderlineCancellations = 0;
   borderlineExpirations = 0;
+  /** Same tick source as {@link borderlineCandidatesCreated} (render-path metric). */
+  borderlineEntered = 0;
+  /** Same tick source as {@link borderlinePromotions} (render-path metric). */
+  borderlinePromoted = 0;
+  borderlineRejectedTimeout = 0;
+  borderlineRejectedWeak = 0;
 
   borderlineTradesClosed = 0;
   borderlineWins = 0;
@@ -225,6 +240,34 @@ export class StrategyStatsTracker {
     else if (type === "promoted") this.borderlinePromotions += 1;
     else if (type === "cancelled") this.borderlineCancellations += 1;
     else if (type === "expired") this.borderlineExpirations += 1;
+  }
+
+  /**
+   * Borderline funnel metrics (timeouts vs weak rejects, entry gate rejects).
+   * Prefer this over {@link observeBorderlineLifecycleEventType} for live monitor.
+   */
+  observeBorderlineLifecycleRenderEvent(ev: BorderlineLifecycleRenderEvent): void {
+    if (ev.type === "entry_rejected_weak") {
+      this.borderlineRejectedWeak += 1;
+      return;
+    }
+    this.observeBorderlineLifecycleEventType(ev.type);
+    if (ev.type === "created") {
+      this.borderlineEntered += 1;
+    } else if (ev.type === "promoted") {
+      this.borderlinePromoted += 1;
+    } else if (ev.type === "expired") {
+      if (BORDERLINE_TIMEOUT_EXPIRE_REASONS.has(ev.reason)) {
+        this.borderlineRejectedTimeout += 1;
+      } else {
+        this.borderlineRejectedWeak += 1;
+      }
+    } else if (
+      ev.type === "cancelled" &&
+      ev.reason !== "replaced_by_new_borderline"
+    ) {
+      this.borderlineRejectedWeak += 1;
+    }
   }
 
   observeClosedTrade(trade: {

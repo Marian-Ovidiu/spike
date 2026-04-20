@@ -8,22 +8,31 @@ import {
   selectPositionQuote,
   SimulationEngine,
 } from "./simulationEngine.js";
-import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
+import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
 const SYM = "BTCUSDT";
 
 const spotTickConfig = {
   takeProfitBps: 35,
   stopLossBps: 25,
-  paperSlippageBps: 0,
+  binaryPaperSlippageBps: 0,
   paperFeeRoundTripBps: 0,
   exitTimeoutMs: 0,
+  binaryTakeProfitPriceDelta: 0.05,
+  binaryStopLossPriceDelta: 0.05,
+  binaryExitTimeoutMs: 90_000,
+  binaryMaxEntryPrice: 0.99,
   entryCooldownMs: 0,
   stakePerTrade: 5,
   allowWeakQualityEntries: false,
   weakQualitySizeMultiplier: 0.5,
   strongQualitySizeMultiplier: 1,
   exceptionalQualitySizeMultiplier: 1,
+  minEdgeThreshold: 0,
+  riskPercentPerTrade: 1,
+  maxTradeSize: 0,
+  minTradeSize: 1,
+  probabilityTimeHorizonMs: 30_000,
 } as const;
 
 function trade(pl: number): SimulatedTrade {
@@ -181,6 +190,28 @@ const entryOpenUp = {
   windowSpike: undefined,
 };
 
+const entryOpenDown = {
+  shouldEnter: true,
+  direction: "DOWN" as const,
+  reasons: [] as string[],
+  stableRangeDetected: true,
+  priorRangeFraction: 0.1,
+  stableRangeQuality: "good" as const,
+  rangeDecisionNote: "test",
+  movementClassification: "strong_spike" as const,
+  spikeDetected: true,
+  movement: {
+    strongestMovePercent: 0.01,
+    strongestMoveAbsolute: 0.2,
+    strongestMoveDirection: "DOWN" as const,
+    thresholdPercent: 0.005,
+    thresholdRatio: 2,
+    classification: "strong_spike" as const,
+    sourceWindowLabel: "tick-1",
+  },
+  windowSpike: undefined,
+};
+
 const entryFlat = {
   shouldEnter: false,
   direction: null,
@@ -214,20 +245,24 @@ describe("SimulationEngine.onTradeClosed", () => {
       },
     });
 
-    const openBk = syntheticSpotBookFromMid(100, 5);
+    const openBk = syntheticExecutableBookFromMid(100, 5);
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1_000,
       entry: entryOpenUp,
-      sides: openBk,
+      executionBook: openBk,
       symbol: SYM,
       config: spotTickConfig,
     });
     expect(sim.getOpenPosition()).not.toBeNull();
 
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 2_000,
       entry: entryFlat,
-      sides: syntheticSpotBookFromMid(100.2, 5),
+      executionBook: syntheticExecutableBookFromMid(100.2, 5),
       symbol: SYM,
       config: spotTickConfig,
     });
@@ -243,19 +278,23 @@ describe("SimulationEngine.onTradeClosed", () => {
 
   it("uses fixed stake with spot fill and timeout exit", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
-    const openBk = syntheticSpotBookFromMid(100, 5);
+    const openBk = syntheticExecutableBookFromMid(100, 5);
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1_000,
       entry: entryOpenUp,
-      sides: openBk,
+      executionBook: openBk,
       symbol: SYM,
       config: spotTickConfig,
     });
     expect(sim.getOpenPosition()).not.toBeNull();
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 2_000,
       entry: entryFlat,
-      sides: syntheticSpotBookFromMid(100.2, 5),
+      executionBook: syntheticExecutableBookFromMid(100.2, 5),
       symbol: SYM,
       config: spotTickConfig,
     });
@@ -273,18 +312,22 @@ describe("SimulationEngine.onTradeClosed", () => {
     };
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1_000,
       entry: entryOpenUp,
       entryQualityProfile: "weak",
-      sides: syntheticSpotBookFromMid(100, 5),
+      executionBook: syntheticExecutableBookFromMid(100, 5),
       symbol: SYM,
       config: tickConfig,
     });
     expect(sim.getOpenPosition()?.stake).toBe(5);
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 2_000,
       entry: entryFlat,
-      sides: syntheticSpotBookFromMid(100.2, 5),
+      executionBook: syntheticExecutableBookFromMid(100.2, 5),
       symbol: SYM,
       config: tickConfig,
     });
@@ -298,7 +341,7 @@ describe("SimulationEngine.onTradeClosed", () => {
 });
 
 describe("quotePriceForPositionDirection", () => {
-  const book = syntheticSpotBookFromMid(100, 10);
+  const book = syntheticExecutableBookFromMid(100, 10);
 
   it("UP → mark on bid", () => {
     expect(quotePriceForPositionDirection("UP", book)).toBe(book.bestBid);
@@ -325,39 +368,22 @@ describe("SimulationEngine held-leg integration", () => {
 
   it("DOWN position: profit exit when ask drops enough", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
-    const entryDown = {
-      shouldEnter: true,
-      direction: "DOWN" as const,
-      reasons: [] as string[],
-      stableRangeDetected: true,
-      priorRangeFraction: 0.1,
-      stableRangeQuality: "good" as const,
-      rangeDecisionNote: "test",
-      movementClassification: "strong_spike" as const,
-      spikeDetected: true,
-      movement: {
-        strongestMovePercent: 0.01,
-        strongestMoveAbsolute: 0.2,
-        strongestMoveDirection: "DOWN" as const,
-        thresholdPercent: 0.005,
-        thresholdRatio: 2,
-        classification: "strong_spike" as const,
-        sourceWindowLabel: "tick-1",
-      },
-      windowSpike: undefined,
-    };
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1_000,
-      entry: entryDown,
-      sides: syntheticSpotBookFromMid(100, 5),
+      entry: entryOpenDown,
+      executionBook: syntheticExecutableBookFromMid(100, 5),
       symbol: SYM,
       config: tickConfig,
     });
     const ep = sim.getOpenPosition()!.entryPrice;
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 2_000,
       entry: entryFlat,
-      sides: syntheticSpotBookFromMid(94, 5),
+      executionBook: syntheticExecutableBookFromMid(94, 5),
       symbol: SYM,
       config: tickConfig,
     });
@@ -369,20 +395,261 @@ describe("SimulationEngine held-leg integration", () => {
   it("UP position: profit when bid rises past TP", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1_000,
       entry: entryOpenUp,
-      sides: syntheticSpotBookFromMid(100, 5),
+      executionBook: syntheticExecutableBookFromMid(100, 5),
       symbol: SYM,
       config: tickConfig,
     });
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 2_000,
       entry: entryFlat,
-      sides: syntheticSpotBookFromMid(106, 5),
+      executionBook: syntheticExecutableBookFromMid(106, 5),
       symbol: SYM,
       config: tickConfig,
     });
     const t = sim.getTradeHistory()[0]!;
     expect(t.exitReason).toBe("profit");
+  });
+});
+
+describe("SimulationEngine binary paper mode", () => {
+  const book = () => syntheticExecutableBookFromMid(100, 5);
+  const binaryExitCfg = {
+    ...spotTickConfig,
+    binaryTakeProfitPriceDelta: 0.05,
+    binaryStopLossPriceDelta: 0.05,
+    binaryExitTimeoutMs: 100_000,
+  };
+
+  it("UP buys YES and closes on profit when yes rises by take-profit delta", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
+      underlyingSignalPrice: 100_000,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const open = sim.getOpenPosition()!;
+    expect(open.executionModel).toBe("binary");
+    expect(open.sideBought).toBe("YES");
+    const entryFill = open.entryPrice;
+    const shares = open.shares;
+    const yesExit = 0.541;
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: yesExit, noPrice: 1 - yesExit },
+      underlyingSignalPrice: 100_500,
+      now: 2_000,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.executionModel).toBe("binary");
+    expect(t.sideBought).toBe("YES");
+    expect(t.exitReason).toBe("profit");
+    expect(t.entrySidePrice).toBeCloseTo(entryFill, 10);
+    expect(t.exitSidePrice).toBeCloseTo(yesExit, 10);
+    expect(t.yesPriceAtEntry).toBe(0.49);
+    expect(t.yesPriceAtExit).toBe(yesExit);
+    expect(t.underlyingSignalPriceAtEntry).toBe(100_000);
+    expect(t.underlyingSignalPriceAtExit).toBe(100_500);
+    expect(t.grossPnl).toBeCloseTo(shares * (yesExit - entryFill), 8);
+    expect(t.profitLoss).toBeCloseTo(t.grossPnl - t.feesEstimate, 8);
+    const b = t.holdExitAudit?.binaryPriceSide;
+    expect(b?.takeProfitPriceDelta).toBe(0.05);
+    expect(b?.profitTargetPrice).toBeCloseTo(entryFill + 0.05, 8);
+  });
+
+  it("YES position hits stop when yes falls by stop-loss delta", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const entryFill = sim.getOpenPosition()!.entryPrice;
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.43, noPrice: 0.57 },
+      now: 2_000,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.exitReason).toBe("stop");
+    expect(t.holdExitAudit?.binaryPriceSide?.stopLossThresholdPrice).toBeCloseTo(
+      entryFill - 0.05,
+      8
+    );
+  });
+
+  it("NO position hits stop when no falls by stop-loss delta", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
+      now: 1_000,
+      entry: entryOpenDown,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const entryFill = sim.getOpenPosition()!.entryPrice;
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.62, noPrice: 0.38 },
+      now: 2_000,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.sideBought).toBe("NO");
+    expect(t.exitReason).toBe("stop");
+    expect(t.holdExitAudit?.binaryPriceSide?.stopLossThresholdPrice).toBeCloseTo(
+      entryFill - 0.05,
+      8
+    );
+  });
+
+  it("DOWN buys NO and closes on profit when no rises by take-profit delta", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
+      now: 1_000,
+      entry: entryOpenDown,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const open = sim.getOpenPosition()!;
+    expect(open.sideBought).toBe("NO");
+    const entryFill = open.entryPrice;
+    const shares = open.shares;
+    const noExit = 0.501;
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 1 - noExit, noPrice: noExit },
+      now: 2_000,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    expect(t.sideBought).toBe("NO");
+    expect(t.exitReason).toBe("profit");
+    expect(t.grossPnl).toBeCloseTo(shares * (noExit - entryFill), 8);
+  });
+
+  it("deducts configured round-trip fee from binary gross PnL", () => {
+    const feeBps = 80;
+    const cfg = { ...binaryExitCfg, paperFeeRoundTripBps: feeBps };
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: cfg,
+    });
+    const stake = sim.getOpenPosition()!.stake;
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.551, noPrice: 0.449 },
+      now: 2_000,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: cfg,
+    });
+    const t = sim.getTradeHistory()[0]!;
+    const expectedFees = stake * (feeBps / 10_000);
+    expect(t.feesEstimate).toBeCloseTo(expectedFees, 10);
+    expect(t.profitLoss).toBeCloseTo(t.grossPnl - expectedFees, 8);
+  });
+
+  it("exits on timeout when mark stays inside binary TP/SL band", () => {
+    const cfg = {
+      ...spotTickConfig,
+      binaryTakeProfitPriceDelta: 0.2,
+      binaryStopLossPriceDelta: 0.2,
+      binaryExitTimeoutMs: 50_000,
+    };
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: cfg,
+    });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      now: 1_000 + 50_001,
+      entry: entryFlat,
+      executionBook: book(),
+      symbol: SYM,
+      config: cfg,
+    });
+    expect(sim.getTradeHistory()[0]!.exitReason).toBe("timeout");
+  });
+
+  it("skips binary entry when edge vs YES ask does not exceed MIN_EDGE_THRESHOLD", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const bookProb = {
+      bestBid: 0.48,
+      bestAsk: 0.52,
+      midPrice: 0.5,
+      spreadBps: 800,
+    };
+    const cfg = { ...binaryExitCfg, minEdgeThreshold: 0.03 };
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: 0.51,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: bookProb,
+      symbol: SYM,
+      config: cfg,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: 0.58,
+      now: 2_000,
+      entry: entryOpenUp,
+      executionBook: bookProb,
+      symbol: SYM,
+      config: cfg,
+    });
+    expect(sim.getOpenPosition()).not.toBeNull();
   });
 });

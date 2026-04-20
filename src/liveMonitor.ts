@@ -1,28 +1,49 @@
+import { BOT_TICK_INTERVAL_MS, MIN_SAMPLES_FOR_STRATEGY, type BotContext } from "./botLoop.js";
 import {
-  BOT_TICK_INTERVAL_MS,
-  MIN_SAMPLES_FOR_STRATEGY,
-  runStrategyTick,
-  type BotContext,
-} from "./botLoop.js";
-import { config, debugMonitor, logConfig } from "./config.js";
+  config,
+  configMeta,
+  debugMonitor,
+  describeActiveConfigGroups,
+  logConfig,
+} from "./config.js";
+import { assertBinaryOnlyRuntime } from "./binaryOnlyRuntime.js";
+import { assertLegacySpotMarketModeAcknowledged } from "./legacy/spot/assertLegacySpotMarketMode.js";
 import { aggregateHoldExitAudits } from "./holdExitAudit.js";
+import {
+  buildNormalizedMonitorConfigSummary,
+  formatSignalDetectionBannerLines,
+} from "./config/monitorNormalizedConfigSummary.js";
 import {
   buildMonitorSessionSummary,
   MonitorFilePersistence,
 } from "./monitorPersistence.js";
+import { computeBinaryRunAnalytics } from "./analyze/binaryRunAnalytics.js";
+import { BinaryMarketFeed } from "./binary/venue/binaryMarketFeed.js";
+import { BinarySyntheticFeed } from "./binary/venue/binarySyntheticFeed.js";
+import { formatGammaBootstrapStepsForLog } from "./binary/venue/gammaMarketResolve.js";
 import {
-  buildSpikeDecisionTracePayload,
-  formatDebugTickExtras,
-  logBorderlineLifecycleBlock,
-  formatMonitorTickLine,
-  logOpportunityBlock,
+  formatBinaryExecutionVenueBannerLine,
+  resolveBinaryMarketSelectorFromEnv,
+} from "./binary/venue/binaryMarketSelector.js";
+import { buildBinaryBannerExecutionLine } from "./binary/monitor/binaryMonitorBanner.js";
+import { BinaryQuoteSessionStats } from "./binary/monitor/binaryMonitorQuoteStats.js";
+import {
   logPaperTradeClosedBlock,
-  logSpikeDecisionTrace,
-  logValidOpportunityBlock,
   printLiveMonitorBanner,
   printPeriodicRuntimeSummary,
   printShutdownReport,
 } from "./monitorConsole.js";
+import { buildSessionInterpretationLines } from "./monitor/binarySessionInterpretation.js";
+import {
+  flushPendingProbabilityCalibration,
+  runLiveMonitorTick,
+  type LiveMonitorTickDeps,
+} from "./monitor/runLiveMonitorTick.js";
+import { SignalMidRingBuffer } from "./binary/signal/signalMidRingBuffer.js";
+import {
+  resolveOpportunityCalibration,
+  resolveTradeCalibration,
+} from "./binary/signal/probabilityCalibrationResolve.js";
 import {
   logReportCounterConsistency,
   MonitorRuntimeStats,
@@ -31,38 +52,86 @@ import { computeStrongSpikeGateFunnel } from "./monitorFunnelDiagnostics.js";
 import { RollingPriceBuffer } from "./rollingPriceBuffer.js";
 import type { SimulatedTrade } from "./simulationEngine.js";
 import { SimulationEngine } from "./simulationEngine.js";
-import { BinanceSpotFeed } from "./adapters/binanceSpotFeed.js";
+import {
+  ensureAutoDiscoveredBinaryMarketSlug,
+  getLastAutoDiscoveredBtc5mMarket,
+  wasBinaryMarketAutoDiscovered,
+} from "./binary/venue/discoverBtc5mUpDownMarket.js";
+import { createSignalAndExecutionFeeds } from "./market/marketFeedFactory.js";
+import {
+  buildMarketFeedShutdownDiagnostics,
+  liveMonitorDualFeedBannerDetail,
+} from "./market/marketDiagnostics.js";
 import { OpportunityTracker } from "./opportunityTracker.js";
 import {
   evaluateSession,
   printSessionEvaluationReport,
 } from "./sessionEvaluator.js";
 import { SpikeDebugTracker } from "./spikeDebugTracker.js";
-import {
-  BorderlineCandidateStore,
-} from "./borderlineCandidateStore.js";
+import { BorderlineCandidateStore } from "./borderlineCandidateStore.js";
 import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
-import {
-  applyFeedStaleEntryBlock,
-  entryEvaluationForPipelinePaperExecution,
-  formatStrategyDecisionLog,
-  runStrategyDecisionPipeline,
-} from "./strategyDecisionPipeline.js";
 
 const runtimeStats = new MonitorRuntimeStats({
   exceptionalSpikePercent: config.exceptionalSpikePercent,
 });
+const binaryQuoteSessionStats = new BinaryQuoteSessionStats();
+const binaryCompareDiag =
+  process.env.BINARY_COMPARE_DIAG?.trim().toLowerCase() === "1" ||
+  process.env.BINARY_COMPARE_DIAG?.trim().toLowerCase() === "true";
+
 const persistence = new MonitorFilePersistence();
-const binanceFeed = new BinanceSpotFeed();
+
+const signalMidRing = new SignalMidRingBuffer(
+  config.probabilityTimeHorizonMs + 180_000
+);
+const pendingCalibrationTradeIds: number[] = [];
+
+assertLegacySpotMarketModeAcknowledged(config.marketMode);
+assertBinaryOnlyRuntime(config.marketMode);
+await ensureAutoDiscoveredBinaryMarketSlug(config.marketMode);
+
+const { signalFeed, executionFeed } = createSignalAndExecutionFeeds(
+  config.marketMode,
+  {
+    paper: false,
+    binarySignalSource: config.binarySignalSource,
+    binarySignalSymbol: config.binarySignalSymbol,
+  }
+);
+const sameMarketFeedInstance = signalFeed === executionFeed;
 const spikeDebug = new SpikeDebugTracker();
 const borderlineManager = new BorderlineCandidateStore({
-  symbol: binanceFeed.getSymbol(),
+  symbol: executionFeed.getSymbol(),
   watchTicks: config.borderlineWatchTicks,
+  maxLifetimeMs: config.borderlineMaxLifetimeMs,
+  enableBorderlineMode: config.enableBorderlineMode,
+  borderlineEntryMinThresholdRatio: config.borderlineEntryMinThresholdRatio,
+  borderlineEntryRequiresStableRange: config.borderlineEntryRequiresStableRange,
 });
 const strongSpikeManager = new StrongSpikeCandidateStore({
-  symbol: binanceFeed.getSymbol(),
+  symbol: executionFeed.getSymbol(),
   watchTicks: config.strongSpikeConfirmationTicks,
 });
+
+const liveMonitorTickDeps: LiveMonitorTickDeps = {
+  runtimeStats,
+  binaryQuoteSessionStats,
+  borderlineManager,
+  strongSpikeManager,
+  persistence,
+  spikeDebug,
+  binaryCompareDiag,
+  ...(config.marketMode === "binary"
+    ? {
+        probabilityCalibration: {
+          signalMidRing,
+          horizonMs: config.probabilityTimeHorizonMs,
+          pendingTradeIds: pendingCalibrationTradeIds,
+          getSimulation: () => simulation,
+        },
+      }
+    : {}),
+};
 
 let monitorStartedAtMs = 0;
 let tickTimer: ReturnType<typeof setInterval> | undefined;
@@ -70,41 +139,27 @@ let statsTimer: ReturnType<typeof setInterval> | undefined;
 let shutdownInProgress = false;
 
 function buildInterpretationLines(): string[] {
-  const lines: string[] = [];
-  if (
-    runtimeStats.noSignalMoves >
-    runtimeStats.borderlineMoves + runtimeStats.strongSpikeMoves
-  ) {
-    lines.push("market too flat");
-  }
-  const blockedByBook =
-    runtimeStats.blockedByInvalidQuotes +
-    runtimeStats.blockedByExpensiveOppositeSide +
-    runtimeStats.blockedByNeutralQuotes;
-  if (runtimeStats.rejectedByWeakSpikeQuality > runtimeStats.validOpportunities) {
-    lines.push("too many weak spikes rejected");
-  }
-  const trendNoiseFiltered =
-    runtimeStats.rejectedByPriorRangeTooWide + runtimeStats.rejectedByHardUnstableContext;
-  if (trendNoiseFiltered >= runtimeStats.validOpportunities) {
-    lines.push("trend/noise filter removed most signals");
-  }
-  if (blockedByBook > 0 && blockedByBook >= runtimeStats.validOpportunities) {
-    lines.push("wide spread or invalid book blocked most entries");
-  }
-  if (runtimeStats.cooldownOverridesUsed > 0 && runtimeStats.exceptionalSpikeEntries > 0) {
-    lines.push("exceptional spikes bypassed cooldown successfully");
-  }
-  if (
-    runtimeStats.validOpportunities > 0 &&
-    runtimeStats.validOpportunities < runtimeStats.rejectedOpportunities
-  ) {
-    lines.push("strategy now focuses on high-quality setups");
-  }
-  if (lines.length === 0) {
-    lines.push("session mixed: monitor movement mix and blocker counters");
-  }
-  return lines;
+  return buildSessionInterpretationLines({
+    marketMode: config.marketMode,
+    runtime: {
+      ticksObserved: runtimeStats.ticksObserved,
+      noSignalMoves: runtimeStats.noSignalMoves,
+      borderlineMoves: runtimeStats.borderlineMoves,
+      strongSpikeMoves: runtimeStats.strongSpikeMoves,
+      validOpportunities: runtimeStats.validOpportunities,
+      rejectedOpportunities: runtimeStats.rejectedOpportunities,
+      rejectedByWeakSpikeQuality: runtimeStats.rejectedByWeakSpikeQuality,
+      blockedByInvalidQuotes: runtimeStats.blockedByInvalidQuotes,
+      blockedByExpensiveOppositeSide: runtimeStats.blockedByExpensiveOppositeSide,
+      blockedByNeutralQuotes: runtimeStats.blockedByNeutralQuotes,
+      rejectedByPriorRangeTooWide: runtimeStats.rejectedByPriorRangeTooWide,
+      rejectedByHardUnstableContext: runtimeStats.rejectedByHardUnstableContext,
+      cooldownOverridesUsed: runtimeStats.cooldownOverridesUsed,
+      exceptionalSpikeEntries: runtimeStats.exceptionalSpikeEntries,
+    },
+    binaryQuote:
+      config.marketMode === "binary" ? binaryQuoteSessionStats.snapshot() : null,
+  });
 }
 
 function formatTopRejectionReasons(): string {
@@ -133,6 +188,18 @@ function gracefulShutdown(): void {
   shutdownInProgress = true;
   if (statsTimer !== undefined) clearInterval(statsTimer);
   if (tickTimer !== undefined) clearInterval(tickTimer);
+  try {
+    signalFeed.stop();
+  } catch {
+    /* ignore */
+  }
+  if (!sameMarketFeedInstance) {
+    try {
+      executionFeed.stop();
+    } catch {
+      /* ignore */
+    }
+  }
 
   const gateFunnel = computeStrongSpikeGateFunnel({
     opportunities: ctx.opportunityTracker.getOpportunities(),
@@ -168,19 +235,29 @@ function gracefulShutdown(): void {
       verdict: borderlineImpactVerdict(),
       gateFunnel,
       testMode: config.testMode,
+      marketMode: config.marketMode,
+      configGroupSummary: describeActiveConfigGroups(config.marketMode),
       exitThresholdAudit,
-      binanceFeedDiagnostics: {
-        symbol: binanceFeed.getSymbol(),
-        health: binanceFeed.getHealth(),
-        lastMessageAgeMs: binanceFeed.getLastMessageAgeMs(),
-      },
+      marketFeedDiagnostics: buildMarketFeedShutdownDiagnostics(
+        config.marketMode,
+        executionFeed
+      ),
+      ...(config.marketMode === "binary"
+        ? {
+            signalFeedDiagnostics: buildMarketFeedShutdownDiagnostics(
+              "spot",
+              signalFeed
+            ),
+            binaryQuoteSession: binaryQuoteSessionStats.snapshot(),
+          }
+        : {}),
     }
   );
   for (const line of buildInterpretationLines()) {
     console.log(`[interpretation] ${line}`);
   }
 
-  if (spikeDebug.getReadyTickCount() > 0) {
+  if (debugMonitor && spikeDebug.getReadyTickCount() > 0) {
     console.log(spikeDebug.formatSummary());
   }
 
@@ -194,10 +271,28 @@ function gracefulShutdown(): void {
 
   const endedAt = Date.now();
   logReportCounterConsistency(runtimeStats);
+  const binaryRunAnalytics =
+    config.marketMode === "binary"
+      ? computeBinaryRunAnalytics({
+          marketMode: config.marketMode,
+          opportunities: ctx.opportunityTracker.getOpportunities(),
+          trades: simulation.getTradeHistory(),
+          openedTradesOverride: runtimeStats.tradesExecuted,
+          borderlineFunnel: {
+            borderlineEntered: runtimeStats.borderlineEntered,
+            borderlinePromoted: runtimeStats.borderlinePromoted,
+            borderlineRejectedTimeout: runtimeStats.borderlineRejectedTimeout,
+            borderlineRejectedWeak: runtimeStats.borderlineRejectedWeak,
+          },
+        })
+      : null;
   try {
     persistence.writeSessionSummary(
       buildMonitorSessionSummary({
         outputDirectory: persistence.getOutputDir(),
+        marketMode: config.marketMode,
+        configGroupSummary: describeActiveConfigGroups(config.marketMode),
+        normalizedConfig: buildNormalizedMonitorConfigSummary(config, configMeta),
         startedAtMs: monitorStartedAtMs,
         endedAtMs: endedAt,
         ticksObserved: runtimeStats.ticksObserved,
@@ -219,6 +314,10 @@ function gracefulShutdown(): void {
           borderlinePromotions: runtimeStats.borderlinePromotions,
           borderlineCancellations: runtimeStats.borderlineCancellations,
           borderlineExpirations: runtimeStats.borderlineExpirations,
+          borderlineEntered: runtimeStats.borderlineEntered,
+          borderlinePromoted: runtimeStats.borderlinePromoted,
+          borderlineRejectedTimeout: runtimeStats.borderlineRejectedTimeout,
+          borderlineRejectedWeak: runtimeStats.borderlineRejectedWeak,
           blockedByCooldown: runtimeStats.blockedByCooldown,
           blockedByActivePosition: runtimeStats.blockedByActivePosition,
           blockedByInvalidQuotes: runtimeStats.blockedByInvalidQuotes,
@@ -264,16 +363,71 @@ function gracefulShutdown(): void {
           ...(config.testMode
             ? { testModeLabel: "TEST MODE ACTIVE" as const }
             : {}),
-          binanceFeedDiagnostics: {
-            symbol: binanceFeed.getSymbol(),
-            health: binanceFeed.getHealth(),
-            lastMessageAgeMs: binanceFeed.getLastMessageAgeMs(),
-          },
+          marketFeedDiagnostics: buildMarketFeedShutdownDiagnostics(
+            config.marketMode,
+            executionFeed
+          ),
+          ...(config.marketMode === "binary"
+            ? {
+                signalFeedDiagnostics: buildMarketFeedShutdownDiagnostics(
+                  "spot",
+                  signalFeed
+                ),
+                binaryQuoteSession: binaryQuoteSessionStats.snapshot(),
+              }
+            : {}),
         },
+        ...(binaryRunAnalytics !== null ? { binaryRunAnalytics } : {}),
       })
     );
+    if (config.marketMode === "binary" && executionFeed instanceof BinarySyntheticFeed) {
+      const synDiag = executionFeed.getSyntheticPricingDiagnosticsSummary();
+      if (synDiag !== null) {
+        persistence.writeSyntheticPricingDiagnostics(synDiag);
+      }
+    }
   } catch (err) {
     console.error("[monitor] Failed to write session-summary.json:", err);
+  }
+  flushPendingProbabilityCalibration(liveMonitorTickDeps, Date.now());
+  if (config.marketMode === "binary") {
+    const ended = Date.now();
+    for (const o of ctx.opportunityTracker.getOpportunities()) {
+      if (o.marketMode !== "binary") continue;
+      if (
+        o.estimatedProbabilityUp === undefined ||
+        !Number.isFinite(o.estimatedProbabilityUp)
+      ) {
+        continue;
+      }
+      if (
+        o.opportunityOutcome === "entered_immediate" ||
+        o.opportunityOutcome === "promoted_after_watch"
+      ) {
+        continue;
+      }
+      const horizon = o.probabilityTimeHorizonMs ?? config.probabilityTimeHorizonMs;
+      const refMid = o.underlyingSignalPrice ?? o.btcPrice;
+      if (!Number.isFinite(refMid)) continue;
+      const ev = resolveOpportunityCalibration({
+        opportunityTimestampMs: o.timestamp,
+        predictedProbabilityUp: o.estimatedProbabilityUp,
+        probabilityTimeHorizonMs: horizon,
+        referenceSignalMid: refMid,
+        ring: signalMidRing,
+        sessionEndMs: ended,
+      });
+      if (ev) {
+        try {
+          persistence.appendProbabilityCalibrationLine(ev);
+        } catch (err) {
+          console.error(
+            "[monitor] Failed to append probability-calibration-events.jsonl (opportunity):",
+            err
+          );
+        }
+      }
+    }
   }
   process.exit(0);
 }
@@ -287,6 +441,27 @@ function onPaperTradeClosed(trade: SimulatedTrade): void {
   }
 
   logPaperTradeClosedBlock(trade);
+
+  if (trade.executionModel === "binary") {
+    const r = resolveTradeCalibration(
+      trade,
+      config.probabilityTimeHorizonMs,
+      signalMidRing,
+      Date.now()
+    );
+    if (r.kind === "event") {
+      try {
+        persistence.appendProbabilityCalibrationLine(r.event);
+      } catch (err) {
+        console.error(
+          "[monitor] Failed to append probability-calibration-events.jsonl (trade):",
+          err
+        );
+      }
+    } else if (r.kind === "deferred") {
+      pendingCalibrationTradeIds.push(trade.id);
+    }
+  }
 
   const closedCount = simulation.getTradeHistory().length;
   if (closedCount > 0 && closedCount % 10 === 0) {
@@ -335,288 +510,57 @@ function onPaperTradeClosed(trade: SimulatedTrade): void {
         borderlinePnL: runtimeStats.borderlinePnL,
       },
       simulation,
-      config.testMode
+      config.testMode,
+      config.marketMode
     );
-  }
-}
-
-async function runMonitorTick(ctx: BotContext): Promise<void> {
-  const tick = await runStrategyTick(ctx);
-  const sim = ctx.simulation;
-  const now = Date.now();
-
-  runtimeStats.observeTick(tick);
-
-  console.log(formatMonitorTickLine(tick, sim, MIN_SAMPLES_FOR_STRATEGY));
-
-  const spikeSnap = spikeDebug.observeTick(
-    tick,
-    ctx.config.spikeThreshold,
-    ctx.config.borderlineMinRatio,
-  );
-  if (debugMonitor) {
-    if (spikeSnap !== null) {
-      console.log(SpikeDebugTracker.formatTickDebugLine(spikeSnap));
-    }
-    if (tick.kind === "ready") {
-      console.log(
-        formatDebugTickExtras(
-          tick.prices,
-          ctx.config.rangeThreshold,
-          ctx.config.spikeThreshold,
-          ctx.config.tradableSpikeMinPercent,
-          ctx.config.maxPriorRangeForNormalEntry,
-          ctx.config.hardRejectPriorRangePercent,
-          ctx.config.maxEntrySpreadBps,
-          tick.entry.windowSpike
-            ? {
-                classification: tick.entry.windowSpike.classification,
-                thresholdRatio: tick.entry.windowSpike.thresholdRatio,
-                sourceWindowLabel: tick.entry.windowSpike.sourceWindowLabel,
-              }
-            : undefined,
-        ),
-      );
-    }
-  }
-  if (spikeDebug.shouldPrintSummary()) {
-    console.log(spikeDebug.formatSummary());
-  }
-
-  if (tick.kind !== "ready") {
-    const pipeline = runStrategyDecisionPipeline({
-      now,
-      tick,
-      manager: borderlineManager,
-      strongSpikeManager,
-      simulation: sim,
-      config: {
-        rangeThreshold: ctx.config.rangeThreshold,
-        stableRangeSoftToleranceRatio: ctx.config.stableRangeSoftToleranceRatio,
-        strongSpikeHardRejectPoorRange: ctx.config.strongSpikeHardRejectPoorRange,
-        spikeThreshold: ctx.config.spikeThreshold,
-        tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
-        maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
-        hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
-        strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
-        exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
-        exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
-        maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
-        entryCooldownMs: ctx.config.entryCooldownMs,
-        borderlineRequirePause: ctx.config.borderlineRequirePause,
-        borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
-        borderlineContinuationThreshold:
-          ctx.config.borderlineContinuationThreshold,
-        borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
-        borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
-        allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
-        allowWeakQualityOnlyForStrongSpikes:
-          ctx.config.allowWeakQualityOnlyForStrongSpikes,
-        allowAcceptableQualityStrongSpikes:
-          ctx.config.allowAcceptableQualityStrongSpikes,
-        unstableContextMode: ctx.config.unstableContextMode,
-      },
-    });
-    for (const msg of pipeline.strongSpikeLifecycleMessages ?? []) {
-      console.log(msg);
-    }
-    for (const ev of pipeline.borderlineLifecycleEvents) {
-      logBorderlineLifecycleBlock(ev);
-    }
-    if (pipeline.decision.action !== "none") {
-      console.log(formatStrategyDecisionLog(pipeline.decision));
-    }
-    return;
-  }
-
-  persistence.ensureReady();
-
-  const feedStale =
-    tick.market.feedPossiblyStale ||
-    ctx.marketFeed.getLastMessageAgeMs() > ctx.config.feedStaleMaxAgeMs;
-
-  let pipeline = runStrategyDecisionPipeline({
-    now,
-    tick,
-    manager: borderlineManager,
-    strongSpikeManager,
-    simulation: sim,
-    config: {
-      rangeThreshold: ctx.config.rangeThreshold,
-      stableRangeSoftToleranceRatio: ctx.config.stableRangeSoftToleranceRatio,
-      strongSpikeHardRejectPoorRange: ctx.config.strongSpikeHardRejectPoorRange,
-      spikeThreshold: ctx.config.spikeThreshold,
-      tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
-      maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
-      hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
-      strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
-      exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
-      exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
-      maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
-      entryCooldownMs: ctx.config.entryCooldownMs,
-      borderlineRequirePause: ctx.config.borderlineRequirePause,
-      borderlineRequireNoContinuation: ctx.config.borderlineRequireNoContinuation,
-      borderlineContinuationThreshold: ctx.config.borderlineContinuationThreshold,
-      borderlineReversionThreshold: ctx.config.borderlineReversionThreshold,
-      borderlinePauseBandPercent: ctx.config.borderlinePauseBandPercent,
-      allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
-      allowWeakQualityOnlyForStrongSpikes:
-        ctx.config.allowWeakQualityOnlyForStrongSpikes,
-      allowAcceptableQualityStrongSpikes:
-        ctx.config.allowAcceptableQualityStrongSpikes,
-      unstableContextMode: ctx.config.unstableContextMode,
-    },
-  });
-  pipeline = applyFeedStaleEntryBlock(pipeline, {
-    tick,
-    simulation: sim,
-    config: ctx.config,
-    feedStale,
-  });
-  for (const ev of pipeline.borderlineLifecycleEvents) {
-    logBorderlineLifecycleBlock(ev);
-    runtimeStats.observeBorderlineLifecycleEventType(ev.type);
-    const tracked = ctx.opportunityTracker.recordBorderlineLifecycleEvent({
-      timestamp: now,
-      event: ev,
-      tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
-      maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
-    });
-    try {
-      persistence.appendOpportunityLine(tracked);
-    } catch (err) {
-      console.error(
-        "[monitor] Failed to append opportunities.jsonl (borderline lifecycle):",
-        err
-      );
-    }
-  }
-  for (const msg of pipeline.strongSpikeLifecycleMessages ?? []) {
-    if (
-      msg.includes("promoted") ||
-      msg.includes("cancelled") ||
-      msg.includes("classification=") ||
-      msg.includes("exceptional spike override activated") ||
-      msg.includes("[quality-gate]") ||
-      msg.includes("[unstable-context]")
-    ) {
-      console.log(msg);
-    }
-  }
-  if (pipeline.decision.action !== "none") {
-    console.log(formatStrategyDecisionLog(pipeline.decision));
-  } else if (debugMonitor) {
-    console.log(formatStrategyDecisionLog(pipeline.decision));
-  }
-
-  const entryForSimulation = pipeline.entryForSimulation ?? tick.entry;
-  const paperEntry = entryEvaluationForPipelinePaperExecution(
-    pipeline.decision,
-    entryForSimulation
-  );
-  if (debugMonitor && tick.entry.spikeDetected) {
-    logSpikeDecisionTrace(
-      buildSpikeDecisionTracePayload({
-        entry: entryForSimulation,
-        decision: pipeline.decision,
-      })
-    );
-  }
-  const entryPath =
-    pipeline.decision.action === "promote_borderline_candidate"
-      ? "borderline_delayed"
-      : "strong_spike_immediate";
-  const hadOpenPosition = sim.getOpenPosition() !== null;
-  const action = pipeline.decision.action;
-  const enteringImmediate = action === "enter_immediate";
-  const promoting = action === "promote_borderline_candidate";
-  sim.onTick({
-    now,
-    entry: paperEntry,
-    entryPath,
-    ...(pipeline.decision.qualityProfile !== undefined
-      ? { entryQualityProfile: pipeline.decision.qualityProfile }
-      : {}),
-    sides: tick.sides,
-    symbol: ctx.tradeSymbol,
-    config: {
-      takeProfitBps: ctx.config.takeProfitBps,
-      stopLossBps: ctx.config.stopLossBps,
-      paperSlippageBps: ctx.config.paperSlippageBps,
-      paperFeeRoundTripBps: ctx.config.paperFeeRoundTripBps,
-      exitTimeoutMs: ctx.config.exitTimeoutMs,
-      entryCooldownMs: ctx.config.entryCooldownMs,
-      stakePerTrade: ctx.config.stakePerTrade,
-      allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
-      weakQualitySizeMultiplier: ctx.config.weakQualitySizeMultiplier,
-      strongQualitySizeMultiplier: ctx.config.strongQualitySizeMultiplier,
-      exceptionalQualitySizeMultiplier:
-        ctx.config.exceptionalQualitySizeMultiplier,
-    },
-  });
-
-  const cls = tick.entry.movementClassification;
-  const spikeRawEvent =
-    tick.entry.spikeDetected === true || enteringImmediate || promoting;
-  const candidatePass =
-    spikeRawEvent &&
-    (cls === "strong_spike" ||
-      cls === "borderline" ||
-      enteringImmediate ||
-      promoting);
-  const validEntryApproved = enteringImmediate || promoting;
-  const positionOpenedThisTick =
-    !hadOpenPosition && sim.getOpenPosition() !== null;
-  runtimeStats.observeReadyTickFunnel({
-    spikeRawEvent,
-    candidatePass,
-    validEntryApproved,
-    positionOpenedThisTick,
-  });
-
-  const recorded = ctx.opportunityTracker.recordFromReadyTick({
-    timestamp: now,
-    btcPrice: tick.btc,
-    prices: tick.prices,
-    previousPrice: tick.prev,
-    currentPrice: tick.last,
-    sides: tick.sides,
-    entry: entryForSimulation,
-    tradableSpikeMinPercent: ctx.config.tradableSpikeMinPercent,
-    maxPriorRangeForNormalEntry: ctx.config.maxPriorRangeForNormalEntry,
-    exceptionalSpikeMinPercent: ctx.config.exceptionalSpikePercent,
-    allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,
-    allowWeakQualityOnlyForStrongSpikes:
-      ctx.config.allowWeakQualityOnlyForStrongSpikes,
-    allowAcceptableQualityStrongSpikes:
-      ctx.config.allowAcceptableQualityStrongSpikes,
-    decision: pipeline.decision,
-  });
-  if (recorded !== null) {
-    if (recorded.status === "valid") {
-      logValidOpportunityBlock(recorded);
-    } else if (debugMonitor) {
-      logOpportunityBlock(recorded);
-    }
-  }
-
-  runtimeStats.observeOpportunityRecord(recorded);
-
-  if (recorded !== null) {
-    try {
-      persistence.appendOpportunityLine(recorded);
-    } catch (err) {
-      console.error("[monitor] Failed to append opportunities.jsonl:", err);
-    }
   }
 }
 
 function startLiveMonitor(ctx: BotContext): void {
   monitorStartedAtMs = Date.now();
+  binaryQuoteSessionStats.reset();
   persistence.ensureReady();
   logConfig();
   printLiveMonitorBanner({
-    dataSourceDetail: `Binance Spot ${binanceFeed.getSymbol()} (bookTicker + aggTrade WS, REST bootstrap)`,
+    ...(config.marketMode === "binary"
+      ? {
+          binaryBannerLayers: {
+            signalSource: config.binarySignalSource,
+            signalSymbol: config.binarySignalSymbol,
+            executionSlugLine: buildBinaryBannerExecutionLine(executionFeed),
+          },
+          binaryVenueLine: formatBinaryExecutionVenueBannerLine(
+            resolveBinaryMarketSelectorFromEnv()
+          ),
+          ...(wasBinaryMarketAutoDiscovered() && getLastAutoDiscoveredBtc5mMarket() !== null
+            ? {
+                binaryAutoDiscoveryBanner: getLastAutoDiscoveredBtc5mMarket()!,
+              }
+            : {}),
+        }
+      : {}),
+    dataSourceDetail: liveMonitorDualFeedBannerDetail(
+      config.marketMode,
+      signalFeed,
+      executionFeed,
+      config.marketMode === "binary"
+        ? {
+            source: config.binarySignalSource,
+            symbol: config.binarySignalSymbol,
+          }
+        : undefined
+    ),
+    marketMode: config.marketMode,
+    ...(config.marketMode === "binary"
+      ? {
+          binaryPaperExits: {
+            takeProfitPriceDelta: config.binaryTakeProfitPriceDelta,
+            stopLossPriceDelta: config.binaryStopLossPriceDelta,
+            exitTimeoutMs: config.binaryExitTimeoutMs,
+            maxOppositeSideEntryPrice: config.binaryMaxOppositeSideEntryPrice,
+          },
+        }
+      : {}),
     tickIntervalSec: BOT_TICK_INTERVAL_MS / 1000,
     bufferSlots: config.priceBufferSize,
     minSamples: MIN_SAMPLES_FOR_STRATEGY,
@@ -631,6 +575,7 @@ function startLiveMonitor(ctx: BotContext): void {
     persistPath: `${persistence.getOutputDir()} (JSONL + session-summary on exit)`,
     debugMode: debugMonitor,
     testMode: config.testMode,
+    signalDetectionBannerLines: formatSignalDetectionBannerLines(config, configMeta),
   });
 
   statsTimer = setInterval(() => {
@@ -679,15 +624,16 @@ function startLiveMonitor(ctx: BotContext): void {
         borderlinePnL: runtimeStats.borderlinePnL,
       },
       ctx.simulation,
-      config.testMode
+      config.testMode,
+      ctx.config.marketMode
     );
     console.log(
       `${config.testMode ? "[TEST MODE] " : ""}[quality] weak=${runtimeStats.qualityWeak} strong=${runtimeStats.qualityStrong} exceptional=${runtimeStats.qualityExceptional} | top-rejections ${formatTopRejectionReasons()}`
     );
   }, 5 * 60 * 1000);
-  void runMonitorTick(ctx);
+  void runLiveMonitorTick(ctx, liveMonitorTickDeps);
   tickTimer = setInterval(() => {
-    void runMonitorTick(ctx);
+    void runLiveMonitorTick(ctx, liveMonitorTickDeps);
   }, BOT_TICK_INTERVAL_MS);
   process.once("SIGINT", gracefulShutdown);
   process.once("SIGTERM", gracefulShutdown);
@@ -705,14 +651,61 @@ const ctx: BotContext = {
   simulation,
   opportunityTracker: new OpportunityTracker(),
   config,
-  marketFeed: binanceFeed,
-  tradeSymbol: binanceFeed.getSymbol(),
+  signalFeed,
+  executionFeed,
+  tradeSymbol: executionFeed.getSymbol(),
 };
 
-void binanceFeed.bootstrapRest().then((ok) => {
-  if (!ok) {
+function startAfterBootstrap(signalOk: boolean, execOk: boolean): void {
+  if (!signalOk && config.marketMode === "spot") {
     console.warn("[monitor] REST bookTicker bootstrap failed — waiting for WebSocket");
   }
-  binanceFeed.start();
+  if (!signalOk && config.marketMode === "binary") {
+    console.warn(
+      "[monitor] BTC signal feed REST bootstrap failed — check Binance connectivity / symbol"
+    );
+  }
+  if (
+    !sameMarketFeedInstance &&
+    !execOk &&
+    config.marketMode === "binary" &&
+    executionFeed instanceof BinaryMarketFeed
+  ) {
+    const sel = resolveBinaryMarketSelectorFromEnv();
+    console.error(
+      "[monitor] FATAL: Gamma bootstrap did not produce a usable YES/NO execution quote/book (see [gamma-bootstrap] lines above)."
+    );
+    console.error(
+      `  selector: ${sel.selectorKind}  value: ${sel.selectorValue}  env: ${sel.sourceEnvKey}`
+    );
+    const lr = executionFeed.getLastGammaResolve();
+    if (lr !== null) {
+      console.error(
+        "  Gamma HTTP trace:\n" + formatGammaBootstrapStepsForLog(lr.steps).replace(/^/gm, "  ")
+      );
+      console.error(`  resolution: ${JSON.stringify(lr.resolution)}`);
+      if (lr.parseFailure) console.error(`  parseFailure: ${lr.parseFailure}`);
+    }
+    const bookWhy = executionFeed.describeExecutableBookInvalidReason();
+    if (bookWhy) console.error(`  executable_book: ${bookWhy}`);
+    console.error(
+      "  Common fix: Polymarket **event** URL slugs must resolve via /events/slug (bot does this automatically). If you still see empty markets, use BINARY_MARKET_SLUG of the **child** market or BINARY_MARKET_ID. For condition hex use BINARY_CONDITION_ID (CLOB bridge)."
+    );
+    process.exit(1);
+  }
+  signalFeed.start();
+  if (!sameMarketFeedInstance) executionFeed.start();
   startLiveMonitor(ctx);
-});
+}
+
+if (sameMarketFeedInstance) {
+  void signalFeed.bootstrapRest().then((signalOk) => {
+    startAfterBootstrap(signalOk, signalOk);
+  });
+} else {
+  void Promise.all([signalFeed.bootstrapRest(), executionFeed.bootstrapRest()]).then(
+    ([signalOk, execOk]) => {
+      startAfterBootstrap(signalOk, execOk);
+    }
+  );
+}

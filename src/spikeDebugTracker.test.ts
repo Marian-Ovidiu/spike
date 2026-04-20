@@ -5,21 +5,24 @@ import {
 } from "./spikeDebugTracker.js";
 import type { StrategyTickResult } from "./botLoop.js";
 import type { EntryEvaluation } from "./entryConditions.js";
+import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
 function makeReadyTick(
   prev: number,
   last: number,
   overrides?: Partial<EntryEvaluation>
 ): StrategyTickResult {
+  const executionBook = syntheticExecutableBookFromMid(last, 5);
   return {
     kind: "ready",
     btc: last,
+    underlyingSignalPrice: last,
     n: 10,
     cap: 20,
     prev,
     last,
     prices: [prev, last],
-    sides: { upSidePrice: 0.55, downSidePrice: 0.45 },
+    executionBook,
     entry: {
       shouldEnter: false,
       direction: null,
@@ -27,7 +30,8 @@ function makeReadyTick(
       windowSpike: undefined,
       ...overrides,
     },
-    quoteFeed: { quoteSource: "env" },
+    market: { book: executionBook, feedPossiblyStale: false },
+    binaryOutcomes: null,
   };
 }
 
@@ -37,15 +41,17 @@ function makeReadyTickWithHistory(
 ): StrategyTickResult {
   const last = history[history.length - 1]!;
   const prev = history.length >= 2 ? history[history.length - 2]! : last;
+  const executionBook = syntheticExecutableBookFromMid(last, 5);
   return {
     kind: "ready",
     btc: last,
+    underlyingSignalPrice: last,
     n: history.length,
     cap: 20,
     prev,
     last,
     prices: history,
-    sides: { upSidePrice: 0.55, downSidePrice: 0.45 },
+    executionBook,
     entry: {
       shouldEnter: false,
       direction: null,
@@ -53,7 +59,8 @@ function makeReadyTickWithHistory(
       windowSpike: undefined,
       ...overrides,
     },
-    quoteFeed: { quoteSource: "env" },
+    market: { book: executionBook, feedPossiblyStale: false },
+    binaryOutcomes: null,
   };
 }
 

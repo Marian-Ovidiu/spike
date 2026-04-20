@@ -12,7 +12,8 @@ import {
   toMovementAnalysis,
   type MovementAnalysis,
 } from "./movementAnalysis.js";
-import { evaluateSpotSpreadFilter } from "./spotSpreadFilter.js";
+import { evaluateExecutionSpreadFilter } from "./executionSpreadFilter.js";
+import { logBorderlinePipelineSignal } from "./borderlineSignalLog.js";
 
 export type EntryDirection = "UP" | "DOWN";
 
@@ -24,6 +25,7 @@ export const ENTRY_REASON_CODES = {
   SPREAD_TOO_WIDE: "spread_too_wide",
   INVALID_BOOK: "invalid_book",
   NO_SPIKE_DIRECTION: "no_spike_direction",
+  BORDERLINE_REJECTED_WEAK: "borderline_rejected_weak",
 } as const;
 
 export type EntryEvaluation = {
@@ -58,9 +60,18 @@ export type EvaluateEntryConditionsInput = {
   spikeMinRangeMultiple: number;
   /** Borderline lower bound as ratio of `spikeThreshold` (e.g. 0.85). */
   borderlineMinRatio: number;
+  /**
+   * Minimum move (fraction) used for tradability; borderline watch requires
+   * strongest window move ≥ `tradableSpikeMinPercent * 1.2` or the signal is demoted to noise.
+   */
+  tradableSpikeMinPercent: number;
   /** Max bid/ask spread (bps) allowed for entry; wider = blocked. */
   maxEntrySpreadBps: number;
-  /** Best bid, best ask, mid, spread (bps) from spot book. */
+  /**
+   * Execution venue top-of-book (binary: YES/NO or synthetic bid/ask; legacy spot: Binance L1).
+   * Used only for spread / invalid-book gates — spike direction and strength come from
+   * `prices`, `previousPrice`, and `currentPrice` (the BTC signal series in binary mode).
+   */
   bestBid: number;
   bestAsk: number;
   midPrice: number;
@@ -78,9 +89,11 @@ export const ENTRY_REASON_MESSAGES: Record<string, string> = {
   [ENTRY_REASON_CODES.SPREAD_TOO_WIDE]:
     "bid/ask spread wider than allowed for entry",
   [ENTRY_REASON_CODES.INVALID_BOOK]:
-    "spot book missing or non-finite (bid/ask)",
+    "executable book missing or non-finite (bid/ask)",
   [ENTRY_REASON_CODES.NO_SPIKE_DIRECTION]:
     "no one-tick direction (flat candle)",
+  [ENTRY_REASON_CODES.BORDERLINE_REJECTED_WEAK]:
+    "borderline move too weak for watch (below tradable spike bar)",
 };
 
 /** Maps rejection codes to readable text for logging. */
@@ -114,6 +127,7 @@ export function evaluateEntryConditions(
     spikeThreshold,
     spikeMinRangeMultiple,
     borderlineMinRatio,
+    tradableSpikeMinPercent,
     maxEntrySpreadBps,
     bestBid,
     bestAsk,
@@ -157,12 +171,59 @@ export function evaluateEntryConditions(
     stableRangeSoftToleranceRatio,
   });
 
-  const windowSpike = classifyMovementWindow({
+  const rawWindowSpike = classifyMovementWindow({
     prices,
     spikeThreshold,
     borderlineMinRatio,
     windowTicks: 2,
   });
+
+  const borderlineMinTradableMove = tradableSpikeMinPercent * 1.2;
+  let borderlineDemotedWeak = false;
+  let windowSpike = rawWindowSpike;
+  if (rawWindowSpike.classification === "borderline") {
+    const ratioOk = rawWindowSpike.thresholdRatio >= borderlineMinRatio;
+    const spikePctOk =
+      rawWindowSpike.strongestMovePercent >= borderlineMinTradableMove;
+    if (!ratioOk || !spikePctOk) {
+      borderlineDemotedWeak = true;
+      windowSpike = {
+        ...rawWindowSpike,
+        classification: "no_signal",
+        detected: false,
+      };
+      logBorderlinePipelineSignal("borderline_rejected_weak", {
+        thresholdRatio: rawWindowSpike.thresholdRatio,
+        strongestMovePercent: rawWindowSpike.strongestMovePercent,
+        borderlineMinRatio,
+        minTradableMoveFrac: borderlineMinTradableMove,
+        ratioOk,
+        spikePctOk,
+      });
+    }
+  }
+
+  if (borderlineDemotedWeak) {
+    const movementWeak: MovementAnalysis = toMovementAnalysis(windowSpike);
+    const rangeAssessmentWeak = assessStableRangeQuality({
+      prices,
+      rangeThreshold,
+      stableRangeSoftToleranceRatio,
+    });
+    return {
+      shouldEnter: false,
+      direction: null,
+      reasons: [ENTRY_REASON_CODES.BORDERLINE_REJECTED_WEAK],
+      stableRangeDetected: rangeAssessmentWeak.stableRangeDetected,
+      priorRangeFraction: rangeAssessmentWeak.priorRangeFraction,
+      stableRangeQuality: rangeAssessmentWeak.stableRangeQuality,
+      rangeDecisionNote: "borderline demoted: below tightened tradability gate",
+      movementClassification: "no_signal",
+      spikeDetected: false,
+      movement: movementWeak,
+      windowSpike,
+    };
+  }
 
   const priorWindow = prices.slice(0, -1);
   const movement: MovementAnalysis = toMovementAnalysis(windowSpike);
@@ -225,7 +286,7 @@ export function evaluateEntryConditions(
   }
 
   if (windowSpike.strongestMoveDirection === "UP") {
-    const spreadBlock = evaluateSpotSpreadFilter({
+    const spreadBlock = evaluateExecutionSpreadFilter({
       spreadBps,
       maxEntrySpreadBps,
     });
@@ -246,7 +307,7 @@ export function evaluateEntryConditions(
   }
 
   if (windowSpike.strongestMoveDirection === "DOWN") {
-    const spreadBlock = evaluateSpotSpreadFilter({
+    const spreadBlock = evaluateExecutionSpreadFilter({
       spreadBps,
       maxEntrySpreadBps,
     });

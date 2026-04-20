@@ -5,6 +5,8 @@
 import WebSocket from "ws";
 import axios from "axios";
 
+import type { QuoteStaleResult } from "../market/types.js";
+
 const BINANCE_WS_BASE = "wss://stream.binance.com:9443";
 const BINANCE_REST = "https://api.binance.com";
 
@@ -97,6 +99,10 @@ export class BinanceSpotFeed {
     return this.symbolLower.toUpperCase();
   }
 
+  getBinaryOutcomePrices(): null {
+    return null;
+  }
+
   getHealth(): BinanceFeedHealth {
     return {
       connected: this.ws !== null && this.ws.readyState === WebSocket.OPEN,
@@ -113,6 +119,14 @@ export class BinanceSpotFeed {
   getLastMessageAgeMs(now = Date.now()): number {
     if (this.lastMessageAtMs === null) return Number.POSITIVE_INFINITY;
     return Math.max(0, now - this.lastMessageAtMs);
+  }
+
+  getQuoteStale(now = Date.now()): QuoteStaleResult {
+    const age = this.getLastMessageAgeMs(now);
+    if (age === Number.POSITIVE_INFINITY) {
+      return { stale: true, reason: "no_ws_messages" };
+    }
+    return { stale: false, reason: null };
   }
 
   /**
@@ -368,6 +382,10 @@ export class PaperBinanceFeed {
     return this.symbolUpper;
   }
 
+  getBinaryOutcomePrices(): null {
+    return null;
+  }
+
   getHealth(): BinanceFeedHealth {
     return {
       connected: true,
@@ -382,6 +400,11 @@ export class PaperBinanceFeed {
 
   getLastMessageAgeMs(now = Date.now()): number {
     return Math.max(0, now - this.lastMessageAtMs);
+  }
+
+  getQuoteStale(now = Date.now()): QuoteStaleResult {
+    void now;
+    return { stale: false, reason: null };
   }
 
   getNormalizedBook(): NormalizedSpotBook | null {
@@ -419,4 +442,3 @@ export class PaperBinanceFeed {
   }
 }
 
-export type SpotMarketFeed = BinanceSpotFeed | PaperBinanceFeed;

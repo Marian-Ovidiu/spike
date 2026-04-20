@@ -1,22 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { SimulationEngine } from "./simulationEngine.js";
-import { BorderlineCandidateManager } from "./borderlineCandidate.js";
-import { StrongSpikeCandidateStore } from "./strongSpikeCandidateStore.js";
-import type { StrategyTickResult } from "./botLoop.js";
-import type { EntryEvaluation } from "./entryConditions.js";
-import { OpportunityTracker } from "./opportunityTracker.js";
+import { SimulationEngine } from "../simulationEngine.js";
+import { BorderlineCandidateManager } from "../borderlineCandidate.js";
+import { StrongSpikeCandidateStore } from "../strongSpikeCandidateStore.js";
+import type { StrategyTickResult } from "../botLoop.js";
+import type { EntryEvaluation } from "../entryConditions.js";
+import { OpportunityTracker } from "../opportunityTracker.js";
 import {
   applyQuoteStaleEntryBlock,
   entryEvaluationForPipelinePaperExecution,
   PIPELINE_BLOCKED_ENTRY_REASON,
   runStrategyDecisionPipeline,
 } from "./strategyDecisionPipeline.js";
-import { syntheticSpotBookFromMid } from "./spotSpreadFilter.js";
+import { syntheticExecutableBookFromMid } from "../executionSpreadFilter.js";
 
 function readyTick(
-  entry: EntryEvaluation
+  entry: EntryEvaluation,
+  binaryOutcomes: Extract<
+    StrategyTickResult,
+    { kind: "ready" }
+  >["binaryOutcomes"] = null
 ): Extract<StrategyTickResult, { kind: "ready" }> {
-  const sides = syntheticSpotBookFromMid(100_000, 5);
+  const executionBook = syntheticExecutableBookFromMid(100_000, 5);
   const normalizedEntry: EntryEvaluation = {
     stableRangeDetected: true,
     priorRangeFraction: 0.0005,
@@ -38,14 +42,16 @@ function readyTick(
   return {
     kind: "ready",
     btc: 100_000,
+    underlyingSignalPrice: 100_000,
     n: 12,
     cap: 20,
     prev: 100_000,
     last: 100_050,
     prices: [99_980, 99_990, 100_000, 100_050],
-    sides,
+    executionBook,
     entry: normalizedEntry,
-    market: { book: sides, feedPossiblyStale: false },
+    market: { book: executionBook, feedPossiblyStale: false },
+    binaryOutcomes,
   };
 }
 
@@ -67,24 +73,43 @@ const pipelineConfig = {
   borderlineContinuationThreshold: 0.25,
   borderlineReversionThreshold: 0.2,
   borderlinePauseBandPercent: 0.00015,
+  borderlineMaxLifetimeMs: 0,
+  borderlineFastPromoteDeltaBps: 4,
+  borderlineFastPromoteProbDelta: 0.04,
+  borderlineFastRejectSameDirectionBps: 0,
+  enableBorderlineMode: true,
   allowWeakQualityEntries: false,
   allowWeakQualityOnlyForStrongSpikes: true,
   allowAcceptableQualityStrongSpikes: false,
   unstableContextMode: "hard" as const,
+  marketMode: "spot" as const,
+  binaryMaxOppositeSideEntryPrice: 0.78,
+  binaryMaxEntrySidePrice: 0,
+  binaryNeutralQuoteBandMin: 0,
+  binaryNeutralQuoteBandMax: 0,
 } as const;
 
 const spotSimConfig = {
   takeProfitBps: 35,
   stopLossBps: 25,
-  paperSlippageBps: 0,
+  binaryPaperSlippageBps: 0,
   paperFeeRoundTripBps: 8,
   exitTimeoutMs: 60_000,
+  binaryTakeProfitPriceDelta: 0.05,
+  binaryStopLossPriceDelta: 0.05,
+  binaryExitTimeoutMs: 60_000,
+  binaryMaxEntryPrice: 0.99,
   entryCooldownMs: 120_000,
   stakePerTrade: 5,
   allowWeakQualityEntries: false,
   weakQualitySizeMultiplier: 0.5,
   strongQualitySizeMultiplier: 1,
   exceptionalQualitySizeMultiplier: 1,
+  minEdgeThreshold: 0,
+  riskPercentPerTrade: 1,
+  maxTradeSize: 0,
+  minTradeSize: 1,
+  probabilityTimeHorizonMs: 30_000,
 } as const;
 
 describe("strategyDecisionPipeline", () => {
@@ -1167,10 +1192,12 @@ describe("strategyDecisionPipeline", () => {
     };
     // open position to trigger critical blocker
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 100,
       entry: strong,
       entryPath: "strong_spike_immediate",
-      sides: syntheticSpotBookFromMid(100_000, 5),
+      executionBook: syntheticExecutableBookFromMid(100_000, 5),
       symbol: "BTCUSDT",
       config: spotSimConfig,
     });
@@ -1297,8 +1324,8 @@ describe("strategyDecisionPipeline", () => {
         detected: false,
       },
     });
-    t.sides.bestBid = Number.NaN;
-    t.market = { book: t.sides, feedPossiblyStale: false };
+    t.executionBook.bestBid = Number.NaN;
+    t.market = { book: t.executionBook, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 2_000,
       tick: t,
@@ -1626,9 +1653,9 @@ describe("strategyDecisionPipeline", () => {
         comparisons: [],
       },
     };
-    const wide = syntheticSpotBookFromMid(100_000, 400);
+    const wide = syntheticExecutableBookFromMid(100_000, 400);
     const t = readyTick(strong);
-    t.sides = wide;
+    t.executionBook = wide;
     t.market = { book: wide, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 1_000,
@@ -1683,13 +1710,13 @@ describe("strategyDecisionPipeline", () => {
       },
     };
     const t = readyTick(strong);
-    t.sides = {
+    t.executionBook = {
       bestBid: 100_100,
       bestAsk: 100_000,
       midPrice: 100_050,
       spreadBps: Number.NaN,
     };
-    t.market = { book: t.sides, feedPossiblyStale: false };
+    t.market = { book: t.executionBook, feedPossiblyStale: false };
     const result = runStrategyDecisionPipeline({
       now: 1_000,
       tick: t,
@@ -1834,15 +1861,24 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
   const paperConfig = {
     takeProfitBps: 35,
     stopLossBps: 25,
-    paperSlippageBps: 0,
+    binaryPaperSlippageBps: 0,
     paperFeeRoundTripBps: 8,
     exitTimeoutMs: 60_000,
+    binaryTakeProfitPriceDelta: 0.05,
+    binaryStopLossPriceDelta: 0.05,
+    binaryExitTimeoutMs: 60_000,
+    binaryMaxEntryPrice: 0.99,
     entryCooldownMs: 0,
     stakePerTrade: 10,
     allowWeakQualityEntries: false,
     weakQualitySizeMultiplier: 1,
     strongQualitySizeMultiplier: 1,
     exceptionalQualitySizeMultiplier: 1,
+    minEdgeThreshold: 0,
+    riskPercentPerTrade: 1,
+    maxTradeSize: 0,
+    minTradeSize: 1,
+    probabilityTimeHorizonMs: 30_000,
   } as const;
 
   it("clears shouldEnter when pipeline did not approve, so paper sim stays flat", () => {
@@ -1894,9 +1930,11 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
     expect(paper.reasons).toContain(PIPELINE_BLOCKED_ENTRY_REASON);
 
     sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
       now: 1,
       entry: paper,
-      sides: syntheticSpotBookFromMid(100_000, 5),
+      executionBook: syntheticExecutableBookFromMid(100_000, 5),
       symbol: "BTCUSDT",
       config: paperConfig,
     });
@@ -2011,6 +2049,7 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
       config: {
         blockEntriesOnStaleQuotes: true,
         tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
+        marketMode: "spot",
       },
       quoteFeedStale: true,
     });
@@ -2025,13 +2064,183 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
       prices: tick.prices,
       previousPrice: tick.prev,
       currentPrice: tick.last,
-      sides: tick.sides,
+      executionBook: tick.executionBook,
       entry: strong,
       decision: blocked.decision,
       tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
     });
     expect(o).not.toBeNull();
     expect(o!.entryRejectionReasons).toContain("feed_stale");
+  });
+
+  it("applyQuoteStaleEntryBlock uses quote_feed_stale in binary market mode", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const strong: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const tick = readyTick(strong);
+    const base = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick,
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: pipelineConfig,
+    });
+    expect(base.decision.action).toBe("enter_immediate");
+
+    const blocked = applyQuoteStaleEntryBlock(base, {
+      tick,
+      simulation: sim,
+      config: {
+        blockEntriesOnStaleQuotes: true,
+        tradableSpikeMinPercent: pipelineConfig.tradableSpikeMinPercent,
+        marketMode: "binary",
+      },
+      quoteFeedStale: true,
+    });
+    expect(blocked.decision.action).toBe("none");
+    expect(blocked.decision.criticalBlockerUsed).toBe("quote_feed_stale");
+    expect(blocked.decision.reasons?.includes("quote_feed_stale")).toBe(true);
+  });
+
+  it("binary mode blocks strong-spike promote when opposite outcome quote is too high", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({ symbol: "BTCUSD", watchTicks: 2 });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const binaryCfg = {
+      ...pipelineConfig,
+      marketMode: "binary" as const,
+      binaryMaxOppositeSideEntryPrice: 0.1,
+    };
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0004,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.0015,
+        strongestMoveAbsolute: 150,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.5,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0015,
+        strongestMoveAbsolute: 150,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 1.5,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_150,
+        strongestMove: 0.0015,
+        strongestAbsDelta: 150,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const first = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: readyTick(entry),
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: binaryCfg,
+    });
+    expect(first.decision.reason).toBe("strong_spike_waiting_confirmation_tick");
+
+    const confirmTick = readyTick(
+      {
+        ...entry,
+        shouldEnter: false,
+        direction: null,
+        movementClassification: "no_signal",
+        spikeDetected: false,
+        reasons: ["spike_not_strong_enough"],
+        movement: {
+          ...entry.movement,
+          strongestMovePercent: 0.0002,
+          thresholdRatio: 0.2,
+          classification: "no_signal",
+        },
+        windowSpike: {
+          ...entry.windowSpike!,
+          classification: "no_signal",
+          strongestMovePercent: 0.0002,
+          thresholdRatio: 0.2,
+          detected: false,
+        },
+      },
+      { yesPrice: 0.52, noPrice: 0.48 }
+    );
+    const result = runStrategyDecisionPipeline({
+      now: 2_000,
+      tick: confirmTick,
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: binaryCfg,
+    });
+    expect(result.decision.action).toBe("none");
+    expect(result.decision.reason).toBe("opposite_side_price_too_high");
+    expect((result.strongSpikeLifecycleMessages ?? []).join(" ")).toContain(
+      "binary_quote_gate:opposite_side_price_too_high"
+    );
   });
 
   it("applyQuoteStaleEntryBlock does nothing when stale flag is false", () => {

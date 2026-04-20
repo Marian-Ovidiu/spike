@@ -6,10 +6,12 @@ import {
   MonitorRuntimeStats,
 } from "./monitorRuntimeStats.js";
 import { SimulationEngine } from "./simulationEngine.js";
+import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
 describe("MonitorRuntimeStats", () => {
   it("aggregates tick and opportunity counters", () => {
     const s = new MonitorRuntimeStats({ exceptionalSpikePercent: 0.0025 });
+    const executionBook = syntheticExecutableBookFromMid(1, 5);
     s.observeTick({ kind: "no_btc" });
     s.observeTick({
       kind: "warming",
@@ -23,12 +25,15 @@ describe("MonitorRuntimeStats", () => {
     s.observeTick({
       kind: "ready",
       btc: 1,
+      underlyingSignalPrice: 1,
       n: 11,
       cap: 20,
       prev: 1,
       last: 1,
       prices: [],
-      sides: { upSidePrice: 0.5, downSidePrice: 0.5 },
+      executionBook,
+      market: { book: executionBook, feedPossiblyStale: false },
+      binaryOutcomes: null,
       entry: {
         shouldEnter: false,
         direction: "UP",
@@ -67,7 +72,6 @@ describe("MonitorRuntimeStats", () => {
           comparisons: [],
         },
       },
-      quoteFeed: { quoteSource: "env" },
     });
     expect(s.strongSpikeSignals).toBe(1);
     expect(s.strongSpikeCount).toBe(1);
@@ -75,12 +79,15 @@ describe("MonitorRuntimeStats", () => {
     s.observeTick({
       kind: "ready",
       btc: 1,
+      underlyingSignalPrice: 1,
       n: 11,
       cap: 20,
       prev: 1,
       last: 1,
       prices: [],
-      sides: { upSidePrice: 0.5, downSidePrice: 0.5 },
+      executionBook,
+      market: { book: executionBook, feedPossiblyStale: false },
+      binaryOutcomes: null,
       entry: {
         shouldEnter: false,
         direction: null,
@@ -102,17 +109,19 @@ describe("MonitorRuntimeStats", () => {
         },
         windowSpike: undefined,
       },
-      quoteFeed: { quoteSource: "env" },
     });
     s.observeTick({
       kind: "ready",
       btc: 1,
+      underlyingSignalPrice: 1,
       n: 11,
       cap: 20,
       prev: 1,
       last: 1,
       prices: [],
-      sides: { upSidePrice: 0.5, downSidePrice: 0.5 },
+      executionBook,
+      market: { book: executionBook, feedPossiblyStale: false },
+      binaryOutcomes: null,
       entry: {
         shouldEnter: false,
         direction: null,
@@ -134,7 +143,6 @@ describe("MonitorRuntimeStats", () => {
         },
         windowSpike: undefined,
       },
-      quoteFeed: { quoteSource: "env" },
     });
     expect(s.borderlineCount).toBe(1);
     expect(s.noSignalCount).toBe(1);

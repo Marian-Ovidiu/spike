@@ -9,11 +9,15 @@ const QUOTE_BLOCKERS: ReadonlySet<NormalizedRejectionReason> = new Set([
   "missing_quote_data",
   "invalid_market_prices",
   "market_quotes_too_neutral",
+  "missing_binary_quotes",
+  "quote_feed_stale",
 ]);
 
 /** First failure wins for “primary blocker” attribution (pipeline-ish order). */
 const PRIMARY_BLOCKER_PRIORITY: readonly NormalizedRejectionReason[] = [
   "missing_quote_data",
+  "missing_binary_quotes",
+  "quote_feed_stale",
   "invalid_market_prices",
   "market_quotes_too_neutral",
   "hard_reject_unstable_pre_spike_context",
