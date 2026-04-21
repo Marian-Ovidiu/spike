@@ -243,13 +243,13 @@ describe("runBacktestReplay", () => {
 });
 
 describe("runBinaryBacktestReplay", () => {
-  it("exposes binary_run_analytics_v1 and marks closed trades as binary execution", () => {
+  it("exposes binary_run_analytics_v2 and marks closed trades as binary execution", () => {
     const prices = Array.from({ length: 45 }, (_, i) => 40_000 + i * 3 + (i > 38 ? 120 : 0));
     const r = runBinaryBacktestReplay(prices, {
       config: defaultAppConfig,
       includeStrictComparison: false,
     });
-    expect(r.binaryRunAnalytics?.schema).toBe("binary_run_analytics_v1");
+    expect(r.binaryRunAnalytics?.schema).toBe("binary_run_analytics_v2");
     expect(r.evaluationNote).toContain("binary");
     for (const t of r.trades) {
       expect(t.executionModel).toBe("binary");

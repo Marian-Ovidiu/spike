@@ -35,6 +35,10 @@ import {
   normalizeEntryReasons,
   type NormalizedRejectionReason,
 } from "./rejectionReasons.js";
+import {
+  formatBinaryYesNoComparativeConsole,
+  type BinaryYesNoComparativeReport,
+} from "./analyze/binaryRunAnalytics.js";
 
 function formatQualityGateDiagSummary(d: QualityGateDiagnostics): string {
   const dd = d.downgradeChain.map((s) => s.reasonCode).join(" → ");
@@ -1149,6 +1153,10 @@ export function printShutdownReport(
     marketFeedDiagnostics?: MarketFeedDiagnostics;
     signalFeedDiagnostics?: MarketFeedDiagnostics;
     binaryQuoteSession?: BinaryQuoteSessionSnapshot;
+    rejectedByPipelineQualityDowngradeLegacy?: number;
+    pipelineQualityDowngradeBreakdown?: Record<string, number>;
+    /** Binary: YES vs NO funnel + trade aggregates (see session `binaryRunAnalytics.yesNoComparative`). */
+    binaryYesNoComparative?: BinaryYesNoComparativeReport;
   }
 ): void {
   const durationMs = Math.max(0, Date.now() - startedAtMs);
@@ -1215,6 +1223,26 @@ export function printShutdownReport(
         const label = REJECTION_REASON_MESSAGES[item.reason as NormalizedRejectionReason] ?? item.reason;
         console.log(`  - ${label}: ${item.count}`);
       }
+    }
+    if (
+      extended.rejectedByPipelineQualityDowngradeLegacy !== undefined &&
+      extended.rejectedByPipelineQualityDowngradeLegacy > 0
+    ) {
+      console.log(
+        `${"Pipe Q rollup".padEnd(14)} ${extended.rejectedByPipelineQualityDowngradeLegacy} rejects (compat bucket = any pipeline_* / legacy pipeline_quality_downgrade)`
+      );
+    }
+    if (
+      extended.pipelineQualityDowngradeBreakdown !== undefined &&
+      Object.keys(extended.pipelineQualityDowngradeBreakdown).length > 0
+    ) {
+      console.log(
+        `${"Pipe Q detail".padEnd(14)} ${JSON.stringify(extended.pipelineQualityDowngradeBreakdown)}`
+      );
+    }
+    if (extended.binaryYesNoComparative !== undefined) {
+      console.log("");
+      console.log(formatBinaryYesNoComparativeConsole(extended.binaryYesNoComparative));
     }
     console.log(`${"Border verdict".padEnd(14)} ${extended.verdict.toUpperCase()}`);
     if (extended.gateFunnel !== undefined) {

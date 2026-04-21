@@ -1,12 +1,67 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { computeBinaryEntryEdge, resolveBinaryVenueAsks } from "../binary/entry/edgeEntryDecision.js";
+import type { EntryDirection } from "../entryConditions.js";
+import type { HoldExitAudit } from "../holdExitAudit.js";
+import type { ExecutableTopOfBook, MarketMode } from "../market/types.js";
 import type { Opportunity } from "../opportunityTracker.js";
 import type { SimulatedTrade } from "../simulationEngine.js";
-import type { MarketMode } from "../market/types.js";
 import type { QualityProfile } from "../preEntryQualityGate.js";
 
-export const BINARY_RUN_ANALYTICS_SCHEMA = "binary_run_analytics_v1" as const;
+export const BINARY_RUN_ANALYTICS_SCHEMA = "binary_run_analytics_v2" as const;
+
+const PRIMARY_REJECTION_REASONS_TOP = 12;
+
+/** Subreasons for `invalid_market_prices` (binary observability). */
+export const INVALID_MARKET_PRICES_SUBREASON_KEYS = [
+  "invalid_yes_no_bounds",
+  "invalid_executable_price",
+  "invalid_crossed_or_inverted_book",
+  "invalid_price_not_finite",
+  "invalid_market_price_extreme_reprice",
+] as const;
+
+export type InvalidMarketPricesSubreasonKey =
+  (typeof INVALID_MARKET_PRICES_SUBREASON_KEYS)[number];
+
+function emptyInvalidMarketPricesSubreasonBreakdown(): Record<
+  InvalidMarketPricesSubreasonKey | "unknown",
+  number
+> {
+  const base: Record<string, number> = { unknown: 0 };
+  for (const k of INVALID_MARKET_PRICES_SUBREASON_KEYS) {
+    base[k] = 0;
+  }
+  return base as Record<InvalidMarketPricesSubreasonKey | "unknown", number>;
+}
+
+function countInvalidMarketPricesSubreasons(
+  opportunities: readonly {
+    marketMode?: string;
+    status?: string;
+    entryRejectionReasons?: readonly string[];
+    invalidMarketPricesAudit?: { subreason?: string };
+  }[]
+): Record<InvalidMarketPricesSubreasonKey | "unknown", number> {
+  const out = emptyInvalidMarketPricesSubreasonBreakdown();
+  for (const o of opportunities) {
+    if (o.marketMode !== "binary") continue;
+    if (o.status !== "rejected") continue;
+    const reasons = o.entryRejectionReasons ?? [];
+    if (!reasons.includes("invalid_market_prices")) continue;
+    const sub = o.invalidMarketPricesAudit?.subreason;
+    if (
+      sub !== undefined &&
+      (INVALID_MARKET_PRICES_SUBREASON_KEYS as readonly string[]).includes(sub)
+    ) {
+      out[sub as InvalidMarketPricesSubreasonKey] += 1;
+    } else {
+      out.unknown += 1;
+    }
+  }
+  return out;
+}
 
 /** Model edge at entry: P(side) minus venue ask on bought leg (same units as MIN_EDGE_THRESHOLD). */
 export type EdgeBucketLabel = "<0.01" | "0.01-0.03" | "0.03-0.05" | ">0.05" | "unknown";
@@ -47,6 +102,363 @@ export type TradeOutcomeBreakdown = {
   };
 };
 
+/** Per bought-outcome leg: full-funnel observability (binary sessions). */
+export type BinaryYesNoSideMetrics = {
+  opportunitiesSeen: number;
+  opportunitiesRejected: number;
+  validOpportunities: number;
+  /** Primary blockers on rejected rows (`entryRejectionPrimaryBlocker`), sorted by count desc. */
+  primaryRejectionReasons: Array<{ reason: string; count: number }>;
+  /**
+   * Closed paper trades on this leg (`sideBought` / JSONL `outcomeTokenBought`).
+   * In the current engine each open is closed in-session, so this matches per-leg “opens”.
+   */
+  tradesClosed: number;
+  winRatePercent: number;
+  pnlTotal: number;
+  avgPnlPerTrade: number;
+  /**
+   * Mean model edge at opportunity observation (same geometry as simulator:
+   * {@link computeBinaryEntryEdge} + {@link resolveBinaryVenueAsks}).
+   */
+  avgOpportunityModelEdge: number | null;
+  /** Mean `entryModelEdge` on closed trades for this leg. */
+  avgTradeEntryModelEdge: number | null;
+  /** Mean executable ask on the bought leg at opportunity tick. */
+  avgOpportunityEntryAsk: number | null;
+  /** Mean entry fill / outcome price on closed trades. */
+  avgTradeEntryPrice: number | null;
+  avgMfe: number | null;
+  avgMae: number | null;
+  avgHoldMs: number | null;
+};
+
+export type BinaryYesNoComparativeReport = {
+  YES: BinaryYesNoSideMetrics;
+  NO: BinaryYesNoSideMetrics;
+  /** Rows missing YES/NO attribution (e.g. legacy JSONL or unset contrarian). */
+  outcomeSideUnknown: BinaryYesNoSideMetrics;
+};
+
+type YesNoOppLike = {
+  marketMode?: string;
+  status?: string;
+  entryOutcomeSide?: "YES" | "NO" | null;
+  entryRejectionPrimaryBlocker?: string | null;
+  estimatedProbabilityUp?: number;
+  yesPrice?: number;
+  noPrice?: number;
+  bestBid?: number;
+  bestAsk?: number;
+  midPrice?: number;
+  spreadBps?: number;
+};
+
+type YesNoTradeLike = {
+  executionModel?: string;
+  marketMode?: string;
+  sideBought?: "YES" | "NO";
+  outcomeTokenBought?: string | null;
+  profitLoss?: number;
+  netPnlUsdt?: number;
+  entryModelEdge?: number | null;
+  entryPrice?: number;
+  entryOutcomePrice?: number;
+  holdExitAudit?: HoldExitAudit;
+  openedAt?: number;
+  closedAt?: number;
+  openedAtMs?: number;
+  closedAtMs?: number;
+  holdDurationMs?: number;
+};
+
+type YesNoAcc = {
+  opportunitiesSeen: number;
+  opportunitiesRejected: number;
+  validOpportunities: number;
+  primaryReasons: Map<string, number>;
+  oppEdgeSum: number;
+  oppEdgeN: number;
+  oppAskSum: number;
+  oppAskN: number;
+  tradesClosed: number;
+  wins: number;
+  pnlSum: number;
+  tradeEdgeSum: number;
+  tradeEdgeN: number;
+  tradeEntryPxSum: number;
+  tradeEntryPxN: number;
+  mfeSum: number;
+  mfeN: number;
+  maeSum: number;
+  maeN: number;
+  holdMsSum: number;
+  holdMsN: number;
+};
+
+function emptyYesNoAcc(): YesNoAcc {
+  return {
+    opportunitiesSeen: 0,
+    opportunitiesRejected: 0,
+    validOpportunities: 0,
+    primaryReasons: new Map(),
+    oppEdgeSum: 0,
+    oppEdgeN: 0,
+    oppAskSum: 0,
+    oppAskN: 0,
+    tradesClosed: 0,
+    wins: 0,
+    pnlSum: 0,
+    tradeEdgeSum: 0,
+    tradeEdgeN: 0,
+    tradeEntryPxSum: 0,
+    tradeEntryPxN: 0,
+    mfeSum: 0,
+    mfeN: 0,
+    maeSum: 0,
+    maeN: 0,
+    holdMsSum: 0,
+    holdMsN: 0,
+  };
+}
+
+function directionFromOutcomeSide(side: "YES" | "NO"): EntryDirection {
+  return side === "YES" ? "UP" : "DOWN";
+}
+
+function executableBookFromOppLike(o: YesNoOppLike): ExecutableTopOfBook | null {
+  const { bestBid, bestAsk, midPrice, spreadBps } = o;
+  if (
+    bestBid === undefined ||
+    bestAsk === undefined ||
+    midPrice === undefined ||
+    spreadBps === undefined
+  ) {
+    return null;
+  }
+  if (
+    !Number.isFinite(bestBid) ||
+    !Number.isFinite(bestAsk) ||
+    !Number.isFinite(midPrice) ||
+    !Number.isFinite(spreadBps)
+  ) {
+    return null;
+  }
+  return { bestBid, bestAsk, midPrice, spreadBps };
+}
+
+function tryOpportunityModelEdgeAndAsk(o: YesNoOppLike): {
+  edge: number;
+  askOnLeg: number;
+} | null {
+  if (o.marketMode !== "binary") return null;
+  if (o.entryOutcomeSide !== "YES" && o.entryOutcomeSide !== "NO") return null;
+  if (o.estimatedProbabilityUp === undefined || !Number.isFinite(o.estimatedProbabilityUp)) {
+    return null;
+  }
+  if (o.yesPrice === undefined || o.noPrice === undefined) return null;
+  if (!Number.isFinite(o.yesPrice) || !Number.isFinite(o.noPrice)) return null;
+  const book = executableBookFromOppLike(o);
+  if (book === null) return null;
+  const asks = resolveBinaryVenueAsks({
+    executionBook: book,
+    yesMid: o.yesPrice,
+    noMid: o.noPrice,
+  });
+  const edge = computeBinaryEntryEdge({
+    estimatedProbabilityUp: o.estimatedProbabilityUp,
+    direction: directionFromOutcomeSide(o.entryOutcomeSide),
+    yesAsk: asks.yesAsk,
+    noAsk: asks.noAsk,
+  });
+  if (!Number.isFinite(edge)) return null;
+  const askOnLeg = o.entryOutcomeSide === "YES" ? asks.yesAsk : asks.noAsk;
+  if (!Number.isFinite(askOnLeg)) return null;
+  return { edge, askOnLeg };
+}
+
+function outcomeSideBucketFromOpportunity(o: YesNoOppLike): "YES" | "NO" | "unknown" {
+  if (o.marketMode !== "binary") return "unknown";
+  if (o.entryOutcomeSide === "YES" || o.entryOutcomeSide === "NO") {
+    return o.entryOutcomeSide;
+  }
+  return "unknown";
+}
+
+function bumpPrimaryReason(acc: YesNoAcc, reason: string | null | undefined): void {
+  if (reason === null || reason === undefined || reason.length === 0) return;
+  acc.primaryReasons.set(reason, (acc.primaryReasons.get(reason) ?? 0) + 1);
+}
+
+function accumulateOpportunityForYesNo(
+  o: YesNoOppLike,
+  byYes: YesNoAcc,
+  byNo: YesNoAcc,
+  byUnk: YesNoAcc
+): void {
+  if (o.marketMode !== "binary") return;
+  const bucket = outcomeSideBucketFromOpportunity(o);
+  const acc = bucket === "YES" ? byYes : bucket === "NO" ? byNo : byUnk;
+  acc.opportunitiesSeen += 1;
+  if (o.status === "rejected") {
+    acc.opportunitiesRejected += 1;
+    bumpPrimaryReason(acc, o.entryRejectionPrimaryBlocker ?? null);
+  } else if (o.status === "valid") {
+    acc.validOpportunities += 1;
+  }
+  const econ = tryOpportunityModelEdgeAndAsk(o);
+  if (econ !== null) {
+    acc.oppEdgeSum += econ.edge;
+    acc.oppEdgeN += 1;
+    acc.oppAskSum += econ.askOnLeg;
+    acc.oppAskN += 1;
+  }
+}
+
+function mfeMaeFromHoldAudit(a: HoldExitAudit | undefined): { mfe: number; mae: number } | null {
+  if (a === undefined) return null;
+  if (a.binaryPriceSide !== undefined) {
+    const mfe = a.binaryPriceSide.maxFavorableExcursionPoints;
+    const mae = a.binaryPriceSide.maxAdverseExcursionPoints;
+    if (Number.isFinite(mfe) && Number.isFinite(mae)) return { mfe, mae };
+  }
+  if (Number.isFinite(a.maxFavorableExcursion) && Number.isFinite(a.maxAdverseExcursion)) {
+    return { mfe: a.maxFavorableExcursion, mae: a.maxAdverseExcursion };
+  }
+  return null;
+}
+
+function isBinaryTradeLike(t: YesNoTradeLike): boolean {
+  return t.executionModel === "binary" || t.marketMode === "binary";
+}
+
+function tradePnlUsdt(t: YesNoTradeLike): number {
+  if (t.profitLoss !== undefined && Number.isFinite(t.profitLoss)) return t.profitLoss;
+  const n = Number(t.netPnlUsdt);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function tradeOutcomeSide(t: YesNoTradeLike): "YES" | "NO" | "unknown" {
+  const raw = t.sideBought ?? t.outcomeTokenBought ?? null;
+  if (raw === "YES" || raw === "NO") return raw;
+  return "unknown";
+}
+
+function tradeHoldMs(t: YesNoTradeLike): number | null {
+  if (t.holdDurationMs !== undefined && Number.isFinite(t.holdDurationMs)) {
+    return t.holdDurationMs;
+  }
+  const o0 = t.openedAt ?? t.openedAtMs;
+  const c0 = t.closedAt ?? t.closedAtMs;
+  if (
+    o0 !== undefined &&
+    c0 !== undefined &&
+    Number.isFinite(o0) &&
+    Number.isFinite(c0)
+  ) {
+    return c0 - o0;
+  }
+  return null;
+}
+
+function tradeEntryPrice(t: YesNoTradeLike): number | null {
+  const px =
+    t.entryPrice !== undefined && Number.isFinite(t.entryPrice)
+      ? t.entryPrice
+      : t.entryOutcomePrice;
+  if (px !== undefined && Number.isFinite(px)) return px;
+  return null;
+}
+
+function accumulateTradeForYesNo(
+  t: YesNoTradeLike,
+  byYes: YesNoAcc,
+  byNo: YesNoAcc,
+  byUnk: YesNoAcc
+): void {
+  if (!isBinaryTradeLike(t)) return;
+  const side = tradeOutcomeSide(t);
+  const acc = side === "YES" ? byYes : side === "NO" ? byNo : byUnk;
+  const pnl = tradePnlUsdt(t);
+  acc.tradesClosed += 1;
+  acc.pnlSum += pnl;
+  if (pnl > 0) acc.wins += 1;
+
+  if (t.entryModelEdge !== undefined && t.entryModelEdge !== null && Number.isFinite(t.entryModelEdge)) {
+    acc.tradeEdgeSum += t.entryModelEdge;
+    acc.tradeEdgeN += 1;
+  }
+  const entryPx = tradeEntryPrice(t);
+  if (entryPx !== null) {
+    acc.tradeEntryPxSum += entryPx;
+    acc.tradeEntryPxN += 1;
+  }
+  const mm = mfeMaeFromHoldAudit(t.holdExitAudit);
+  if (mm !== null) {
+    acc.mfeSum += mm.mfe;
+    acc.mfeN += 1;
+    acc.maeSum += mm.mae;
+    acc.maeN += 1;
+  }
+  const hold = tradeHoldMs(t);
+  if (hold !== null && Number.isFinite(hold) && hold >= 0) {
+    acc.holdMsSum += hold;
+    acc.holdMsN += 1;
+  }
+}
+
+function finalizeYesNoAcc(acc: YesNoAcc): BinaryYesNoSideMetrics {
+  const primaryRejectionReasons = [...acc.primaryReasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, PRIMARY_REJECTION_REASONS_TOP)
+    .map(([reason, count]) => ({ reason, count }));
+
+  const nTr = acc.tradesClosed;
+  const winRatePercent = nTr > 0 ? (acc.wins / nTr) * 100 : 0;
+  const avgPnlPerTrade = nTr > 0 ? acc.pnlSum / nTr : 0;
+
+  return {
+    opportunitiesSeen: acc.opportunitiesSeen,
+    opportunitiesRejected: acc.opportunitiesRejected,
+    validOpportunities: acc.validOpportunities,
+    primaryRejectionReasons,
+    tradesClosed: nTr,
+    winRatePercent,
+    pnlTotal: acc.pnlSum,
+    avgPnlPerTrade,
+    avgOpportunityModelEdge:
+      acc.oppEdgeN > 0 ? acc.oppEdgeSum / acc.oppEdgeN : null,
+    avgTradeEntryModelEdge:
+      acc.tradeEdgeN > 0 ? acc.tradeEdgeSum / acc.tradeEdgeN : null,
+    avgOpportunityEntryAsk: acc.oppAskN > 0 ? acc.oppAskSum / acc.oppAskN : null,
+    avgTradeEntryPrice:
+      acc.tradeEntryPxN > 0 ? acc.tradeEntryPxSum / acc.tradeEntryPxN : null,
+    avgMfe: acc.mfeN > 0 ? acc.mfeSum / acc.mfeN : null,
+    avgMae: acc.maeN > 0 ? acc.maeSum / acc.maeN : null,
+    avgHoldMs: acc.holdMsN > 0 ? acc.holdMsSum / acc.holdMsN : null,
+  };
+}
+
+export function computeBinaryYesNoComparative(input: {
+  opportunities: readonly YesNoOppLike[];
+  trades: readonly YesNoTradeLike[];
+}): BinaryYesNoComparativeReport {
+  const y = emptyYesNoAcc();
+  const n = emptyYesNoAcc();
+  const u = emptyYesNoAcc();
+  for (const o of input.opportunities) {
+    accumulateOpportunityForYesNo(o, y, n, u);
+  }
+  for (const t of input.trades) {
+    accumulateTradeForYesNo(t, y, n, u);
+  }
+  return {
+    YES: finalizeYesNoAcc(y),
+    NO: finalizeYesNoAcc(n),
+    outcomeSideUnknown: finalizeYesNoAcc(u),
+  };
+}
+
 export type BinaryRunAnalyticsReport = {
   schema: typeof BINARY_RUN_ANALYTICS_SCHEMA;
   opportunitiesTotal: number;
@@ -62,6 +474,16 @@ export type BinaryRunAnalyticsReport = {
   qualityBucketBreakdown: Record<string, number>;
   borderlineFunnelBreakdown: BorderlineFunnelBreakdown;
   tradeOutcomeBreakdown: TradeOutcomeBreakdown;
+  /**
+   * Binary-only: rejected opportunities whose normalized reasons include
+   * `invalid_market_prices`, split by {@link InvalidMarketPricesSubreasonKey}.
+   */
+  invalidMarketPricesSubreasonBreakdown: Record<
+    InvalidMarketPricesSubreasonKey | "unknown",
+    number
+  >;
+  /** YES vs NO: funnel (opportunities) + closed paper trade stats side-by-side. */
+  yesNoComparative: BinaryYesNoComparativeReport;
 };
 
 function emptyTradeOutcomeBreakdown(): TradeOutcomeBreakdown {
@@ -187,6 +609,14 @@ export function computeBinaryRunAnalytics(input: {
     borderlineRejectedWeak: 0,
   };
 
+  const invalidMarketPricesSubreasonBreakdown =
+    countInvalidMarketPricesSubreasons(opps);
+
+  const yesNoComparative = computeBinaryYesNoComparative({
+    opportunities: opps,
+    trades: binaryTrades,
+  });
+
   return {
     schema: BINARY_RUN_ANALYTICS_SCHEMA,
     opportunitiesTotal,
@@ -202,6 +632,8 @@ export function computeBinaryRunAnalytics(input: {
     qualityBucketBreakdown,
     borderlineFunnelBreakdown,
     tradeOutcomeBreakdown: tradeOutcome,
+    invalidMarketPricesSubreasonBreakdown,
+    yesNoComparative,
   };
 }
 
@@ -211,6 +643,17 @@ export type OpportunityJsonlRow = {
   qualityProfile?: string;
   status?: string;
   marketMode?: string;
+  entryRejectionReasons?: readonly string[];
+  invalidMarketPricesAudit?: { subreason?: string };
+  entryOutcomeSide?: "YES" | "NO" | null;
+  entryRejectionPrimaryBlocker?: string | null;
+  estimatedProbabilityUp?: number;
+  yesPrice?: number;
+  noPrice?: number;
+  bestBid?: number;
+  bestAsk?: number;
+  midPrice?: number;
+  spreadBps?: number;
 };
 
 export type BinaryTradeJsonlRow = {
@@ -220,6 +663,11 @@ export type BinaryTradeJsonlRow = {
   outcomeTokenBought?: string | null;
   entryQualityProfile?: QualityProfile | string;
   entryModelEdge?: number | null;
+  entryOutcomePrice?: number;
+  openedAtMs?: number;
+  closedAtMs?: number;
+  holdDurationMs?: number;
+  holdExitAudit?: HoldExitAudit;
 };
 
 export function computeBinaryRunAnalyticsFromJsonlRows(input: {
@@ -291,6 +739,14 @@ export function computeBinaryRunAnalyticsFromJsonlRows(input: {
   const avgPnlPerTrade = closedTrades > 0 ? pnlTotal / closedTrades : 0;
   const timeoutRate = closedTrades > 0 ? (timeouts / closedTrades) * 100 : 0;
 
+  const invalidMarketPricesSubreasonBreakdown =
+    countInvalidMarketPricesSubreasons(input.opportunityRows);
+
+  const yesNoComparative = computeBinaryYesNoComparative({
+    opportunities: input.opportunityRows,
+    trades: binaryTrades,
+  });
+
   return {
     schema: BINARY_RUN_ANALYTICS_SCHEMA,
     opportunitiesTotal,
@@ -311,6 +767,8 @@ export function computeBinaryRunAnalyticsFromJsonlRows(input: {
       borderlineRejectedWeak: 0,
     },
     tradeOutcomeBreakdown: tradeOutcome,
+    invalidMarketPricesSubreasonBreakdown,
+    yesNoComparative,
   };
 }
 
@@ -389,6 +847,52 @@ export function analyzeRunDirectory(dir: string): BinaryRunAnalyticsReport {
   });
 }
 
+function fmtNumOrDash(n: number | null, digits: number): string {
+  if (n === null || !Number.isFinite(n)) return "—";
+  return n.toFixed(digits);
+}
+
+/** Multi-line block for shutdown console + analyze-run text output. */
+export function formatBinaryYesNoComparativeConsole(
+  y: BinaryYesNoComparativeReport
+): string {
+  const lines: string[] = [
+    "──────── Binary — YES vs NO (funnel + closed trades) ────────",
+  ];
+  const blocks: Array<{ title: string; b: BinaryYesNoSideMetrics }> = [
+    { title: "YES (bought leg)", b: y.YES },
+    { title: "NO (bought leg)", b: y.NO },
+    { title: "Side unknown (missing entryOutcomeSide / token)", b: y.outcomeSideUnknown },
+  ];
+  for (const { title, b } of blocks) {
+    lines.push(`${title}:`);
+    lines.push(
+      `  opportunities: seen=${b.opportunitiesSeen} rejected=${b.opportunitiesRejected} valid=${b.validOpportunities}`
+    );
+    lines.push(
+      `  trades closed: ${b.tradesClosed}  winRate=${b.winRatePercent.toFixed(1)}%  pnl=${b.pnlTotal.toFixed(4)} USDT  avgPnl/trade=${b.avgPnlPerTrade.toFixed(4)}`
+    );
+    lines.push(
+      `  avg opp model edge: ${fmtNumOrDash(b.avgOpportunityModelEdge, 4)}  avg trade entry edge: ${fmtNumOrDash(b.avgTradeEntryModelEdge, 4)}`
+    );
+    lines.push(
+      `  avg opp entry ask (leg): ${fmtNumOrDash(b.avgOpportunityEntryAsk, 4)}  avg trade entry price: ${fmtNumOrDash(b.avgTradeEntryPrice, 4)}`
+    );
+    lines.push(
+      `  avg MFE: ${fmtNumOrDash(b.avgMfe, 6)}  avg MAE: ${fmtNumOrDash(b.avgMae, 6)}  avg hold: ${fmtNumOrDash(b.avgHoldMs, 0)} ms`
+    );
+    if (b.primaryRejectionReasons.length > 0) {
+      lines.push(
+        `  primary rejection blockers: ${b.primaryRejectionReasons.map((p) => `${p.reason}×${p.count}`).join(" | ")}`
+      );
+    } else if (b.opportunitiesRejected > 0) {
+      lines.push(`  primary rejection blockers: (none recorded — add entryRejectionPrimaryBlocker to JSONL)`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
 export function formatBinaryRunAnalyticsConsole(
   dir: string,
   report: BinaryRunAnalyticsReport
@@ -436,6 +940,10 @@ export function formatBinaryRunAnalyticsConsole(
     `  Timeout: ${report.tradeOutcomeBreakdown.byExit.timeout}`,
     `  Unknown: ${report.tradeOutcomeBreakdown.byExit.unknown}`,
     "",
+    `Invalid market prices (binary rejected opps) by subreason:`,
+    `  ${JSON.stringify(report.invalidMarketPricesSubreasonBreakdown)}`,
+    "",
+    formatBinaryYesNoComparativeConsole(report.yesNoComparative),
   ];
   return lines.join("\n");
 }

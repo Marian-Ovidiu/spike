@@ -208,6 +208,21 @@ function gracefulShutdown(): void {
     strategyApprovedEntryTicks: runtimeStats.validOpportunities,
   });
   const exitThresholdAudit = aggregateHoldExitAudits(simulation.getTradeHistory());
+  const binaryRunAnalytics =
+    config.marketMode === "binary"
+      ? computeBinaryRunAnalytics({
+          marketMode: config.marketMode,
+          opportunities: ctx.opportunityTracker.getOpportunities(),
+          trades: simulation.getTradeHistory(),
+          openedTradesOverride: runtimeStats.tradesExecuted,
+          borderlineFunnel: {
+            borderlineEntered: runtimeStats.borderlineEntered,
+            borderlinePromoted: runtimeStats.borderlinePromoted,
+            borderlineRejectedTimeout: runtimeStats.borderlineRejectedTimeout,
+            borderlineRejectedWeak: runtimeStats.borderlineRejectedWeak,
+          },
+        })
+      : null;
   printShutdownReport(
     monitorStartedAtMs,
     {
@@ -249,6 +264,9 @@ function gracefulShutdown(): void {
               signalFeed
             ),
             binaryQuoteSession: binaryQuoteSessionStats.snapshot(),
+            ...(binaryRunAnalytics !== null
+              ? { binaryYesNoComparative: binaryRunAnalytics.yesNoComparative }
+              : {}),
           }
         : {}),
     }
@@ -271,21 +289,6 @@ function gracefulShutdown(): void {
 
   const endedAt = Date.now();
   logReportCounterConsistency(runtimeStats);
-  const binaryRunAnalytics =
-    config.marketMode === "binary"
-      ? computeBinaryRunAnalytics({
-          marketMode: config.marketMode,
-          opportunities: ctx.opportunityTracker.getOpportunities(),
-          trades: simulation.getTradeHistory(),
-          openedTradesOverride: runtimeStats.tradesExecuted,
-          borderlineFunnel: {
-            borderlineEntered: runtimeStats.borderlineEntered,
-            borderlinePromoted: runtimeStats.borderlinePromoted,
-            borderlineRejectedTimeout: runtimeStats.borderlineRejectedTimeout,
-            borderlineRejectedWeak: runtimeStats.borderlineRejectedWeak,
-          },
-        })
-      : null;
   try {
     persistence.writeSessionSummary(
       buildMonitorSessionSummary({
@@ -356,6 +359,10 @@ function gracefulShutdown(): void {
           qualityStrong: runtimeStats.qualityStrong,
           qualityExceptional: runtimeStats.qualityExceptional,
           topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
+          rejectedByPipelineQualityDowngradeLegacy:
+            runtimeStats.rejectedByPipelineQualityDowngradeLegacy,
+          pipelineQualityDowngradeBreakdown:
+            runtimeStats.getPipelineQualityDowngradeBreakdown(),
           interpretation: buildInterpretationLines(),
           gateFunnel,
           testMode: config.testMode,

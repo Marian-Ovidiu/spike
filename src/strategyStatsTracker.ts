@@ -1,5 +1,9 @@
 import type { StrategyTickResult } from "./botLoop.js";
 import type { Opportunity } from "./opportunityTracker.js";
+import {
+  opportunityHasLegacyPipelineQualityDowngrade,
+  PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS,
+} from "./decisionReasonBuilder.js";
 import type { BorderlineLifecycleRenderEvent } from "./strategy/strategyDecisionPipeline.js";
 
 const BORDERLINE_TIMEOUT_EXPIRE_REASONS = new Set([
@@ -86,6 +90,9 @@ export class StrategyStatsTracker {
   borderlineRejectedTimeout = 0;
   borderlineRejectedWeak = 0;
 
+  /** Rejected opportunities touching any legacy pipeline downgrade bucket (rollup). */
+  rejectedByPipelineQualityDowngradeLegacy = 0;
+
   borderlineTradesClosed = 0;
   borderlineWins = 0;
   borderlineLosses = 0;
@@ -98,6 +105,7 @@ export class StrategyStatsTracker {
   qualityStrong = 0;
   qualityExceptional = 0;
   private readonly rejectionReasonCounts = new Map<string, number>();
+  private readonly pipelineQualityDowngradeDetailCounts = new Map<string, number>();
 
   observeTick(tick: StrategyTickResult): void {
     this.ticksObserved += 1;
@@ -209,6 +217,24 @@ export class StrategyStatsTracker {
       if (reasons.has("borderline_cancelled_continuation")) {
         this.rejectedByBorderlineContinuation += 1;
       }
+      if (opportunityHasLegacyPipelineQualityDowngrade([...reasons])) {
+        this.rejectedByPipelineQualityDowngradeLegacy += 1;
+      }
+      for (const d of PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS) {
+        if (reasons.has(d)) {
+          this.pipelineQualityDowngradeDetailCounts.set(
+            d,
+            (this.pipelineQualityDowngradeDetailCounts.get(d) ?? 0) + 1
+          );
+        }
+      }
+      if (reasons.has("pipeline_quality_downgrade")) {
+        const k = "pipeline_quality_downgrade";
+        this.pipelineQualityDowngradeDetailCounts.set(
+          k,
+          (this.pipelineQualityDowngradeDetailCounts.get(k) ?? 0) + 1
+        );
+      }
     }
     if (recorded.qualityProfile === "exceptional") this.qualityExceptional += 1;
     else if (recorded.qualityProfile === "strong") this.qualityStrong += 1;
@@ -220,6 +246,20 @@ export class StrategyStatsTracker {
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit))
       .map(([reason, count]) => ({ reason, count }));
+  }
+
+  /**
+   * Per-reason counts for pipeline downgrade detail codes + legacy
+   * `pipeline_quality_downgrade` token (strong-spike rejected rows only).
+   */
+  getPipelineQualityDowngradeBreakdown(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const d of PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS) {
+      out[d] = this.pipelineQualityDowngradeDetailCounts.get(d) ?? 0;
+    }
+    out.pipeline_quality_downgrade =
+      this.pipelineQualityDowngradeDetailCounts.get("pipeline_quality_downgrade") ?? 0;
+    return out;
   }
 
   // Backward-compatible aliases used by previous runtime summaries/tests.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   normalizeDecisionRejectionReasons,
   normalizeOpportunityRejectionReasons,
+  pickPrimaryRejectionBlocker,
 } from "./rejectionReasons.js";
 import type { StrategyDecision } from "./strategy/strategyDecisionPipeline.js";
 
@@ -36,13 +37,13 @@ describe("normalizeOpportunityRejectionReasons", () => {
     ).toEqual(["model_edge_below_min_threshold"]);
   });
 
-  it("maps delayed confirmation and pipeline watch strings to pipeline_quality_downgrade", () => {
+  it("maps pipeline watch / quality strings to explicit pipeline_* codes", () => {
     expect(
       normalizeOpportunityRejectionReasons({
         rawReasons: ["quality_gate_requires_delayed_confirmation"],
         movementClassification: "strong_spike",
       })
-    ).toEqual(["pipeline_quality_downgrade"]);
+    ).toEqual(["pipeline_delayed_confirmation_failed"]);
     expect(
       normalizeOpportunityRejectionReasons({
         rawReasons: [
@@ -50,19 +51,43 @@ describe("normalizeOpportunityRejectionReasons", () => {
         ],
         movementClassification: "strong_spike",
       })
-    ).toEqual(["pipeline_quality_downgrade"]);
+    ).toEqual(["pipeline_profile_weak"]);
     expect(
       normalizeOpportunityRejectionReasons({
         rawReasons: ["strong_spike_confirmation_noisy_unclear"],
         movementClassification: "strong_spike",
       })
-    ).toEqual(["pipeline_quality_downgrade"]);
+    ).toEqual(["pipeline_confirmation_noise"]);
     expect(
       normalizeOpportunityRejectionReasons({
         rawReasons: ["strong_spike_confirmation_tick_pending_review"],
         movementClassification: "strong_spike",
       })
+    ).toEqual(["pipeline_confirmation_noise"]);
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["strong_spike_waiting_confirmation_tick"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_watch_path_blocked"]);
+  });
+
+  it("keeps legacy pipeline_quality_downgrade token when already normalized", () => {
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["pipeline_quality_downgrade"],
+        movementClassification: "strong_spike",
+      })
     ).toEqual(["pipeline_quality_downgrade"]);
+  });
+
+  it("maps strong_spike_confirmation_invalid_market_prices to coupled pipeline code", () => {
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["strong_spike_confirmation_invalid_market_prices"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_invalid_market_coupled_downgrade"]);
   });
 
   it("keeps strong_spike continuation distinct from other strong_spike_confirmation_* codes", () => {
@@ -212,5 +237,44 @@ describe("normalizeDecisionRejectionReasons", () => {
     });
     expect(reasons).toEqual(["opposite_side_price_too_high"]);
   });
+
+  it("adds pipeline_invalid_market_coupled_downgrade when invalid prices meet confirmation modifier", () => {
+    const reasons = normalizeDecisionRejectionReasons({
+      decision: baseDecision({
+        movementClassification: "strong_spike",
+        spikeDetected: true,
+        criticalBlockerUsed: "invalid_market_prices",
+        reason: "invalid_market_prices",
+        pipelineQualityModifier: {
+          effectiveQualityProfile: "weak",
+          reason: "strong_spike_confirmation_invalid_market_prices",
+          preModifierGateProfile: "strong",
+        },
+      }),
+      entry: { movementClassification: "strong_spike", reasons: [] },
+    });
+    expect(reasons).toContain("invalid_market_prices");
+    expect(reasons).toContain("pipeline_invalid_market_coupled_downgrade");
+  });
 });
 
+describe("pickPrimaryRejectionBlocker", () => {
+  it("prefers invalid_market_prices over pipeline detail when both are present", () => {
+    expect(
+      pickPrimaryRejectionBlocker([
+        "pipeline_watch_path_blocked",
+        "invalid_market_prices",
+        "pipeline_confirmation_noise",
+      ])
+    ).toBe("invalid_market_prices");
+  });
+
+  it("orders pipeline sub-causes: coupled invalid market before profile weak", () => {
+    expect(
+      pickPrimaryRejectionBlocker([
+        "pipeline_profile_weak",
+        "pipeline_invalid_market_coupled_downgrade",
+      ])
+    ).toBe("pipeline_invalid_market_coupled_downgrade");
+  });
+});

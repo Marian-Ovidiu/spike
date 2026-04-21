@@ -22,7 +22,96 @@ export type NormalizedRejectionReason =
   | "missing_binary_quotes"
   | "negative_or_zero_model_edge"
   | "model_edge_below_min_threshold"
-  | "pipeline_quality_downgrade";
+  /**
+   * Legacy / rollup bucket — still emitted when raw string is already
+   * `pipeline_quality_downgrade`, and used for backward-compatible totals.
+   */
+  | "pipeline_quality_downgrade"
+  /** Strong-spike path: borderline mode off and gate profile is not strong/exceptional. */
+  | "pipeline_profile_weak"
+  /** Strong-spike path: acceptable profile requires delayed confirmation. */
+  | "pipeline_delayed_confirmation_failed"
+  /** Strong-spike confirmation tick classified as noisy / unclear. */
+  | "pipeline_confirmation_noise"
+  /** Strong-spike waiting for confirmation watch tick (non-exceptional profile). */
+  | "pipeline_watch_path_blocked"
+  /** Strong-spike confirm failed with invalid book/spread while invalid prices also apply. */
+  | "pipeline_invalid_market_coupled_downgrade";
+
+/** Sub-categories that replace the generic `pipeline_quality_downgrade` macro-reason. */
+export const PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS = [
+  "pipeline_profile_weak",
+  "pipeline_delayed_confirmation_failed",
+  "pipeline_confirmation_noise",
+  "pipeline_watch_path_blocked",
+  "pipeline_invalid_market_coupled_downgrade",
+] as const;
+
+export type PipelineQualityDowngradeDetailReason =
+  (typeof PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS)[number];
+
+const DETAIL_SET: ReadonlySet<string> = new Set(PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS);
+
+export function isPipelineQualityDowngradeDetail(
+  r: string
+): r is PipelineQualityDowngradeDetailReason {
+  return DETAIL_SET.has(r);
+}
+
+/**
+ * True when an opportunity row should count toward the legacy
+ * `pipeline_quality_downgrade` funnel / rollup (any explicit detail or legacy token).
+ */
+export function opportunityHasLegacyPipelineQualityDowngrade(
+  reasons: readonly string[]
+): boolean {
+  if (reasons.includes("pipeline_quality_downgrade")) return true;
+  for (const d of PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS) {
+    if (reasons.includes(d)) return true;
+  }
+  return false;
+}
+
+/**
+ * First matching reason wins (same semantics as strong-spike gate funnel).
+ * Exported for session summary + opportunity primary blocker.
+ */
+export const PRIMARY_REJECTION_BLOCKER_PRIORITY: readonly NormalizedRejectionReason[] = [
+  "missing_quote_data",
+  "missing_binary_quotes",
+  "quote_feed_stale",
+  "invalid_market_prices",
+  "market_quotes_too_neutral",
+  "hard_reject_unstable_pre_spike_context",
+  "prior_range_too_wide_for_mean_reversion",
+  "pre_spike_range_too_noisy",
+  "pipeline_invalid_market_coupled_downgrade",
+  "pipeline_profile_weak",
+  "pipeline_delayed_confirmation_failed",
+  "pipeline_confirmation_noise",
+  "pipeline_watch_path_blocked",
+  "pipeline_quality_downgrade",
+  "negative_or_zero_model_edge",
+  "model_edge_below_min_threshold",
+  "quality_gate_rejected",
+  "opposite_side_price_too_high",
+  "entry_side_price_too_high",
+  "entry_cooldown_active",
+  "active_position_open",
+  "strong_spike_continuation",
+  "borderline_cancelled_continuation",
+  "borderline_watch_pending",
+  "no_signal_below_borderline",
+];
+
+export function pickPrimaryRejectionBlocker(
+  reasons: readonly NormalizedRejectionReason[]
+): NormalizedRejectionReason | null {
+  for (const p of PRIMARY_REJECTION_BLOCKER_PRIORITY) {
+    if (reasons.includes(p)) return p;
+  }
+  return reasons.length > 0 ? reasons[0]! : null;
+}
 
 const ORDER: readonly NormalizedRejectionReason[] = [
   "missing_quote_data",
@@ -32,6 +121,11 @@ const ORDER: readonly NormalizedRejectionReason[] = [
   "hard_reject_unstable_pre_spike_context",
   "prior_range_too_wide_for_mean_reversion",
   "pre_spike_range_too_noisy",
+  "pipeline_invalid_market_coupled_downgrade",
+  "pipeline_profile_weak",
+  "pipeline_delayed_confirmation_failed",
+  "pipeline_confirmation_noise",
+  "pipeline_watch_path_blocked",
   "pipeline_quality_downgrade",
   "quality_gate_rejected",
   "borderline_cancelled_continuation",
@@ -74,7 +168,17 @@ export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string
   model_edge_below_min_threshold:
     "binary paper: model edge does not exceed MIN_EDGE_THRESHOLD",
   pipeline_quality_downgrade:
-    "pipeline: quality/watch path blocked entry (profile, delayed confirm, or confirm noise)",
+    "pipeline: quality/watch path blocked entry (legacy rollup)",
+  pipeline_profile_weak:
+    "pipeline: strong spike blocked — quality profile not strong/exceptional (borderline mode off)",
+  pipeline_delayed_confirmation_failed:
+    "pipeline: acceptable quality requires delayed confirmation (not satisfied)",
+  pipeline_confirmation_noise:
+    "pipeline: strong-spike confirmation tick noisy/unclear",
+  pipeline_watch_path_blocked:
+    "pipeline: strong spike waiting for confirmation watch (non-exceptional profile)",
+  pipeline_invalid_market_coupled_downgrade:
+    "pipeline: invalid execution book/spread during strong-spike confirmation",
 };
 
 function dedupeAndOrder(
@@ -89,6 +193,7 @@ const SUPERSEDES_GENERIC_QUALITY_GATE: ReadonlySet<NormalizedRejectionReason> = 
   "hard_reject_unstable_pre_spike_context",
   "prior_range_too_wide_for_mean_reversion",
   "pipeline_quality_downgrade",
+  ...PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS,
   "strong_spike_continuation",
   "opposite_side_price_too_high",
   "market_quotes_too_neutral",
@@ -114,6 +219,19 @@ function dropRedundantGenericQualityGate(
   );
   if (!hasSpecific) return reasons;
   return reasons.filter((r) => r !== "quality_gate_rejected");
+}
+
+function normalizeStrongSpikeConfirmationTail(
+  raw: string
+): NormalizedRejectionReason | null {
+  if (!raw.startsWith("strong_spike_confirmation_")) return null;
+  if (raw === "strong_spike_confirmation_continuation") return null;
+  const tail = raw.slice("strong_spike_confirmation_".length);
+  if (tail === "noisy_unclear") return "pipeline_confirmation_noise";
+  if (tail === "invalid_market_prices" || tail === "spread_too_wide") {
+    return "pipeline_invalid_market_coupled_downgrade";
+  }
+  return "pipeline_confirmation_noise";
 }
 
 function normalizeRawReason(
@@ -151,15 +269,17 @@ function normalizeRawReason(
   if (raw === "strong_spike_confirmation_continuation") {
     return "strong_spike_continuation";
   }
-  if (
-    raw === "strong_spike_confirmation_noisy_unclear" ||
-    raw === "strong_spike_waiting_confirmation_tick" ||
-    raw === "borderline_mode_off_strong_spike_requires_strong_or_exceptional_quality"
-  ) {
-    return "pipeline_quality_downgrade";
+  if (raw === "strong_spike_confirmation_noisy_unclear") {
+    return "pipeline_confirmation_noise";
+  }
+  if (raw === "strong_spike_waiting_confirmation_tick") {
+    return "pipeline_watch_path_blocked";
+  }
+  if (raw === "borderline_mode_off_strong_spike_requires_strong_or_exceptional_quality") {
+    return "pipeline_profile_weak";
   }
   if (raw === "quality_gate_requires_delayed_confirmation") {
-    return "pipeline_quality_downgrade";
+    return "pipeline_delayed_confirmation_failed";
   }
   if (raw === "spread_too_wide") return "invalid_market_prices";
   if (raw === "cooldown_blocked") return "entry_cooldown_active";
@@ -172,18 +292,32 @@ function normalizeRawReason(
   if (raw === "hard_reject_unstable_pre_spike_context") {
     return "hard_reject_unstable_pre_spike_context";
   }
-  if (
-    raw.startsWith("strong_spike_confirmation_") &&
-    raw !== "strong_spike_confirmation_continuation"
-  ) {
-    return "pipeline_quality_downgrade";
-  }
+  const conf = normalizeStrongSpikeConfirmationTail(raw);
+  if (conf !== null) return conf;
   if (raw === "spike_not_strong_enough") {
     if (movementClassification === "borderline") return "borderline_watch_pending";
     if (movementClassification === "no_signal") return "no_signal_below_borderline";
     return null;
   }
   return null;
+}
+
+function appendCoupledInvalidMarketPipeline(
+  decision: Pick<
+    StrategyDecision,
+    "pipelineQualityModifier" | "criticalBlockerUsed"
+  >,
+  out: NormalizedRejectionReason[]
+): void {
+  if (out.includes("pipeline_invalid_market_coupled_downgrade")) return;
+  if (!out.includes("invalid_market_prices")) return;
+  const mod = decision.pipelineQualityModifier?.reason ?? "";
+  if (
+    mod.startsWith("strong_spike_confirmation_") &&
+    mod !== "strong_spike_confirmation_continuation"
+  ) {
+    out.push("pipeline_invalid_market_coupled_downgrade");
+  }
 }
 
 export function normalizeEntryReasons(
@@ -280,7 +414,10 @@ export function normalizeDecisionRejectionReasons(input: {
     }
   }
 
-  return dedupeAndOrder(dropRedundantGenericQualityGate(out));
+  const merged = dedupeAndOrder(dropRedundantGenericQualityGate(out));
+  const withCoupled = [...merged];
+  appendCoupledInvalidMarketPipeline(decision, withCoupled);
+  return dedupeAndOrder(dropRedundantGenericQualityGate(withCoupled));
 }
 
 export function normalizeBorderlineLifecycleRejection(input: {
@@ -294,4 +431,3 @@ export function normalizeBorderlineLifecycleRejection(input: {
   if (normalized !== null) return [normalized];
   return ["borderline_watch_pending"];
 }
-

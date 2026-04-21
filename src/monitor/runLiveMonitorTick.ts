@@ -538,6 +538,8 @@ export async function runLiveMonitorTick(
             ? { estimatedProbabilityUp: tick.estimatedProbabilityUp }
             : {}),
           probabilityTimeHorizonMs: ctx.config.probabilityTimeHorizonMs,
+          maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
+          binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
         }
       : {}),
   });

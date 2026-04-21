@@ -4,6 +4,10 @@ import {
   computeStrongSpikeGateFunnel,
   formatGateFunnelSection,
 } from "./monitorFunnelDiagnostics.js";
+import {
+  normalizeOpportunityRejectionReasons,
+  pickPrimaryRejectionBlocker,
+} from "./rejectionReasons.js";
 
 function diag(passed: boolean) {
   return {
@@ -33,7 +37,34 @@ function diag(passed: boolean) {
 }
 
 function strongBase(over: Partial<Opportunity>): Opportunity {
-  const o: Opportunity = {
+  const {
+    entryRejectionReasons: erOver,
+    entryRejectionPrimaryBlocker: pbOver,
+    entryAllowed: allowedOver,
+    status: statusOver,
+    opportunityOutcome: outcomeOver,
+    qualityProfile: qpOver,
+    qualityGateDiagnostics: qgOver,
+    ...restOver
+  } = over;
+  const entryRejectionReasons = erOver ?? ["quality_gate_rejected"];
+  const entryAllowed = allowedOver ?? false;
+  const status = statusOver ?? "rejected";
+  const opportunityOutcome =
+    outcomeOver ?? (entryAllowed ? "entered_immediate" : "rejected");
+  const qualityProfile = qpOver ?? "weak";
+  const qualityGateDiagnostics = qgOver ?? diag(false);
+  const entryRejectionPrimaryBlocker =
+    pbOver ??
+    (entryAllowed
+      ? null
+      : pickPrimaryRejectionBlocker(
+          normalizeOpportunityRejectionReasons({
+            rawReasons: entryRejectionReasons,
+            movementClassification: "strong_spike",
+          })
+        ));
+  return {
     timestamp: 0,
     btcPrice: 100_000,
     previousPrice: 100_000,
@@ -43,24 +74,26 @@ function strongBase(over: Partial<Opportunity>): Opportunity {
     spikeSource: "tick-1",
     spikeReferencePrice: 100_000,
     priorRangeFraction: 0.0005,
-    upSidePrice: 0.35,
-    downSidePrice: 0.65,
+    bestBid: 0.49,
+    bestAsk: 0.51,
+    midPrice: 0.5,
+    spreadBps: 40,
     stableRangeDetected: true,
     stableRangeQuality: "good",
     spikeDetected: true,
     movementClassification: "strong_spike",
     movementThresholdRatio: 2,
     opportunityType: "strong_spike",
-    opportunityOutcome: "rejected",
+    opportunityOutcome,
     tradableSpikeMinPercent: 0.0015,
-    qualityProfile: "weak",
-    qualityGateDiagnostics: diag(false),
-    entryAllowed: false,
-    entryRejectionReasons: ["quality_gate_rejected"],
-    status: "rejected",
-    ...over,
+    qualityProfile,
+    qualityGateDiagnostics,
+    entryAllowed,
+    entryRejectionReasons,
+    entryRejectionPrimaryBlocker,
+    status,
+    ...restOver,
   };
-  return o;
 }
 
 describe("computeStrongSpikeGateFunnel", () => {

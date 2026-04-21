@@ -71,6 +71,7 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
     borderlineCandidateId: o.borderlineCandidateId,
     entryAllowed: o.entryAllowed,
     entryRejectionReasons: [...o.entryRejectionReasons],
+    entryRejectionPrimaryBlocker: o.entryRejectionPrimaryBlocker,
     status: o.status,
     ...(o.yesPrice !== undefined ? { yesPrice: o.yesPrice } : {}),
     ...(o.noPrice !== undefined ? { noPrice: o.noPrice } : {}),
@@ -94,6 +95,9 @@ export function opportunityToJsonlRecord(o: Opportunity): Record<string, unknown
     ...(o.probabilityTimeHorizonMs !== undefined &&
     Number.isFinite(o.probabilityTimeHorizonMs)
       ? { probabilityTimeHorizonMs: o.probabilityTimeHorizonMs }
+      : {}),
+    ...(o.invalidMarketPricesAudit !== undefined
+      ? { invalidMarketPricesAudit: o.invalidMarketPricesAudit }
       : {}),
     ...(o.marketMode === "binary"
       ? {
@@ -215,6 +219,8 @@ export function buildMonitorSessionSummary(input: {
     delayedBorderlineWinRate: number;
     borderlineNetImpact: "positive" | "negative" | "flat";
     verdict: "helpful" | "neutral" | "harmful";
+    rejectedByPipelineQualityDowngradeLegacy?: number;
+    pipelineQualityDowngradeBreakdown?: Record<string, number>;
     qualityWeak?: number;
     qualityStrong?: number;
     qualityExceptional?: number;
@@ -371,6 +377,8 @@ export type MonitorSessionSummary = {
     delayedBorderlineWinRate: number;
     borderlineNetImpact: "positive" | "negative" | "flat";
     verdict: "helpful" | "neutral" | "harmful";
+    rejectedByPipelineQualityDowngradeLegacy?: number;
+    pipelineQualityDowngradeBreakdown?: Record<string, number>;
     qualityWeak?: number;
     qualityStrong?: number;
     qualityExceptional?: number;

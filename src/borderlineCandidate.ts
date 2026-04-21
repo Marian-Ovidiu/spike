@@ -7,6 +7,7 @@ import {
   type PostSpikeConfirmationResult,
 } from "./postSpikeConfirmationEngine.js";
 import { evaluateExecutionBookPipeline } from "./executionSpreadFilter.js";
+import { logInvalidMarketPricesBinaryAuditFromReadyTick } from "./binary/monitor/invalidMarketPricesAudit.js";
 import { logBorderlinePipelineSignal } from "./borderlineSignalLog.js";
 
 export type BorderlineCandidateStatus =
@@ -93,6 +94,7 @@ export type EvaluateBorderlineWatchInput = {
     | "stableRangeSoftToleranceRatio"
     | "spikeThreshold"
     | "maxEntrySpreadBps"
+    | "binaryPaperSlippageBps"
     | "borderlineRequirePause"
     | "borderlineRequireNoContinuation"
     | "borderlineContinuationThreshold"
@@ -560,6 +562,20 @@ export function evaluateBorderlineWatchDecision(
     tick.executionBook,
     config.maxEntrySpreadBps
   );
+  if (bookGate === "invalid_book" || bookGate === "spread_too_wide") {
+    if (tick.binaryOutcomes !== null && tick.binaryOutcomes !== undefined) {
+      logInvalidMarketPricesBinaryAuditFromReadyTick({
+        tick,
+        maxEntrySpreadBps: config.maxEntrySpreadBps,
+        binaryPaperSlippageBps: config.binaryPaperSlippageBps,
+        context:
+          bookGate === "invalid_book"
+            ? "borderline_watch_invalid_book"
+            : "borderline_watch_spread_too_wide",
+        direction: candidate.suggestedContrarianDirection,
+      });
+    }
+  }
   if (bookGate === "invalid_book") {
     return { action: "cancel", reason: "invalid_market_prices" };
   }

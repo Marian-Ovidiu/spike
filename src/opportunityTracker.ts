@@ -8,13 +8,23 @@ import type {
   PipelineQualityModifier,
   StrategyDecision,
 } from "./strategy/strategyDecisionPipeline.js";
-import { normalizeBorderlineLifecycleRejection } from "./decisionReasonBuilder.js";
+import {
+  normalizeBorderlineLifecycleRejection,
+  pickPrimaryRejectionBlocker,
+  type NormalizedRejectionReason,
+} from "./decisionReasonBuilder.js";
 import {
   DEFAULT_TRADABLE_SPIKE_MIN_PERCENT,
   evaluatePreEntryQualityGate,
   type QualityGateDiagnostics,
   type QualityProfile,
 } from "./preEntryQualityGate.js";
+import {
+  buildInvalidMarketPricesAuditRecord,
+  logInvalidMarketPricesBinaryAudit,
+  shouldAttachInvalidMarketPricesAudit,
+  type InvalidMarketPricesAuditRecord,
+} from "./binary/monitor/invalidMarketPricesAudit.js";
 
 /** Direction of the BTC move on the spike candle (not the entry side). */
 export type SpikeDirection = "UP" | "DOWN";
@@ -92,6 +102,11 @@ export type Opportunity = {
   entryAllowed: boolean;
   /** Same codes as {@link EntryEvaluation.reasons} when rejected. */
   entryRejectionReasons: readonly string[];
+  /**
+   * Highest-priority normalized blocker among {@link entryRejectionReasons}
+   * (see {@link pickPrimaryRejectionBlocker}); `null` when {@link entryAllowed}.
+   */
+  entryRejectionPrimaryBlocker: NormalizedRejectionReason | null;
   status: OpportunityStatus;
   /** Session universe; omitted on legacy rows (treated as spot). */
   marketMode?: "spot" | "binary";
@@ -111,6 +126,11 @@ export type Opportunity = {
   estimatedProbabilityUp?: number;
   /** Binary: horizon used with realized BTC path for calibration labels. */
   probabilityTimeHorizonMs?: number;
+  /**
+   * Binary: structured audit when {@link entryRejectionReasons} includes
+   * `invalid_market_prices` (spread / book / leg diagnostics).
+   */
+  invalidMarketPricesAudit?: InvalidMarketPricesAuditRecord;
 };
 
 export type RecordReadyTickInput = {
@@ -157,6 +177,9 @@ export type RecordReadyTickInput = {
   };
   estimatedProbabilityUp?: number;
   probabilityTimeHorizonMs?: number;
+  /** Required for binary `invalid_market_prices` audit / subreason on opportunity rows. */
+  maxEntrySpreadBps?: number;
+  binaryPaperSlippageBps?: number;
 };
 
 function priorWindowRelativeRangeFraction(
@@ -310,6 +333,9 @@ export function buildOpportunityFromReadyTick(
     overrideReason: decision?.overrideReason ?? null,
     entryAllowed,
     entryRejectionReasons,
+    entryRejectionPrimaryBlocker: entryAllowed
+      ? null
+      : pickPrimaryRejectionBlocker(entryRejectionReasons as NormalizedRejectionReason[]),
     status: entryAllowed ? "valid" : "rejected",
     ...(marketMode === "binary"
       ? {
@@ -342,6 +368,23 @@ export function buildOpportunityFromReadyTick(
           ...(horizonInput !== undefined && Number.isFinite(horizonInput)
             ? { probabilityTimeHorizonMs: Math.trunc(horizonInput) }
             : {}),
+          ...(shouldAttachInvalidMarketPricesAudit({
+            marketMode: "binary",
+            entryRejectionReasons,
+          })
+            ? {
+                invalidMarketPricesAudit: buildInvalidMarketPricesAuditRecord({
+                  context: "strong_spike_opportunity_row",
+                  book: executionBook,
+                  maxEntrySpreadBps: input.maxEntrySpreadBps ?? 50,
+                  binaryPaperSlippageBps: input.binaryPaperSlippageBps ?? 3,
+                  yesMid: bo?.yesPrice,
+                  noMid: bo?.noPrice,
+                  direction: entry.direction,
+                  estimatedProbabilityUp: pUpInput,
+                }),
+              }
+            : {}),
         }
       : {}),
   };
@@ -368,6 +411,9 @@ export class OpportunityTracker {
   recordFromReadyTick(input: RecordReadyTickInput): Opportunity | null {
     const o = buildOpportunityFromReadyTick(input);
     if (!o) return null;
+    if (o.invalidMarketPricesAudit !== undefined) {
+      logInvalidMarketPricesBinaryAudit(o.invalidMarketPricesAudit);
+    }
     this.opportunities.push(o);
     if (this.opportunities.length > this.maxStored) {
       const drop = this.opportunities.length - this.maxStored;
@@ -445,6 +491,13 @@ export class OpportunityTracker {
     const contrarian = e.suggestedContrarianDirection ?? null;
 
     const u = e.currentBtcPrice ?? 0;
+    const entryRejectionReasonsBorderline =
+      derivedOutcome === "promoted_after_watch"
+        ? []
+        : normalizeBorderlineLifecycleRejection({
+            type: e.type === "promoted" ? "watch" : e.type,
+            reason: e.reason,
+          });
     const o: Opportunity = {
       timestamp: input.timestamp,
       btcPrice: u,
@@ -481,13 +534,13 @@ export class OpportunityTracker {
       cooldownOverridden: false,
       overrideReason: null,
       entryAllowed: derivedOutcome === "promoted_after_watch",
-      entryRejectionReasons:
+      entryRejectionReasons: entryRejectionReasonsBorderline,
+      entryRejectionPrimaryBlocker:
         derivedOutcome === "promoted_after_watch"
-          ? []
-          : normalizeBorderlineLifecycleRejection({
-              type: e.type === "promoted" ? "watch" : e.type,
-              reason: e.reason,
-            }),
+          ? null
+          : pickPrimaryRejectionBlocker(
+              entryRejectionReasonsBorderline as NormalizedRejectionReason[]
+            ),
       status: derivedOutcome === "promoted_after_watch" ? "valid" : "rejected",
       ...(input.marketMode === "binary"
         ? {

@@ -1,6 +1,7 @@
 import type { Opportunity } from "./opportunityTracker.js";
 import {
   normalizeOpportunityRejectionReasons,
+  pickPrimaryRejectionBlocker,
   REJECTION_REASON_MESSAGES,
   type NormalizedRejectionReason,
 } from "./rejectionReasons.js";
@@ -12,30 +13,6 @@ const QUOTE_BLOCKERS: ReadonlySet<NormalizedRejectionReason> = new Set([
   "missing_binary_quotes",
   "quote_feed_stale",
 ]);
-
-/** First failure wins for “primary blocker” attribution (pipeline-ish order). */
-const PRIMARY_BLOCKER_PRIORITY: readonly NormalizedRejectionReason[] = [
-  "missing_quote_data",
-  "missing_binary_quotes",
-  "quote_feed_stale",
-  "invalid_market_prices",
-  "market_quotes_too_neutral",
-  "hard_reject_unstable_pre_spike_context",
-  "prior_range_too_wide_for_mean_reversion",
-  "pre_spike_range_too_noisy",
-  "pipeline_quality_downgrade",
-  "negative_or_zero_model_edge",
-  "model_edge_below_min_threshold",
-  "quality_gate_rejected",
-  "opposite_side_price_too_high",
-  "entry_side_price_too_high",
-  "entry_cooldown_active",
-  "active_position_open",
-  "strong_spike_continuation",
-  "borderline_cancelled_continuation",
-  "borderline_watch_pending",
-  "no_signal_below_borderline",
-];
 
 function normalizedReasons(o: Opportunity): NormalizedRejectionReason[] {
   if (o.status === "valid") return [];
@@ -67,13 +44,7 @@ function passOppositePriceGate(norm: NormalizedRejectionReason[]): boolean {
 }
 
 function primaryBlocker(norm: NormalizedRejectionReason[]): string | null {
-  if (norm.length === 0) return null;
-  for (const p of PRIMARY_BLOCKER_PRIORITY) {
-    if (norm.includes(p)) {
-      return p;
-    }
-  }
-  return norm[0] ?? null;
+  return pickPrimaryRejectionBlocker(norm);
 }
 
 function comboKey(norm: NormalizedRejectionReason[]): string {

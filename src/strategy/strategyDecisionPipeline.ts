@@ -1292,6 +1292,7 @@ export function runStrategyDecisionPipeline(
         borderlineFastPromoteProbDelta: config.borderlineFastPromoteProbDelta,
         borderlineFastRejectSameDirectionBps:
           config.borderlineFastRejectSameDirectionBps,
+        binaryPaperSlippageBps: config.binaryPaperSlippageBps,
       },
       cooldownBlocked: !simulation.canOpenNewPosition(now, config.entryCooldownMs),
       ...(tick.estimatedProbabilityUp !== undefined

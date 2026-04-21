@@ -331,6 +331,19 @@ export async function runBotTick(ctx: BotContext): Promise<void> {
       ctx.config.allowWeakQualityOnlyForStrongSpikes,
     allowAcceptableQualityStrongSpikes:
       ctx.config.allowAcceptableQualityStrongSpikes,
+    ...(ctx.config.marketMode === "binary"
+      ? {
+          marketMode: "binary" as const,
+          binaryOutcomes: tick.binaryOutcomes,
+          ...(tick.estimatedProbabilityUp !== undefined &&
+          Number.isFinite(tick.estimatedProbabilityUp)
+            ? { estimatedProbabilityUp: tick.estimatedProbabilityUp }
+            : {}),
+          probabilityTimeHorizonMs: ctx.config.probabilityTimeHorizonMs,
+          maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
+          binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
+        }
+      : {}),
   });
   if (recorded?.entryAllowed) {
     logValidOpportunityBlock(recorded);

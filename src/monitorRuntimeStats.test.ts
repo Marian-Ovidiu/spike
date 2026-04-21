@@ -5,6 +5,7 @@ import {
   logReportCounterConsistency,
   MonitorRuntimeStats,
 } from "./monitorRuntimeStats.js";
+import type { Opportunity } from "./opportunityTracker.js";
 import { SimulationEngine } from "./simulationEngine.js";
 import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 
@@ -384,6 +385,31 @@ describe("MonitorRuntimeStats", () => {
     });
     expect(err).not.toHaveBeenCalled();
     err.mockRestore();
+  });
+
+  it("aggregates pipeline_quality_downgrade legacy rollup and per-detail breakdown", () => {
+    const s = new MonitorRuntimeStats();
+    s.observeOpportunityRecord({
+      status: "rejected",
+      qualityProfile: "weak",
+      entryAllowed: false,
+      entryRejectionReasons: [
+        "pipeline_watch_path_blocked",
+        "quality_gate_rejected",
+      ],
+    } as Opportunity);
+    expect(s.rejectedByPipelineQualityDowngradeLegacy).toBe(1);
+    const br = s.getPipelineQualityDowngradeBreakdown();
+    expect(br.pipeline_watch_path_blocked).toBe(1);
+    expect(br.pipeline_profile_weak).toBe(0);
+    s.observeOpportunityRecord({
+      status: "rejected",
+      qualityProfile: "weak",
+      entryAllowed: false,
+      entryRejectionReasons: ["pipeline_quality_downgrade"],
+    } as Opportunity);
+    expect(s.rejectedByPipelineQualityDowngradeLegacy).toBe(2);
+    expect(s.getPipelineQualityDowngradeBreakdown().pipeline_quality_downgrade).toBe(1);
   });
 
   it("approved open ticks increment valid and trades together (live monitor invariant)", () => {
