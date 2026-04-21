@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { SimulatedTrade } from "./simulationEngine.js";
 import {
+  BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD,
+  BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE,
+} from "./binary/entry/edgeEntryDecision.js";
+import {
   buildTransparentTradeLog,
   computePerformanceFromClosedTrades,
   computeSimulationPerformance,
@@ -418,7 +422,12 @@ describe("SimulationEngine held-leg integration", () => {
 });
 
 describe("SimulationEngine binary paper mode", () => {
-  const book = () => syntheticExecutableBookFromMid(100, 5);
+  /** Venue book on 0–1 scale so model edge matches YES/NO asks (not BTC 100 mids). */
+  const book = () => syntheticExecutableBookFromMid(0.5, 400);
+  /** Mean-reversion YES leg: 1−p_up − yesAsk > 0 with `book()` (~yesAsk 0.51). */
+  const probUpForYesLeg = 0.4;
+  /** Mean-reversion NO leg: p_up − noAsk > 0 for typical NO mids ~0.45. */
+  const probUpForNoLeg = 0.55;
   const binaryExitCfg = {
     ...spotTickConfig,
     binaryTakeProfitPriceDelta: 0.05,
@@ -432,6 +441,7 @@ describe("SimulationEngine binary paper mode", () => {
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
       underlyingSignalPrice: 100_000,
+      estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
       entry: entryOpenUp,
       executionBook: book(),
@@ -476,6 +486,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
+      estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
       entry: entryOpenUp,
       executionBook: book(),
@@ -505,6 +516,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
+      estimatedProbabilityUp: probUpForNoLeg,
       now: 1_000,
       entry: entryOpenDown,
       executionBook: book(),
@@ -535,6 +547,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
+      estimatedProbabilityUp: probUpForNoLeg,
       now: 1_000,
       entry: entryOpenDown,
       executionBook: book(),
@@ -568,6 +581,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
       entry: entryOpenUp,
       executionBook: book(),
@@ -601,6 +615,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
       entry: entryOpenUp,
       executionBook: book(),
@@ -643,7 +658,7 @@ describe("SimulationEngine binary paper mode", () => {
     sim.onTick({
       marketMode: "binary",
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
-      estimatedProbabilityUp: 0.58,
+      estimatedProbabilityUp: 0.4,
       now: 2_000,
       entry: entryOpenUp,
       executionBook: bookProb,
@@ -651,5 +666,73 @@ describe("SimulationEngine binary paper mode", () => {
       config: cfg,
     });
     expect(sim.getOpenPosition()).not.toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBeNull();
+  });
+
+  it("binary edge gate: MR edge negative => skip and record reason", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const bookProb = {
+      bestBid: 0.48,
+      bestAsk: 0.52,
+      midPrice: 0.5,
+      spreadBps: 800,
+    };
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: 0.55,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: bookProb,
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBe(
+      BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE
+    );
+  });
+
+  it("binary edge gate: MR edge zero => skip", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: 0.49,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBe(
+      BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE
+    );
+  });
+
+  it("binary edge gate: MR edge positive but not above MIN_EDGE_THRESHOLD => skip", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const bookProb = {
+      bestBid: 0.48,
+      bestAsk: 0.52,
+      midPrice: 0.5,
+      spreadBps: 800,
+    };
+    const cfg = { ...binaryExitCfg, minEdgeThreshold: 0.1 };
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
+      estimatedProbabilityUp: 0.4,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: bookProb,
+      symbol: SYM,
+      config: cfg,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBe(
+      BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD
+    );
   });
 });

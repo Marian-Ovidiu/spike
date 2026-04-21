@@ -1,3 +1,4 @@
+// Binary paper pre-entry audit (DEBUG_MONITOR): `binary/monitor/binaryPreEntryAudit.ts` + `SimulationEngine.onTickBinary`.
 import type { StrategyTickResult } from "../botLoop.js";
 import type { AppConfig } from "../config.js";
 import type { EntryEvaluation } from "../entryConditions.js";
@@ -800,7 +801,7 @@ export function runStrategyDecisionPipeline(
           overrideReason: null,
           spikeDetected: tick.entry.spikeDetected,
           fastPathUsed: tick.entry.movementClassification === "strong_spike",
-          criticalBlockerUsed: "quality_gate_rejected",
+          criticalBlockerUsed: "hard_reject_unstable_pre_spike_context",
           reason: "hard_reject_unstable_pre_spike_context",
         },
       }),

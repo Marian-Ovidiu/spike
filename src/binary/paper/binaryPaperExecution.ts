@@ -3,7 +3,7 @@ import type { EntryDirection } from "../../entryConditions.js";
 /** Outcome token held in paper binary mode. */
 export type BinarySideBought = "YES" | "NO";
 
-/** UP → buy YES; DOWN → buy NO (contrarian spike leg). */
+/** Strategy direction UP → buy YES token; DOWN → buy NO (maps spike fade to outcome side). */
 export function binarySideFromStrategyDirection(
   direction: EntryDirection
 ): BinarySideBought {

@@ -9,43 +9,59 @@ import {
 } from "./edgeEntryDecision.js";
 
 describe("shouldEnterTrade", () => {
-  it("enters YES when edge exceeds threshold", () => {
+  it("enters YES when mean-reversion edge exceeds threshold", () => {
+    const r = shouldEnterTrade({
+      estimatedProbabilityUp: 0.4,
+      marketPriceYesAsk: 0.52,
+      marketPriceNoAsk: 0.48,
+      minEdgeThreshold: 0.03,
+      side: "YES",
+    });
+    expect(r.probability).toBeCloseTo(0.6, 6);
+    expect(r.edge).toBeCloseTo(0.08, 6);
+    expect(r.shouldEnter).toBe(true);
+    expect(r.decision).toBe("enter");
+  });
+
+  it("skips YES when mean-reversion edge is not strictly greater than threshold", () => {
+    const r = shouldEnterTrade({
+      estimatedProbabilityUp: 0.47,
+      marketPriceYesAsk: 0.52,
+      marketPriceNoAsk: 0.48,
+      minEdgeThreshold: 0.03,
+      side: "YES",
+    });
+    expect(r.probability).toBeCloseTo(0.53, 6);
+    expect(r.edge).toBeCloseTo(0.01, 6);
+    expect(r.shouldEnter).toBe(false);
+    expect(r.decision).toBe("skip");
+  });
+
+  it("uses p_up on NO leg under mean-reversion (fade: buy NO when momentum is up)", () => {
+    const r = shouldEnterTrade({
+      estimatedProbabilityUp: 0.66,
+      marketPriceYesAsk: 0.36,
+      marketPriceNoAsk: 0.62,
+      minEdgeThreshold: 0.02,
+      side: "NO",
+    });
+    expect(r.probability).toBeCloseTo(0.66, 6);
+    expect(r.marketPrice).toBe(0.62);
+    expect(r.edge).toBeCloseTo(0.04, 6);
+    expect(r.shouldEnter).toBe(true);
+  });
+
+  it("momentum mode keeps P(YES)=p_up and P(NO)=1−p_up", () => {
     const r = shouldEnterTrade({
       estimatedProbabilityUp: 0.58,
       marketPriceYesAsk: 0.52,
       marketPriceNoAsk: 0.48,
       minEdgeThreshold: 0.03,
       side: "YES",
+      edgeProbabilityModel: "momentum",
     });
+    expect(r.probability).toBeCloseTo(0.58, 6);
     expect(r.edge).toBeCloseTo(0.06, 6);
-    expect(r.shouldEnter).toBe(true);
-    expect(r.decision).toBe("enter");
-  });
-
-  it("skips YES when edge is not strictly greater than threshold", () => {
-    const r = shouldEnterTrade({
-      estimatedProbabilityUp: 0.54,
-      marketPriceYesAsk: 0.52,
-      marketPriceNoAsk: 0.48,
-      minEdgeThreshold: 0.03,
-      side: "YES",
-    });
-    expect(r.edge).toBeCloseTo(0.02, 6);
-    expect(r.shouldEnter).toBe(false);
-    expect(r.decision).toBe("skip");
-  });
-
-  it("uses 1−p for NO leg", () => {
-    const r = shouldEnterTrade({
-      estimatedProbabilityUp: 0.35,
-      marketPriceYesAsk: 0.36,
-      marketPriceNoAsk: 0.62,
-      minEdgeThreshold: 0.02,
-      side: "NO",
-    });
-    expect(r.probability).toBeCloseTo(0.65, 6);
-    expect(r.marketPrice).toBe(0.62);
-    expect(r.edge).toBeCloseTo(0.03, 6);
     expect(r.shouldEnter).toBe(true);
   });
 

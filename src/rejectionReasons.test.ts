@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { normalizeDecisionRejectionReasons } from "./rejectionReasons.js";
+import {
+  normalizeDecisionRejectionReasons,
+  normalizeOpportunityRejectionReasons,
+} from "./rejectionReasons.js";
 import type { StrategyDecision } from "./strategy/strategyDecisionPipeline.js";
 
 function baseDecision(
@@ -16,6 +19,61 @@ function baseDecision(
     ...partial,
   };
 }
+
+describe("normalizeOpportunityRejectionReasons", () => {
+  it("maps binary model edge rejection codes", () => {
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["negative_or_zero_model_edge"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["negative_or_zero_model_edge"]);
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["binary_model_edge_below_min_threshold"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["model_edge_below_min_threshold"]);
+  });
+
+  it("maps delayed confirmation and pipeline watch strings to pipeline_quality_downgrade", () => {
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["quality_gate_requires_delayed_confirmation"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_quality_downgrade"]);
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: [
+          "borderline_mode_off_strong_spike_requires_strong_or_exceptional_quality",
+        ],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_quality_downgrade"]);
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["strong_spike_confirmation_noisy_unclear"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_quality_downgrade"]);
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["strong_spike_confirmation_tick_pending_review"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["pipeline_quality_downgrade"]);
+  });
+
+  it("keeps strong_spike continuation distinct from other strong_spike_confirmation_* codes", () => {
+    expect(
+      normalizeOpportunityRejectionReasons({
+        rawReasons: ["strong_spike_confirmation_continuation"],
+        movementClassification: "strong_spike",
+      })
+    ).toEqual(["strong_spike_continuation"]);
+  });
+});
 
 describe("normalizeDecisionRejectionReasons", () => {
   it("maps strong spike cooldown blocker", () => {
@@ -122,6 +180,37 @@ describe("normalizeDecisionRejectionReasons", () => {
       entry: { movementClassification: "strong_spike", reasons: [] },
     });
     expect(reasons).toContain("quote_feed_stale");
+  });
+
+  it("drops redundant quality_gate_rejected when a more specific normalized reason is present", () => {
+    const reasons = normalizeDecisionRejectionReasons({
+      decision: baseDecision({
+        movementClassification: "strong_spike",
+        criticalBlockerUsed: "quality_gate_rejected",
+        reason: "hard_reject_unstable_pre_spike_context",
+      }),
+      entry: {
+        movementClassification: "strong_spike",
+        reasons: ["hard_reject_unstable_pre_spike_context"],
+      },
+    });
+    expect(reasons).toContain("hard_reject_unstable_pre_spike_context");
+    expect(reasons).not.toContain("quality_gate_rejected");
+  });
+
+  it("drops redundant quality_gate when opposite-side price is the downstream blocker", () => {
+    const reasons = normalizeDecisionRejectionReasons({
+      decision: baseDecision({
+        movementClassification: "strong_spike",
+        criticalBlockerUsed: "quality_gate_rejected",
+        reason: "opposite_side_price_too_high",
+      }),
+      entry: {
+        movementClassification: "strong_spike",
+        reasons: ["opposite_side_price_too_high"],
+      },
+    });
+    expect(reasons).toEqual(["opposite_side_price_too_high"]);
   });
 });
 

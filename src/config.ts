@@ -309,8 +309,8 @@ export const configDefaults = {
   /** Sigmoid steepness on the normalized BTC probability score. */
   probabilitySigmoidK: 4,
   /**
-   * Binary paper: require `(model P − ask) > minEdgeThreshold` on the bought leg before entry.
-   * `0` disables the gate.
+   * Binary paper: extra floor on mean-reversion edge — require `(model P − ask) > minEdgeThreshold`.
+   * `0` disables this extra floor only; binary `SimulationEngine` still requires strictly positive edge.
    */
   minEdgeThreshold: 0,
   /** Binary paper: max USDT stake from risk sizing; `0` = cap with `stakePerTrade` instead. */

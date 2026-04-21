@@ -76,6 +76,9 @@ const LIVE_IT_REJECTION: Record<NormalizedRejectionReason, string> = {
   quote_feed_stale: "quotazione binaria obsoleta",
   entry_side_price_too_high: "prezzo d'ingresso troppo alto",
   missing_binary_quotes: "prezzi YES/NO assenti",
+  negative_or_zero_model_edge: "edge modello assente o non positivo",
+  model_edge_below_min_threshold: "edge modello sotto soglia minima",
+  pipeline_quality_downgrade: "qualità/conferma pipeline insufficiente",
 };
 
 /** Fallback when reasons are not yet normalized to {@link NormalizedRejectionReason}. */

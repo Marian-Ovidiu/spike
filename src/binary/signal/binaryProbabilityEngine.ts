@@ -1,5 +1,7 @@
 /**
- * Deterministic short-horizon "probability of next move up" from recent spot mids.
+ * Deterministic short-horizon **momentum / continuation** score from recent spot mids → P(up).
+ * Distinct from Polymarket YES price and from **contrarian** fair P on the bought leg used in
+ * binary edge (`fairBuyLegProbabilityFromMomentumUp` in `binaryEdgeSemantics.ts`).
  * Heuristic only — not calibrated market probability.
  */
 
@@ -167,7 +169,11 @@ export function getBinaryProbability(
   return { up: d.up, down: d.down };
 }
 
-/** Rolling BTC mids → `probability_up` for edge gating (needs ≥2 samples). */
+/**
+ * Rolling BTC mids → short-horizon **momentum** p(up) for calibration / feeds.
+ * Binary **entry edge** in `edgeEntryDecision` defaults to mean-reversion mapping
+ * (complement on the bought leg) so it matches contrarian spike entries.
+ */
 export function estimateProbabilityUpFromPriceBuffer(input: {
   prices: readonly number[];
   lastSampleTimeMs: number;

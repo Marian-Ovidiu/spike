@@ -14,6 +14,8 @@ import {
   evaluateSpotExitConditions,
 } from "./legacy/spot/spotExitConditions.js";
 import {
+  BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD,
+  BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE,
   computeBinaryEntryEdge,
   formatEdgeEntryLogLine,
   resolveBinaryVenueAsks,
@@ -25,7 +27,13 @@ import {
   binarySideFromStrategyDirection,
   type BinarySideBought,
 } from "./binary/paper/binaryPaperExecution.js";
-import { logMonitorDebug } from "./monitor/monitorDebugLog.js";
+import {
+  BINARY_PRE_ENTRY_REJECT_INVALID_OUTCOME_FILL,
+  BINARY_PRE_ENTRY_REJECT_MAX_ENTRY_PRICE,
+  BINARY_PRE_ENTRY_REJECT_STAKE_ZERO,
+  buildBinaryPreEntryAuditRecord,
+  logBinaryPreEntryAuditDebug,
+} from "./binary/monitor/binaryPreEntryAudit.js";
 import { getPositionSize } from "./riskPositionSizing.js";
 import {
   applyBinaryPaperVenueTick,
@@ -62,7 +70,9 @@ export type SimulatedTrade = {
   underlyingSignalPriceAtEntry?: number;
   /** Binary: underlying signal mid at exit. */
   underlyingSignalPriceAtExit?: number;
-  /** Binary: model P(up) at entry (same tick as open). */
+  /**
+   * Binary: momentum-style P(BTC up) at entry (`estimateProbabilityUpFromPriceBuffer`); calibration label, not token fair.
+   */
   estimatedProbabilityUpAtEntry?: number;
   /** Binary: horizon used for calibration labels (`PROBABILITY_TIME_HORIZON_MS`). */
   probabilityTimeHorizonMs?: number;
@@ -91,7 +101,10 @@ export type SimulatedTrade = {
   /** Effective multiplier from {@link resolveQualityStakeMultiplier}. */
   qualityStakeMultiplier?: number;
   entryQualityProfile?: QualityProfile;
-  /** Binary: model P(bought) minus venue ask on that leg at entry (for run analytics). */
+  /**
+   * Binary: (fair P on bought leg − ask) at entry. Fair is derived from momentum `p_up` + contrarian mapping
+   * (`fairBuyLegProbabilityFromMomentumUp` / `computeBinaryEntryEdge`), not raw `estimatedProbabilityUpAtEntry`.
+   */
   entryModelEdge?: number;
   exitReason: ExitReason;
   /** Which strategy path opened this trade. */
@@ -164,9 +177,9 @@ type OpenSimPosition = {
   baseStakePerTrade: number;
   qualityStakeMultiplier: number;
   entryQualityProfile?: QualityProfile;
-  /** Binary: model minus ask on bought leg at entry; persisted on closed trade. */
+  /** Binary: fair P(buy leg) − ask at entry (contrarian mapping from momentum p_up). */
   entryModelEdge?: number;
-  /** Binary: model P(up) at entry tick (calibration vs realized horizon). */
+  /** Binary: momentum P(BTC up) at entry tick (calibration vs realized horizon). */
   estimatedProbabilityUpAtEntry?: number;
   /** Set when {@link SimulationEngineOptions.paperPositionMtmDiagnostics} is true. */
   paperOpenSeq?: number;
@@ -201,8 +214,8 @@ export type SimulationTickInput = {
    */
   underlyingSignalPrice?: number;
   /**
-   * Binary: model P(up) for edge vs asks (`minEdgeThreshold` in `config`).
-   * When the gate is on and this is missing/NaN, entry is skipped.
+   * Binary: momentum P(BTC up) from the probability engine — **not** Polymarket YES fair until mapped for edge.
+   * Edge uses contrarian fair on the buy leg (`binaryEdgeSemantics` / `computeBinaryEntryEdge`).
    */
   estimatedProbabilityUp?: number;
   /** Exit, stop (bps), sizing, cooldown, fees. */
@@ -399,6 +412,8 @@ export class SimulationEngine {
   private paperOpenSeqCounter = 0;
   private position: OpenSimPosition | null = null;
   private lastExitAt: number | null = null;
+  /** Last binary entry skip in {@link onTickBinary} (for tests / monitor diagnostics). */
+  private lastBinaryEntryRejectionReason: string | null = null;
   private readonly trades: SimulatedTrade[] = [];
 
   constructor(options?: SimulationEngineOptions) {
@@ -418,6 +433,14 @@ export class SimulationEngine {
   }
 
   /** Paper position currently open, if any. */
+  /**
+   * When the previous tick attempted a binary entry that was skipped after
+   * `entry.shouldEnter`, the rejection code (e.g. `negative_or_zero_model_edge`).
+   */
+  getLastBinaryEntryRejectionReason(): string | null {
+    return this.lastBinaryEntryRejectionReason;
+  }
+
   getOpenPosition(): Readonly<{
     direction: EntryDirection;
     entryPrice: number;
@@ -684,6 +707,7 @@ export class SimulationEngine {
   }
 
   private onTickBinary(input: SimulationTickInput): void {
+    this.lastBinaryEntryRejectionReason = null;
     const { now, entry, executionBook, config, symbol } = input;
     const bo = input.binaryOutcomes;
     if (
@@ -798,6 +822,7 @@ export class SimulationEngine {
         noMid: bo.noPrice,
       });
       const pUpSzEdge = input.estimatedProbabilityUp;
+      // Edge uses mean-reversion fair P on the bought leg (see edgeEntryDecision).
       const entryModelEdge =
         pUpSzEdge !== undefined && Number.isFinite(pUpSzEdge)
           ? computeBinaryEntryEdge({
@@ -807,30 +832,73 @@ export class SimulationEngine {
               noAsk: asks.noAsk,
             })
           : Number.NaN;
+
+      if (!Number.isFinite(entryModelEdge) || entryModelEdge <= 0) {
+        this.lastBinaryEntryRejectionReason =
+          BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE;
+        if (!this.silent) {
+          const eStr = Number.isFinite(entryModelEdge)
+            ? entryModelEdge.toFixed(6)
+            : "NaN";
+          console.log(
+            `[SIM] Skip binary entry: ${BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE} entryModelEdge=${eStr}`
+          );
+        }
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asks.yesAsk,
+            resolvedNoAsk: asks.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason:
+              BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE,
+          })
+        );
+        return;
+      }
+
       const minThr = config.minEdgeThreshold;
       if (minThr > 0) {
-        const pUp = input.estimatedProbabilityUp;
-        if (pUp === undefined || !Number.isFinite(pUp)) {
-          if (!this.silent) {
-            console.log(
-              "[SIM] Skip binary entry: MIN_EDGE_THRESHOLD>0 but estimatedProbabilityUp missing"
-            );
-          }
-          return;
-        }
         const edgeResult = shouldEnterTrade({
-          estimatedProbabilityUp: pUp,
+          estimatedProbabilityUp: pUpSzEdge!,
           marketPriceYesAsk: asks.yesAsk,
           marketPriceNoAsk: asks.noAsk,
           minEdgeThreshold: minThr,
           side: binaryLegFromDirection(entry.direction),
         });
-        if (debugMonitor) {
-          logMonitorDebug(formatEdgeEntryLogLine(edgeResult));
-        } else if (!edgeResult.shouldEnter && !this.silent) {
+        if (!edgeResult.shouldEnter && !this.silent && !debugMonitor) {
           console.log(`[SIM] ${formatEdgeEntryLogLine(edgeResult)}`);
         }
         if (!edgeResult.shouldEnter) {
+          this.lastBinaryEntryRejectionReason =
+            BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD;
+          if (!this.silent) {
+            console.log(
+              `[SIM] Skip binary entry: ${BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD} minEdgeThreshold=${minThr.toFixed(4)}`
+            );
+          }
+          logBinaryPreEntryAuditDebug(
+            buildBinaryPreEntryAuditRecord({
+              entry,
+              venueYesMid: bo.yesPrice,
+              venueNoMid: bo.noPrice,
+              resolvedYesAsk: asks.yesAsk,
+              resolvedNoAsk: asks.noAsk,
+              estimatedProbabilityUp: input.estimatedProbabilityUp,
+              entryModelEdge,
+              minEdgeThreshold: config.minEdgeThreshold,
+              qualityProfile: input.entryQualityProfile,
+              action: "reject",
+              primaryRejectionReason:
+                BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD,
+            })
+          );
           return;
         }
       }
@@ -843,6 +911,21 @@ export class SimulationEngine {
         config.binaryPaperSlippageBps
       );
       if (!Number.isFinite(fill) || fill <= 0) {
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asks.yesAsk,
+            resolvedNoAsk: asks.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_INVALID_OUTCOME_FILL,
+          })
+        );
         return;
       }
 
@@ -855,10 +938,25 @@ export class SimulationEngine {
             `[SIM] Skip binary entry: fill ${fill.toFixed(4)} > BINARY_MAX_ENTRY_PRICE ${config.binaryMaxEntryPrice}`
           );
         }
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asks.yesAsk,
+            resolvedNoAsk: asks.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_MAX_ENTRY_PRICE,
+          })
+        );
         return;
       }
 
-      const edgeForSize = Number.isFinite(entryModelEdge) ? entryModelEdge : 0;
+      const edgeForSize = entryModelEdge;
       const stakeCap =
         config.maxTradeSize > 0
           ? config.maxTradeSize
@@ -881,6 +979,21 @@ export class SimulationEngine {
             `[SIM] Skip entry: effective stake must be > 0 (base=${baseStake.toFixed(2)} mult=${qualityMult.toFixed(4)})`
           );
         }
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asks.yesAsk,
+            resolvedNoAsk: asks.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_STAKE_ZERO,
+          })
+        );
         return;
       }
 
@@ -959,6 +1072,22 @@ export class SimulationEngine {
           binaryMaxEntryPrice: config.binaryMaxEntryPrice,
         });
       }
+
+      logBinaryPreEntryAuditDebug(
+        buildBinaryPreEntryAuditRecord({
+          entry,
+          venueYesMid: bo.yesPrice,
+          venueNoMid: bo.noPrice,
+          resolvedYesAsk: asks.yesAsk,
+          resolvedNoAsk: asks.noAsk,
+          estimatedProbabilityUp: input.estimatedProbabilityUp,
+          entryModelEdge,
+          minEdgeThreshold: config.minEdgeThreshold,
+          qualityProfile: input.entryQualityProfile,
+          action: "enter",
+          primaryRejectionReason: null,
+        })
+      );
 
       if (!this.silent) {
         const prof = input.entryQualityProfile ?? "—";

@@ -89,15 +89,19 @@ describe("computeStrongSpikeGateFunnel", () => {
         ],
         qualityGateDiagnostics: diag(false),
       }),
+      strongBase({
+        entryRejectionReasons: ["quality_gate_rejected"],
+        qualityGateDiagnostics: diag(false),
+      }),
     ];
     const f = computeStrongSpikeGateFunnel({
       opportunities,
       borderlineCandidatesCreated: 2,
       tradesExecuted: 1,
     });
-    expect(f.spikesDetected).toBe(4);
-    expect(f.passedQuoteGate).toBe(4);
-    expect(f.passedUnstableContextGate).toBe(3);
+    expect(f.spikesDetected).toBe(5);
+    expect(f.passedQuoteGate).toBe(5);
+    expect(f.passedUnstableContextGate).toBe(4);
     expect(f.validOpportunities).toBe(1);
     expect(f.rejectedWithMultipleNormalizedReasons).toBe(1);
     expect(f.dominantPrimaryBlocker?.reason).toBe("quality_gate_rejected");
