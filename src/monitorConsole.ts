@@ -14,7 +14,6 @@ import {
   type SimulatedTrade,
 } from "./simulationEngine.js";
 import {
-  allowsPaperEntryDespitePipelineWatchDeferral,
   type BorderlineLifecycleRenderEvent,
   type StrategyDecision,
 } from "./strategy/strategyDecisionPipeline.js";
@@ -1457,10 +1456,10 @@ export type SpikeDecisionTracePayload = {
   /** Non-empty when entry is blocked; normalized / entry codes. */
   rejectionReasons: readonly string[];
   /**
-   * When set, pipeline asked for a confirmation tick but entry was not blocked
-   * (`strong_spike_waiting_confirmation_tick`).
+   * When set, pipeline deferred strong-spike confirmation — raw entry may still show `shouldEnter`
+   * but paper execution clears it until promote (`strong_spike_waiting_confirmation_tick`).
    */
-  pipelineWatchPathNonBlockingNote?: string;
+  pipelineWatchPathDeferredNote?: string;
 };
 
 function collectSpikeTraceRejectionReasons(
@@ -1488,14 +1487,13 @@ export function buildSpikeDecisionTracePayload(input: {
   decision: StrategyDecision;
 }): SpikeDecisionTracePayload {
   const { entry, decision } = input;
-  const pipelineWatchNonBlocking = allowsPaperEntryDespitePipelineWatchDeferral(
-    decision,
-    entry.shouldEnter
-  );
   const entryAllowed =
     decision.action === "enter_immediate" ||
-    decision.action === "promote_borderline_candidate" ||
-    pipelineWatchNonBlocking;
+    decision.action === "promote_borderline_candidate";
+  const pipelineWaitingConfirmationNote =
+    decision.action === "none" &&
+    decision.reason === "strong_spike_waiting_confirmation_tick" &&
+    entry.shouldEnter;
   return {
     spikePercent: entry.movement.strongestMovePercent * 100,
     priorRange: entry.priorRangeFraction * 100,
@@ -1505,10 +1503,10 @@ export function buildSpikeDecisionTracePayload(input: {
     rejectionReasons: entryAllowed
       ? []
       : collectSpikeTraceRejectionReasons(entry, decision),
-    ...(pipelineWatchNonBlocking
+    ...(pipelineWaitingConfirmationNote
       ? {
-          pipelineWatchPathNonBlockingNote:
-            "strong_spike_waiting_confirmation_tick",
+          pipelineWatchPathDeferredNote:
+            "strong_spike_waiting_confirmation_tick (paper entry cleared until promote)",
         }
       : {}),
   };

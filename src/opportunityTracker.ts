@@ -4,10 +4,9 @@ import type { BorderlineLifecyclePersistedRenderEvent } from "./strategy/strateg
 import type { PostMoveClassification } from "./borderlineCandidate.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 import { type MovementClassification, type WindowSpikeSource } from "./strategy.js";
-import {
-  allowsPaperEntryDespitePipelineWatchDeferral,
-  type PipelineQualityModifier,
-  type StrategyDecision,
+import type {
+  PipelineQualityModifier,
+  StrategyDecision,
 } from "./strategy/strategyDecisionPipeline.js";
 import {
   normalizeBorderlineLifecycleRejection,
@@ -132,10 +131,7 @@ export type Opportunity = {
    * `invalid_market_prices` (spread / book / leg diagnostics).
    */
   invalidMarketPricesAudit?: InvalidMarketPricesAuditRecord;
-  /**
-   * Pipeline deferred strong-spike confirmation (`strong_spike_waiting_confirmation_tick`)
-   * but entry remained allowed for this tick (non-blocking override).
-   */
+  /** Legacy JSONL field — no longer emitted (deferral never counts as entry allowed). */
   pipelineWatchPathDeferredNonBlocking?: true;
 };
 
@@ -250,16 +246,11 @@ export function buildOpportunityFromReadyTick(
       : movement.strongestMoveDirection === "DOWN"
         ? "DOWN"
         : null;
-  const pipelineWatchAllowsEntry =
-    decision !== undefined &&
-    allowsPaperEntryDespitePipelineWatchDeferral(decision, entry.shouldEnter);
-
   const entryAllowed =
-    pipelineWatchAllowsEntry ||
-    (decision !== undefined
+    decision !== undefined
       ? decision.action === "enter_immediate" ||
         decision.action === "promote_borderline_candidate"
-      : entry.shouldEnter);
+      : entry.shouldEnter;
   const entryRejectionReasons =
     entryAllowed ? [] : [...(decision?.reasons ?? entry.reasons)];
   const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
@@ -343,9 +334,6 @@ export function buildOpportunityFromReadyTick(
       : {}),
     cooldownOverridden: decision?.cooldownOverridden ?? false,
     overrideReason: decision?.overrideReason ?? null,
-    ...(pipelineWatchAllowsEntry
-      ? { pipelineWatchPathDeferredNonBlocking: true as const }
-      : {}),
     entryAllowed,
     entryRejectionReasons,
     entryRejectionPrimaryBlocker: entryAllowed

@@ -64,7 +64,7 @@ describe("buildSpikeDecisionTracePayload", () => {
     expect(p.rejectionReasons).toEqual([]);
   });
 
-  it("treats strong_spike_waiting_confirmation_tick as allowed entry with observability note", () => {
+  it("strong_spike_waiting_confirmation_tick is not entryAllowed; notes deferral", () => {
     const p = buildSpikeDecisionTracePayload({
       entry: { ...baseEntry, shouldEnter: true, reasons: [] },
       decision: {
@@ -74,9 +74,9 @@ describe("buildSpikeDecisionTracePayload", () => {
         reasons: undefined,
       },
     });
-    expect(p.entryAllowed).toBe(true);
-    expect(p.rejectionReasons).toEqual([]);
-    expect(p.pipelineWatchPathNonBlockingNote).toBe(
+    expect(p.entryAllowed).toBe(false);
+    expect(p.rejectionReasons.length).toBeGreaterThan(0);
+    expect(p.pipelineWatchPathDeferredNote).toContain(
       "strong_spike_waiting_confirmation_tick"
     );
   });

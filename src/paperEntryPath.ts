@@ -2,7 +2,8 @@ import type { StrategyDecision } from "./strategy/strategyDecisionPipeline.js";
 
 /**
  * Persisted on {@link SimulatedTrade.entryPath} / paper logs.
- * `borderline_delayed` is retained for backward compatibility with older sessions.
+ * `borderline_delayed` is retained for backward compatibility — also used when the pipeline
+ * decision is not `enter_immediate` / `promote_borderline_candidate` (tick-level label only).
  */
 export type PaperTradeEntryPath =
   | "strong_spike_immediate"
@@ -29,5 +30,6 @@ export function resolvePaperTradeEntryPath(
     }
     return "strong_spike_immediate";
   }
-  return "strong_spike_immediate";
+  /** No trade this tick (`none`, cancel_*, expire_*, …) — avoid mis-tagging as immediate. */
+  return "borderline_delayed";
 }

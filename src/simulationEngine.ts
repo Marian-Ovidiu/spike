@@ -272,6 +272,12 @@ export type SimulationTickInput = {
   >;
   /** Binary pipeline-backed: copied onto the open position and closed trade record. */
   entryOpenReason?: TradeEntryOpenReason;
+  /**
+   * Binary paper: set from the strategy pipeline when the caller has a `StrategyDecision`.
+   * `true` only for `enter_immediate` or `promote_borderline_candidate`. `false` blocks entry
+   * even if `EntryEvaluation.shouldEnter` is true. Omitted → skip this check (e.g. `botLoop` without pipeline).
+   */
+  pipelineEntryApproved?: boolean;
 };
 
 /** Aggregates from closed trades only (no live equity). */
@@ -840,6 +846,16 @@ export class SimulationEngine {
     }
 
     if (entry.shouldEnter && entry.direction !== null) {
+      const approved = input.pipelineEntryApproved;
+      if (approved !== undefined && approved !== true) {
+        this.lastBinaryEntryRejectionReason = "pipeline_entry_not_approved";
+        if (!this.silent) {
+          console.log(
+            "[SIM] Skip binary entry: pipeline did not return enter_immediate or promote_borderline_candidate"
+          );
+        }
+        return;
+      }
       if (this.lastExitAt !== null) {
         const waited = now - this.lastExitAt;
         if (waited < config.entryCooldownMs) {

@@ -33,7 +33,6 @@ import {
   entryEvaluationForPipelinePaperExecution,
   formatStrategyDecisionLog,
   isPersistedBorderlineLifecycleEvent,
-  PIPELINE_WATCH_PATH_WARNING_REASON,
   runStrategyDecisionPipeline,
 } from "../strategy/strategyDecisionPipeline.js";
 import { resolvePaperTradeEntryPath } from "../paperEntryPath.js";
@@ -456,14 +455,6 @@ export async function runLiveMonitorTick(
     pipeline.decision,
     entryForSimulation
   );
-  if (
-    debugMonitor &&
-    paperEntry.reasons.includes(PIPELINE_WATCH_PATH_WARNING_REASON)
-  ) {
-    logMonitorDebug(
-      "[strategy] pipeline_watch_path deferred — entry allowed (non-blocking): strong_spike_waiting_confirmation_tick"
-    );
-  }
   if (debugMonitor && tick.entry.spikeDetected) {
     logSpikeDecisionTrace(
       buildSpikeDecisionTracePayload({
@@ -485,6 +476,12 @@ export async function runLiveMonitorTick(
     now,
     entry: paperEntry,
     entryPath,
+    ...(ctx.config.marketMode === "binary"
+      ? {
+          pipelineEntryApproved:
+            enteringImmediate || promoting,
+        }
+      : {}),
     marketMode: ctx.config.marketMode,
     binaryOutcomes: tick.binaryOutcomes,
     underlyingSignalPrice: tick.underlyingSignalPrice,

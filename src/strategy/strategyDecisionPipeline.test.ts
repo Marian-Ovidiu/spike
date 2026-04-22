@@ -9,7 +9,6 @@ import {
   applyQuoteStaleEntryBlock,
   entryEvaluationForPipelinePaperExecution,
   PIPELINE_BLOCKED_ENTRY_REASON,
-  PIPELINE_WATCH_PATH_WARNING_REASON,
   runStrategyDecisionPipeline,
 } from "./strategyDecisionPipeline.js";
 import { syntheticExecutableBookFromMid } from "../executionSpreadFilter.js";
@@ -2089,7 +2088,7 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
     expect(sim.getOpenPosition()).toBeNull();
   });
 
-  it("keeps shouldEnter when pipeline defers confirmation tick (watch path non-blocking)", () => {
+  it("clears shouldEnter when pipeline defers confirmation tick (no bypass without enter_immediate)", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     const raw: EntryEvaluation = {
       shouldEnter: true,
@@ -2136,10 +2135,9 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
       },
       raw
     );
-    expect(paper.shouldEnter).toBe(true);
-    expect(paper.direction).toBe("DOWN");
-    expect(paper.reasons).toContain(PIPELINE_WATCH_PATH_WARNING_REASON);
-    expect(paper.reasons).not.toContain(PIPELINE_BLOCKED_ENTRY_REASON);
+    expect(paper.shouldEnter).toBe(false);
+    expect(paper.direction).toBeNull();
+    expect(paper.reasons).toContain(PIPELINE_BLOCKED_ENTRY_REASON);
 
     sim.onTick({
       marketMode: "spot",
@@ -2150,7 +2148,7 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
       symbol: "BTCUSDT",
       config: paperConfig,
     });
-    expect(sim.getOpenPosition()).not.toBeNull();
+    expect(sim.getOpenPosition()).toBeNull();
   });
 
   it("passes through approved enter_immediate unchanged", () => {

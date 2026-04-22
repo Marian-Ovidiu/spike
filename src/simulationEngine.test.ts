@@ -450,6 +450,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
       underlyingSignalPrice: 100_000,
       estimatedProbabilityUp: probUpForYesLeg,
@@ -467,6 +468,7 @@ describe("SimulationEngine binary paper mode", () => {
     const yesExit = 0.541;
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: yesExit, noPrice: 1 - yesExit },
       underlyingSignalPrice: 100_500,
       now: 2_000,
@@ -496,6 +498,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
       estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
@@ -507,6 +510,7 @@ describe("SimulationEngine binary paper mode", () => {
     const entryFill = sim.getOpenPosition()!.entryPrice;
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.43, noPrice: 0.57 },
       now: 2_000,
       entry: entryFlat,
@@ -526,6 +530,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
       estimatedProbabilityUp: probUpForNoLeg,
       now: 1_000,
@@ -537,6 +542,7 @@ describe("SimulationEngine binary paper mode", () => {
     const entryFill = sim.getOpenPosition()!.entryPrice;
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.62, noPrice: 0.38 },
       now: 2_000,
       entry: entryFlat,
@@ -557,6 +563,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.55, noPrice: 0.45 },
       estimatedProbabilityUp: probUpForNoLeg,
       now: 1_000,
@@ -572,6 +579,7 @@ describe("SimulationEngine binary paper mode", () => {
     const noExit = 0.501;
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 1 - noExit, noPrice: noExit },
       now: 2_000,
       entry: entryFlat,
@@ -591,6 +599,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
@@ -602,6 +611,7 @@ describe("SimulationEngine binary paper mode", () => {
     const stake = sim.getOpenPosition()!.stake;
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.551, noPrice: 0.449 },
       now: 2_000,
       entry: entryFlat,
@@ -625,6 +635,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: probUpForYesLeg,
       now: 1_000,
@@ -635,6 +646,7 @@ describe("SimulationEngine binary paper mode", () => {
     });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       now: 1_000 + 50_001,
       entry: entryFlat,
@@ -656,6 +668,7 @@ describe("SimulationEngine binary paper mode", () => {
     const cfg = { ...binaryExitCfg, minEdgeThreshold: 0.03 };
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: 0.51,
       now: 1_000,
@@ -668,6 +681,7 @@ describe("SimulationEngine binary paper mode", () => {
 
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: 0.4,
       now: 2_000,
@@ -690,6 +704,7 @@ describe("SimulationEngine binary paper mode", () => {
     };
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: 0.55,
       now: 1_000,
@@ -708,6 +723,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: 0.49,
       now: 1_000,
@@ -733,6 +749,7 @@ describe("SimulationEngine binary paper mode", () => {
     const cfg = { ...binaryExitCfg, minEdgeThreshold: 0.1 };
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.5, noPrice: 0.5 },
       estimatedProbabilityUp: 0.4,
       now: 1_000,
@@ -751,6 +768,7 @@ describe("SimulationEngine binary paper mode", () => {
     const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
     sim.onTick({
       marketMode: "binary",
+      pipelineEntryApproved: true,
       binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
       underlyingSignalPrice: 100_000,
       estimatedProbabilityUp: probUpForYesLeg,
@@ -764,5 +782,23 @@ describe("SimulationEngine binary paper mode", () => {
     expect(sim.getLastBinaryEntryRejectionReason()).toBe(
       BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD
     );
+  });
+
+  it("skips binary entry when pipelineEntryApproved is false even if shouldEnter is true", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      pipelineEntryApproved: false,
+      binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
+      underlyingSignalPrice: 100_000,
+      estimatedProbabilityUp: probUpForYesLeg,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: binaryExitCfg,
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBe("pipeline_entry_not_approved");
   });
 });

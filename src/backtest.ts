@@ -980,6 +980,9 @@ export function runBinaryBacktestReplay(
       entry: paperEntry,
       entryPath,
       entryOpenReason,
+      pipelineEntryApproved:
+        pipeline.decision.action === "enter_immediate" ||
+        pipeline.decision.action === "promote_borderline_candidate",
       marketMode: "binary",
       binaryOutcomes,
       underlyingSignalPrice: btc,

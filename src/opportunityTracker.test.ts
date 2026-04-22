@@ -129,7 +129,7 @@ describe("buildOpportunityFromReadyTick", () => {
     expect(o!.spikeDirection).toBe("UP");
   });
 
-  it("allows valid opportunity when pipeline only defers confirmation tick", () => {
+  it("does not treat confirmation deferral as entryAllowed", () => {
     const prev = 100_000;
     const last = 100_700;
     const prices = makeStableThenSpikePrices(prev, 10, last);
@@ -151,10 +151,9 @@ describe("buildOpportunityFromReadyTick", () => {
       },
     });
     expect(o).not.toBeNull();
-    expect(o!.entryAllowed).toBe(true);
-    expect(o!.pipelineWatchPathDeferredNonBlocking).toBe(true);
-    expect(o!.status).toBe("valid");
-    expect(o!.entryRejectionReasons).toEqual([]);
+    expect(o!.entryAllowed).toBe(false);
+    expect(o!.status).toBe("rejected");
+    expect(o!.opportunityOutcome).toBe("rejected");
   });
 });
 

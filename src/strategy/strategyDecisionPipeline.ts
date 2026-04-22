@@ -118,12 +118,16 @@ export function isStrongSpikeWaitingConfirmationDeferral(
   );
 }
 
-/** Temporary non-blocking mode: deferral alone does not invalidate `shouldEnter`. */
+/**
+ * Legacy hook (always false): strong-spike confirmation deferral must not bypass the pipeline
+ * for paper execution — {@link entryEvaluationForPipelinePaperExecution} clears `shouldEnter`
+ * unless {@link StrategyDecision.action} is `enter_immediate` or `promote_borderline_candidate`.
+ */
 export function allowsPaperEntryDespitePipelineWatchDeferral(
-  decision: Pick<StrategyDecision, "action"> & { reason?: string },
-  entryShouldEnter: boolean
+  _decision: Pick<StrategyDecision, "action"> & { reason?: string },
+  _entryShouldEnter: boolean
 ): boolean {
-  return isStrongSpikeWaitingConfirmationDeferral(decision) && entryShouldEnter;
+  return false;
 }
 
 /**
@@ -141,22 +145,6 @@ export function entryEvaluationForPipelinePaperExecution(
     decision.action === "promote_borderline_candidate"
   ) {
     return entryForSimulation;
-  }
-  if (
-    allowsPaperEntryDespitePipelineWatchDeferral(
-      decision,
-      entryForSimulation.shouldEnter
-    )
-  ) {
-    const reasons = entryForSimulation.reasons.includes(
-      PIPELINE_WATCH_PATH_WARNING_REASON
-    )
-      ? entryForSimulation.reasons
-      : [...entryForSimulation.reasons, PIPELINE_WATCH_PATH_WARNING_REASON];
-    return {
-      ...entryForSimulation,
-      reasons,
-    };
   }
   if (!entryForSimulation.shouldEnter) {
     return entryForSimulation;

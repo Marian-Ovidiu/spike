@@ -35,4 +35,10 @@ describe("resolvePaperTradeEntryPath", () => {
       )
     ).toBe("strong_spike_immediate");
   });
+
+  it("does not tag non-entry decisions as immediate", () => {
+    expect(
+      resolvePaperTradeEntryPath(d({ action: "none", reason: "strong_spike_waiting_confirmation_tick" }))
+    ).toBe("borderline_delayed");
+  });
 });
