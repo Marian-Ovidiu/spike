@@ -52,7 +52,7 @@ describe("binaryRunAnalytics", () => {
       },
       openedTradesOverride: 5,
     });
-    expect(report.schema).toBe("binary_run_analytics_v2");
+    expect(report.schema).toBe("binary_run_analytics_v3");
     expect(report.opportunitiesTotal).toBe(2);
     expect(report.opportunitiesByType.strong_spike).toBe(1);
     expect(report.opportunitiesByType.borderline).toBe(1);

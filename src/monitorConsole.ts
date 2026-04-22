@@ -13,9 +13,10 @@ import {
   buildTransparentTradeLog,
   type SimulatedTrade,
 } from "./simulationEngine.js";
-import type {
-  BorderlineLifecycleRenderEvent,
-  StrategyDecision,
+import {
+  allowsPaperEntryDespitePipelineWatchDeferral,
+  type BorderlineLifecycleRenderEvent,
+  type StrategyDecision,
 } from "./strategy/strategyDecisionPipeline.js";
 import type { BinaryQuoteSessionSnapshot } from "./binary/monitor/binaryMonitorQuoteStats.js";
 import type { MonitorTickFormatContext } from "./binary/monitor/binaryMonitorTickTypes.js";
@@ -81,6 +82,8 @@ const LIVE_IT_REJECTION: Record<NormalizedRejectionReason, string> = {
   feed_stale: "dati mercato obsoleti",
   quote_feed_stale: "quotazione binaria obsoleta",
   entry_side_price_too_high: "prezzo d'ingresso troppo alto",
+  binary_yes_mid_extreme: "YES fuori banda (mercato quasi risolto)",
+  spread_too_wide_hard_block: "spread troppo ampio (limite rigido)",
   missing_binary_quotes: "prezzi YES/NO assenti",
   negative_or_zero_model_edge: "edge modello assente o non positivo",
   model_edge_below_min_threshold: "edge modello sotto soglia minima",
@@ -1167,6 +1170,13 @@ export function printShutdownReport(
     binaryYesNoComparative?: BinaryYesNoComparativeReport;
     /** Binary: full run analytics (mispricing table, session-summary parity). */
     binaryRunAnalytics?: BinaryRunAnalyticsReport | null;
+    /** Non-borderline split (same totals as legacy strong-spike aggregate when summed). */
+    strongSpikeImmediateTradesClosed?: number;
+    strongSpikeImmediateWinRate?: number;
+    averageStrongSpikeImmediatePnL?: number;
+    strongSpikeConfirmedTradesClosed?: number;
+    strongSpikeConfirmedWinRate?: number;
+    averageStrongSpikeConfirmedPnL?: number;
   }
 ): void {
   const durationMs = Math.max(0, Date.now() - startedAtMs);
@@ -1201,8 +1211,24 @@ export function printShutdownReport(
   );
   if (extended !== undefined) {
     console.log(
-      `${"Strong win%".padEnd(14)} ${extended.strongSpikeWinRate.toFixed(1)}%`
+      `${"Strong win%".padEnd(14)} ${extended.strongSpikeWinRate.toFixed(1)}% (all non-borderline)`
     );
+    if (
+      extended.strongSpikeImmediateTradesClosed !== undefined &&
+      extended.strongSpikeImmediateTradesClosed > 0
+    ) {
+      console.log(
+        `${"Strong imm".padEnd(14)} n=${extended.strongSpikeImmediateTradesClosed}  win% ${(extended.strongSpikeImmediateWinRate ?? 0).toFixed(1)}  avg ${(extended.averageStrongSpikeImmediatePnL ?? 0) >= 0 ? "+" : ""}${(extended.averageStrongSpikeImmediatePnL ?? 0).toFixed(4)}`
+      );
+    }
+    if (
+      extended.strongSpikeConfirmedTradesClosed !== undefined &&
+      extended.strongSpikeConfirmedTradesClosed > 0
+    ) {
+      console.log(
+        `${"Strong cnf".padEnd(14)} n=${extended.strongSpikeConfirmedTradesClosed}  win% ${(extended.strongSpikeConfirmedWinRate ?? 0).toFixed(1)}  avg ${(extended.averageStrongSpikeConfirmedPnL ?? 0) >= 0 ? "+" : ""}${(extended.averageStrongSpikeConfirmedPnL ?? 0).toFixed(4)}`
+      );
+    }
     console.log(
       `${"Border win%".padEnd(14)} ${extended.delayedBorderlineWinRate.toFixed(1)}%`
     );
@@ -1430,6 +1456,11 @@ export type SpikeDecisionTracePayload = {
   entryAllowed: boolean;
   /** Non-empty when entry is blocked; normalized / entry codes. */
   rejectionReasons: readonly string[];
+  /**
+   * When set, pipeline asked for a confirmation tick but entry was not blocked
+   * (`strong_spike_waiting_confirmation_tick`).
+   */
+  pipelineWatchPathNonBlockingNote?: string;
 };
 
 function collectSpikeTraceRejectionReasons(
@@ -1457,9 +1488,14 @@ export function buildSpikeDecisionTracePayload(input: {
   decision: StrategyDecision;
 }): SpikeDecisionTracePayload {
   const { entry, decision } = input;
+  const pipelineWatchNonBlocking = allowsPaperEntryDespitePipelineWatchDeferral(
+    decision,
+    entry.shouldEnter
+  );
   const entryAllowed =
     decision.action === "enter_immediate" ||
-    decision.action === "promote_borderline_candidate";
+    decision.action === "promote_borderline_candidate" ||
+    pipelineWatchNonBlocking;
   return {
     spikePercent: entry.movement.strongestMovePercent * 100,
     priorRange: entry.priorRangeFraction * 100,
@@ -1469,6 +1505,12 @@ export function buildSpikeDecisionTracePayload(input: {
     rejectionReasons: entryAllowed
       ? []
       : collectSpikeTraceRejectionReasons(entry, decision),
+    ...(pipelineWatchNonBlocking
+      ? {
+          pipelineWatchPathNonBlockingNote:
+            "strong_spike_waiting_confirmation_tick",
+        }
+      : {}),
   };
 }
 

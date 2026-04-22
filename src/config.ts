@@ -201,6 +201,12 @@ export const configDefaults = {
   strongSpikeConfirmationTicks: 1,
   /** Min spike percent to consider a move exceptional (0.0025 = 0.25%). */
   exceptionalSpikePercent: 0.0025,
+  /**
+   * Strong-spike profile (not yet exceptional): skip confirmation ticks when
+   * `strongestMovePercent >= this × max(TRADABLE_SPIKE_MIN_PERCENT, EXCEPTIONAL_SPIKE_PERCENT)`.
+   * `0` disables (always wait for confirmation when quality profile is not exceptional).
+   */
+  strongSpikeEarlyEntryExceptionalFraction: 0.7,
   /** If true, exceptional spikes can bypass cooldown-only blockers. */
   exceptionalSpikeOverridesCooldown: true,
   /** Max bid/ask spread (basis points) to allow a paper entry. */
@@ -298,6 +304,33 @@ export const configDefaults = {
   /** With {@link binaryNeutralQuoteBandMax}: if max > min, block when both YES and NO fall inside [min,max]. `0,0` disables. */
   binaryNeutralQuoteBandMin: 0,
   binaryNeutralQuoteBandMax: 0,
+  /**
+   * When true, YES/NO use separate mispricing floors and max entry prices when set (≥ 0).
+   * `-1` on a side override means inherit {@link minEdgeThreshold} / {@link binaryMaxEntryPrice}.
+   */
+  binaryEnableSideSpecificGating: false,
+  /** Override {@link minEdgeThreshold} for YES-only entries. `-1` = inherit global. */
+  binaryYesMinMispricingThreshold: -1,
+  /** Override {@link minEdgeThreshold} for NO-only entries. `-1` = inherit global. */
+  binaryNoMinMispricingThreshold: -1,
+  /** Override {@link binaryMaxEntryPrice} for YES-only entries. `-1` = inherit global. */
+  binaryYesMaxEntryPrice: -1,
+  /** Override {@link binaryMaxEntryPrice} for NO-only entries. `-1` = inherit global. */
+  binaryNoMaxEntryPrice: -1,
+  /**
+   * Block binary entries when venue YES mid is outside `[binaryYesMidBandMin, binaryYesMidBandMax]`
+   * (near-resolved token, little edge). Set false to disable.
+   */
+  binaryYesMidExtremeFilterEnabled: true,
+  /** Inclusive lower bound on YES mid (0–1). */
+  binaryYesMidBandMin: 0.05,
+  /** Inclusive upper bound on YES mid (0–1). */
+  binaryYesMidBandMax: 0.95,
+  /**
+   * Binary: reject entries when venue `spreadBps` exceeds this (hard cap).
+   * `0` disables. Independent of {@link maxEntrySpreadBps} (strategy soft gate).
+   */
+  binaryHardMaxSpreadBps: 20,
   /** Min ms after a simulated exit before another entry (reduces churn). */
   entryCooldownMs: 120_000,
   /** Max number of recent prices to retain in the rolling buffer. */
@@ -362,6 +395,11 @@ export const configDefaults = {
    * When true, stale WebSocket feed blocks entries (monitor paper pipeline).
    */
   blockEntriesOnStaleFeed: true,
+  /**
+   * Binary only: when true, never open with persisted entry path `strong_spike_immediate`
+   * (blocks same-tick strong-spike fill; confirmation + borderline promote unchanged).
+   */
+  binaryDisableImmediateStrongSpike: false,
   /** `MARKET_MODE` — default binary on this branch. */
   marketMode: "binary" as MarketMode,
   /**
@@ -416,6 +454,7 @@ export const CONFIG_KEY_GROUP: { [K in keyof AppConfig]: ConfigKeyGroup } = {
   strongSpikeHardRejectPoorRange: "shared",
   strongSpikeConfirmationTicks: "shared",
   exceptionalSpikePercent: "shared",
+  strongSpikeEarlyEntryExceptionalFraction: "shared",
   exceptionalSpikeOverridesCooldown: "shared",
   maxEntrySpreadBps: "shared",
   spikeMinRangeMultiple: "shared",
@@ -469,6 +508,16 @@ export const CONFIG_KEY_GROUP: { [K in keyof AppConfig]: ConfigKeyGroup } = {
   binaryMaxEntrySidePrice: "binary",
   binaryNeutralQuoteBandMin: "binary",
   binaryNeutralQuoteBandMax: "binary",
+  binaryEnableSideSpecificGating: "binary",
+  binaryYesMinMispricingThreshold: "binary",
+  binaryNoMinMispricingThreshold: "binary",
+  binaryYesMaxEntryPrice: "binary",
+  binaryNoMaxEntryPrice: "binary",
+  binaryYesMidExtremeFilterEnabled: "binary",
+  binaryYesMidBandMin: "binary",
+  binaryYesMidBandMax: "binary",
+  binaryHardMaxSpreadBps: "binary",
+  binaryDisableImmediateStrongSpike: "binary",
   binarySignalSource: "binary",
   binarySignalSymbol: "binary",
 };
@@ -497,6 +546,8 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   strongSpikeHardRejectPoorRange: "STRONG_SPIKE_HARD_REJECT_POOR_RANGE",
   strongSpikeConfirmationTicks: "STRONG_SPIKE_CONFIRMATION_TICKS",
   exceptionalSpikePercent: "EXCEPTIONAL_SPIKE_PERCENT",
+  strongSpikeEarlyEntryExceptionalFraction:
+    "STRONG_SPIKE_EARLY_ENTRY_EXCEPTIONAL_FRACTION",
   exceptionalSpikeOverridesCooldown: "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
   maxEntrySpreadBps: "MAX_ENTRY_SPREAD_BPS",
   spikeMinRangeMultiple: "SPIKE_MIN_RANGE_MULT",
@@ -530,6 +581,16 @@ const ENV_KEYS: { [K in keyof AppConfig]: string } = {
   binaryMaxEntrySidePrice: "BINARY_MAX_ENTRY_SIDE_PRICE",
   binaryNeutralQuoteBandMin: "BINARY_NEUTRAL_QUOTE_BAND_MIN",
   binaryNeutralQuoteBandMax: "BINARY_NEUTRAL_QUOTE_BAND_MAX",
+  binaryEnableSideSpecificGating: "BINARY_ENABLE_SIDE_SPECIFIC_GATING",
+  binaryYesMinMispricingThreshold: "BINARY_YES_MIN_MISPRICING_THRESHOLD",
+  binaryNoMinMispricingThreshold: "BINARY_NO_MIN_MISPRICING_THRESHOLD",
+  binaryYesMaxEntryPrice: "BINARY_YES_MAX_ENTRY_PRICE",
+  binaryNoMaxEntryPrice: "BINARY_NO_MAX_ENTRY_PRICE",
+  binaryYesMidExtremeFilterEnabled: "BINARY_YES_MID_EXTREME_FILTER_ENABLED",
+  binaryYesMidBandMin: "BINARY_YES_MID_BAND_MIN",
+  binaryYesMidBandMax: "BINARY_YES_MID_BAND_MAX",
+  binaryHardMaxSpreadBps: "BINARY_HARD_MAX_SPREAD_BPS",
+  binaryDisableImmediateStrongSpike: "BINARY_DISABLE_IMMEDIATE_STRONG_SPIKE",
   entryCooldownMs: "ENTRY_COOLDOWN_MS",
   priceBufferSize: "PRICE_BUFFER_SIZE",
   probabilityWindowSize: "PROBABILITY_WINDOW_SIZE",
@@ -787,6 +848,14 @@ function loadConfig(): {
     "EXCEPTIONAL_SPIKE_OVERRIDES_COOLDOWN",
     configDefaults.exceptionalSpikeOverridesCooldown
   );
+  const strongSpikeEarlyEntryExceptionalFractionRaw = parseEnvNumber(
+    "STRONG_SPIKE_EARLY_ENTRY_EXCEPTIONAL_FRACTION",
+    configDefaults.strongSpikeEarlyEntryExceptionalFraction
+  );
+  const strongSpikeEarlyEntryExceptionalFraction = Math.min(
+    1,
+    Math.max(0, strongSpikeEarlyEntryExceptionalFractionRaw.value)
+  );
   const maxEntrySpreadBps = parseEnvNumber(
     "MAX_ENTRY_SPREAD_BPS",
     configDefaults.maxEntrySpreadBps
@@ -1003,10 +1072,80 @@ function loadConfig(): {
     "BLOCK_ENTRIES_ON_STALE_FEED",
     configDefaults.blockEntriesOnStaleFeed
   );
+  const binaryDisableImmediateStrongSpike = parseEnvBoolean(
+    "BINARY_DISABLE_IMMEDIATE_STRONG_SPIKE",
+    configDefaults.binaryDisableImmediateStrongSpike
+  );
   const paperPositionMtmDebug = parseEnvBoolean(
     "PAPER_POSITION_MTM_DEBUG",
     configDefaults.paperPositionMtmDebug
   );
+  const binaryEnableSideSpecificGating = parseEnvBoolean(
+    "BINARY_ENABLE_SIDE_SPECIFIC_GATING",
+    configDefaults.binaryEnableSideSpecificGating
+  );
+  const binaryYesMinMispricingThresholdRaw = parseEnvNumber(
+    "BINARY_YES_MIN_MISPRICING_THRESHOLD",
+    configDefaults.binaryYesMinMispricingThreshold
+  );
+  const binaryNoMinMispricingThresholdRaw = parseEnvNumber(
+    "BINARY_NO_MIN_MISPRICING_THRESHOLD",
+    configDefaults.binaryNoMinMispricingThreshold
+  );
+  const binaryYesMaxEntryPriceRaw = parseEnvNumber(
+    "BINARY_YES_MAX_ENTRY_PRICE",
+    configDefaults.binaryYesMaxEntryPrice
+  );
+  const binaryNoMaxEntryPriceRaw = parseEnvNumber(
+    "BINARY_NO_MAX_ENTRY_PRICE",
+    configDefaults.binaryNoMaxEntryPrice
+  );
+  const binaryYesMinMispricingThreshold =
+    binaryYesMinMispricingThresholdRaw.value < 0
+      ? -1
+      : Math.min(1, Math.max(0, binaryYesMinMispricingThresholdRaw.value));
+  const binaryNoMinMispricingThreshold =
+    binaryNoMinMispricingThresholdRaw.value < 0
+      ? -1
+      : Math.min(1, Math.max(0, binaryNoMinMispricingThresholdRaw.value));
+  const binaryYesMaxEntryPrice =
+    binaryYesMaxEntryPriceRaw.value < 0
+      ? -1
+      : Math.min(10, Math.max(0, binaryYesMaxEntryPriceRaw.value));
+  const binaryNoMaxEntryPrice =
+    binaryNoMaxEntryPriceRaw.value < 0
+      ? -1
+      : Math.min(10, Math.max(0, binaryNoMaxEntryPriceRaw.value));
+  const binaryYesMidExtremeFilterEnabled = parseEnvBoolean(
+    "BINARY_YES_MID_EXTREME_FILTER_ENABLED",
+    configDefaults.binaryYesMidExtremeFilterEnabled
+  );
+  const binaryYesMidBandMinRaw = parseEnvNumber(
+    "BINARY_YES_MID_BAND_MIN",
+    configDefaults.binaryYesMidBandMin
+  );
+  const binaryYesMidBandMaxRaw = parseEnvNumber(
+    "BINARY_YES_MID_BAND_MAX",
+    configDefaults.binaryYesMidBandMax
+  );
+  let binaryYesMidBandMin = Math.min(
+    1,
+    Math.max(0, binaryYesMidBandMinRaw.value)
+  );
+  let binaryYesMidBandMax = Math.min(
+    1,
+    Math.max(0, binaryYesMidBandMaxRaw.value)
+  );
+  if (binaryYesMidBandMin > binaryYesMidBandMax) {
+    const t = binaryYesMidBandMin;
+    binaryYesMidBandMin = binaryYesMidBandMax;
+    binaryYesMidBandMax = t;
+  }
+  const binaryHardMaxSpreadBpsRaw = parseEnvNumber(
+    "BINARY_HARD_MAX_SPREAD_BPS",
+    configDefaults.binaryHardMaxSpreadBps
+  );
+  const binaryHardMaxSpreadBps = Math.max(0, binaryHardMaxSpreadBpsRaw.value);
   const testModeSoftUnstable = parseEnvBoolean(
     "TEST_MODE_SOFT_UNSTABLE",
     false
@@ -1030,6 +1169,7 @@ function loadConfig(): {
       strongSpikeHardRejectPoorRange: strongSpikeHardRejectPoorRange.value,
       strongSpikeConfirmationTicks,
       exceptionalSpikePercent: Math.max(0, exceptionalSpikePercent.value),
+      strongSpikeEarlyEntryExceptionalFraction,
       exceptionalSpikeOverridesCooldown: exceptionalSpikeOverridesCooldown.value,
       maxEntrySpreadBps: Math.max(0, maxEntrySpreadBps.value),
       spikeMinRangeMultiple: Math.max(0, spikeMinRangeMultiple.value),
@@ -1081,6 +1221,15 @@ function loadConfig(): {
         0,
         binaryNeutralQuoteBandMax.value
       ),
+      binaryEnableSideSpecificGating: binaryEnableSideSpecificGating.value,
+      binaryYesMinMispricingThreshold,
+      binaryNoMinMispricingThreshold,
+      binaryYesMaxEntryPrice,
+      binaryNoMaxEntryPrice,
+      binaryYesMidExtremeFilterEnabled: binaryYesMidExtremeFilterEnabled.value,
+      binaryYesMidBandMin,
+      binaryYesMidBandMax,
+      binaryHardMaxSpreadBps,
       entryCooldownMs: Math.max(0, entryCooldownMs.value),
       priceBufferSize,
       probabilityWindowSize,
@@ -1103,6 +1252,7 @@ function loadConfig(): {
       testMode: testModeParsed.value,
       feedStaleMaxAgeMs: Math.max(0, feedStaleMaxAgeMs.value),
       blockEntriesOnStaleFeed: blockEntriesOnStaleFeed.value,
+      binaryDisableImmediateStrongSpike: binaryDisableImmediateStrongSpike.value,
       paperPositionMtmDebug: paperPositionMtmDebug.value,
       marketMode: marketMode.value,
       binarySignalSource: binarySignalSource.value,
@@ -1153,6 +1303,9 @@ function loadConfig(): {
         fromEnv: strongSpikeConfirmationTicksRaw.fromEnv,
       },
       exceptionalSpikePercent: { fromEnv: exceptionalSpikePercent.fromEnv },
+      strongSpikeEarlyEntryExceptionalFraction: {
+        fromEnv: strongSpikeEarlyEntryExceptionalFractionRaw.fromEnv,
+      },
       exceptionalSpikeOverridesCooldown: {
         fromEnv: exceptionalSpikeOverridesCooldown.fromEnv,
       },
@@ -1242,6 +1395,33 @@ function loadConfig(): {
           ? { resolvedFrom: binaryNeutralQuoteBandMax.resolvedFrom }
           : {}),
       },
+      binaryEnableSideSpecificGating: {
+        fromEnv: binaryEnableSideSpecificGating.fromEnv,
+      },
+      binaryYesMinMispricingThreshold: {
+        fromEnv: binaryYesMinMispricingThresholdRaw.fromEnv,
+      },
+      binaryNoMinMispricingThreshold: {
+        fromEnv: binaryNoMinMispricingThresholdRaw.fromEnv,
+      },
+      binaryYesMaxEntryPrice: {
+        fromEnv: binaryYesMaxEntryPriceRaw.fromEnv,
+      },
+      binaryNoMaxEntryPrice: {
+        fromEnv: binaryNoMaxEntryPriceRaw.fromEnv,
+      },
+      binaryYesMidExtremeFilterEnabled: {
+        fromEnv: binaryYesMidExtremeFilterEnabled.fromEnv,
+      },
+      binaryYesMidBandMin: {
+        fromEnv: binaryYesMidBandMinRaw.fromEnv,
+      },
+      binaryYesMidBandMax: {
+        fromEnv: binaryYesMidBandMaxRaw.fromEnv,
+      },
+      binaryHardMaxSpreadBps: {
+        fromEnv: binaryHardMaxSpreadBpsRaw.fromEnv,
+      },
       entryCooldownMs: { fromEnv: entryCooldownMs.fromEnv },
       priceBufferSize: { fromEnv: priceBufferSizeRaw.fromEnv },
       probabilityWindowSize: { fromEnv: probabilityWindowSizeRaw.fromEnv },
@@ -1271,6 +1451,9 @@ function loadConfig(): {
       feedStaleMaxAgeMs: { fromEnv: feedStaleMaxAgeMs.fromEnv },
       blockEntriesOnStaleFeed: {
         fromEnv: blockEntriesOnStaleFeed.fromEnv,
+      },
+      binaryDisableImmediateStrongSpike: {
+        fromEnv: binaryDisableImmediateStrongSpike.fromEnv,
       },
       paperPositionMtmDebug: { fromEnv: paperPositionMtmDebug.fromEnv },
       marketMode: {

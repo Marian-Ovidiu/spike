@@ -38,7 +38,7 @@ describe("monitorPersistence", () => {
       marketMode: "binary",
       normalizedConfig: norm,
     });
-    expect(s.normalizedConfig?.schema).toBe("normalized_monitor_config_v2");
+    expect(s.normalizedConfig?.schema).toBe("normalized_monitor_config_v3");
     expect(s.normalizedConfig?.marketMode).toBe("binary");
     expect(s.normalizedConfig?.effectiveExits.timeoutAppliesTo).toBe(
       "binary_outcome_leg"

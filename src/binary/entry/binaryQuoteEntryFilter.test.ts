@@ -73,4 +73,35 @@ describe("evaluateBinaryPaperEntryQuotes", () => {
       })
     ).toBe("missing_binary_quotes");
   });
+
+  it("blocks when YES mid is above band max (default band)", () => {
+    expect(
+      evaluateBinaryPaperEntryQuotes({
+        binaryOutcomes: { yesPrice: 0.96, noPrice: 0.04 },
+        direction: "UP",
+        ...base,
+      })
+    ).toBe("binary_yes_mid_extreme");
+  });
+
+  it("blocks when YES mid is below band min (default band)", () => {
+    expect(
+      evaluateBinaryPaperEntryQuotes({
+        binaryOutcomes: { yesPrice: 0.04, noPrice: 0.96 },
+        direction: "DOWN",
+        ...base,
+      })
+    ).toBe("binary_yes_mid_extreme");
+  });
+
+  it("allows extreme YES mid when extreme filter disabled", () => {
+    expect(
+      evaluateBinaryPaperEntryQuotes({
+        binaryOutcomes: { yesPrice: 0.97, noPrice: 0.03 },
+        direction: "UP",
+        ...base,
+        yesMidExtremeFilterEnabled: false,
+      })
+    ).toBeNull();
+  });
 });

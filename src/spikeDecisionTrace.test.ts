@@ -63,4 +63,21 @@ describe("buildSpikeDecisionTracePayload", () => {
     expect(p.entryAllowed).toBe(true);
     expect(p.rejectionReasons).toEqual([]);
   });
+
+  it("treats strong_spike_waiting_confirmation_tick as allowed entry with observability note", () => {
+    const p = buildSpikeDecisionTracePayload({
+      entry: { ...baseEntry, shouldEnter: true, reasons: [] },
+      decision: {
+        ...baseDecision,
+        action: "none",
+        reason: "strong_spike_waiting_confirmation_tick",
+        reasons: undefined,
+      },
+    });
+    expect(p.entryAllowed).toBe(true);
+    expect(p.rejectionReasons).toEqual([]);
+    expect(p.pipelineWatchPathNonBlockingNote).toBe(
+      "strong_spike_waiting_confirmation_tick"
+    );
+  });
 });

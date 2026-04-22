@@ -249,6 +249,16 @@ function gracefulShutdown(): void {
       topRejectionReasons: runtimeStats.getTopRejectionReasons(5),
       verdict: borderlineImpactVerdict(),
       gateFunnel,
+      strongSpikeImmediateTradesClosed:
+        runtimeStats.strongSpikeImmediateTradesClosed,
+      strongSpikeImmediateWinRate: runtimeStats.strongSpikeImmediateWinRate,
+      averageStrongSpikeImmediatePnL:
+        runtimeStats.strongSpikeImmediateAveragePnL,
+      strongSpikeConfirmedTradesClosed:
+        runtimeStats.strongSpikeConfirmedTradesClosed,
+      strongSpikeConfirmedWinRate: runtimeStats.strongSpikeConfirmedWinRate,
+      averageStrongSpikeConfirmedPnL:
+        runtimeStats.strongSpikeConfirmedAveragePnL,
       testMode: config.testMode,
       marketMode: config.marketMode,
       configGroupSummary: describeActiveConfigGroups(config.marketMode),
@@ -355,6 +365,16 @@ function gracefulShutdown(): void {
           strongSpikePnL: runtimeStats.strongSpikePnL,
           averageStrongSpikePnL: runtimeStats.strongSpikeAveragePnL,
           strongSpikeWinRate: runtimeStats.strongSpikeWinRate,
+          strongSpikeImmediateTradesClosed:
+            runtimeStats.strongSpikeImmediateTradesClosed,
+          strongSpikeImmediateWinRate: runtimeStats.strongSpikeImmediateWinRate,
+          averageStrongSpikeImmediatePnL:
+            runtimeStats.strongSpikeImmediateAveragePnL,
+          strongSpikeConfirmedTradesClosed:
+            runtimeStats.strongSpikeConfirmedTradesClosed,
+          strongSpikeConfirmedWinRate: runtimeStats.strongSpikeConfirmedWinRate,
+          averageStrongSpikeConfirmedPnL:
+            runtimeStats.strongSpikeConfirmedAveragePnL,
           delayedBorderlineWinRate: runtimeStats.borderlineWinRate,
           borderlineNetImpact: borderlineNetImpact(),
           verdict: borderlineImpactVerdict(),

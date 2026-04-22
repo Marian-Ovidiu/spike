@@ -20,6 +20,10 @@ export type NormalizedRejectionReason =
   | "quote_feed_stale"
   | "entry_side_price_too_high"
   | "missing_binary_quotes"
+  /** YES venue mid outside configured tradeable band (near-resolution). */
+  | "binary_yes_mid_extreme"
+  /** Binary venue book spread above configured hard maximum (bps). */
+  | "spread_too_wide_hard_block"
   | "negative_or_zero_model_edge"
   | "model_edge_below_min_threshold"
   /**
@@ -79,6 +83,8 @@ export function opportunityHasLegacyPipelineQualityDowngrade(
 export const PRIMARY_REJECTION_BLOCKER_PRIORITY: readonly NormalizedRejectionReason[] = [
   "missing_quote_data",
   "missing_binary_quotes",
+  "binary_yes_mid_extreme",
+  "spread_too_wide_hard_block",
   "quote_feed_stale",
   "invalid_market_prices",
   "market_quotes_too_neutral",
@@ -137,6 +143,8 @@ const ORDER: readonly NormalizedRejectionReason[] = [
   "feed_stale",
   "quote_feed_stale",
   "entry_side_price_too_high",
+  "binary_yes_mid_extreme",
+  "spread_too_wide_hard_block",
   "missing_binary_quotes",
   "negative_or_zero_model_edge",
   "model_edge_below_min_threshold",
@@ -162,6 +170,10 @@ export const REJECTION_REASON_MESSAGES: Record<NormalizedRejectionReason, string
   feed_stale: "market data feed stale (no recent Binance book/trade updates)",
   quote_feed_stale: "binary / outcome quote feed stale",
   entry_side_price_too_high: "bought outcome leg too expensive (binary cap)",
+  binary_yes_mid_extreme:
+    "YES mid outside tradeable band (resolved / no marginal edge)",
+  spread_too_wide_hard_block:
+    "venue spread exceeds configured hard maximum (binary)",
   missing_binary_quotes: "YES/NO prices missing or invalid for binary entry",
   negative_or_zero_model_edge:
     "binary paper: model edge on bought leg is missing, NaN, or not positive",
@@ -198,6 +210,8 @@ const SUPERSEDES_GENERIC_QUALITY_GATE: ReadonlySet<NormalizedRejectionReason> = 
   "opposite_side_price_too_high",
   "market_quotes_too_neutral",
   "entry_side_price_too_high",
+  "binary_yes_mid_extreme",
+  "spread_too_wide_hard_block",
   "missing_binary_quotes",
   "negative_or_zero_model_edge",
   "model_edge_below_min_threshold",
@@ -247,6 +261,8 @@ function normalizeRawReason(
   if (raw === "neutral_quotes") return "market_quotes_too_neutral";
   if (raw === "entry_side_price_too_high") return "entry_side_price_too_high";
   if (raw === "missing_binary_quotes") return "missing_binary_quotes";
+  if (raw === "binary_yes_mid_extreme") return "binary_yes_mid_extreme";
+  if (raw === "spread_too_wide_hard_block") return "spread_too_wide_hard_block";
   if (raw === "negative_or_zero_model_edge") return "negative_or_zero_model_edge";
   if (
     raw === "binary_model_edge_below_min_threshold" ||

@@ -15,6 +15,7 @@ import type { BinaryHoldExitAuditSummary } from "./holdExitAudit.js";
 import type { MarketFeedDiagnostics, MarketMode } from "./market/types.js";
 import type { NormalizedMonitorConfigSummary } from "./config/monitorNormalizedConfigSummary.js";
 import type { BinaryRunAnalyticsReport } from "./analyze/binaryRunAnalytics.js";
+import type { BinaryMultiSessionAggregateReport } from "./analyze/binaryMultiSessionAggregate.js";
 import { describeActiveConfigGroups } from "./config.js";
 
 const DEFAULT_OUTPUT_DIR = "output/monitor";
@@ -216,6 +217,12 @@ export function buildMonitorSessionSummary(input: {
     strongSpikePnL: number;
     averageStrongSpikePnL: number;
     strongSpikeWinRate: number;
+    strongSpikeImmediateTradesClosed?: number;
+    strongSpikeImmediateWinRate?: number;
+    averageStrongSpikeImmediatePnL?: number;
+    strongSpikeConfirmedTradesClosed?: number;
+    strongSpikeConfirmedWinRate?: number;
+    averageStrongSpikeConfirmedPnL?: number;
     delayedBorderlineWinRate: number;
     borderlineNetImpact: "positive" | "negative" | "flat";
     verdict: "helpful" | "neutral" | "harmful";
@@ -244,6 +251,11 @@ export function buildMonitorSessionSummary(input: {
   };
   /** Binary mode: aggregated funnel + trade attribution (also reproducible via `npm run analyze-run`). */
   binaryRunAnalytics?: BinaryRunAnalyticsReport | null;
+  /**
+   * Optional: copy of {@link BinaryMultiSessionAggregateReport} from offline
+   * `npm run analyze-sessions` (primary artifact: `multi-session-aggregate.json`).
+   */
+  multiSessionAggregate?: BinaryMultiSessionAggregateReport | null;
 }): MonitorSessionSummary {
   const opportunitiesFound =
     input.validOpportunities + input.rejectedOpportunities;
@@ -292,6 +304,9 @@ export function buildMonitorSessionSummary(input: {
   if (input.binaryRunAnalytics !== undefined && input.binaryRunAnalytics !== null) {
     summary.binaryRunAnalytics = input.binaryRunAnalytics;
   }
+  if (input.multiSessionAggregate !== undefined && input.multiSessionAggregate !== null) {
+    summary.multiSessionAggregate = input.multiSessionAggregate;
+  }
   return summary;
 }
 
@@ -302,6 +317,8 @@ export type MonitorSessionSummary = {
   outputDirectory: string;
   /** Present when `MARKET_MODE=binary` and shutdown analytics were computed. */
   binaryRunAnalytics?: BinaryRunAnalyticsReport;
+  /** Optional offline multi-session rollup (`analyze-sessions`) embedded for tooling. */
+  multiSessionAggregate?: BinaryMultiSessionAggregateReport;
   /** Live monitor shutdown only — aligns session artifact with MARKET_MODE. */
   marketMode?: MarketMode;
   /** Which config sections were active vs ignored for this run. */
@@ -374,6 +391,12 @@ export type MonitorSessionSummary = {
     strongSpikePnL: number;
     averageStrongSpikePnL: number;
     strongSpikeWinRate: number;
+    strongSpikeImmediateTradesClosed?: number;
+    strongSpikeImmediateWinRate?: number;
+    averageStrongSpikeImmediatePnL?: number;
+    strongSpikeConfirmedTradesClosed?: number;
+    strongSpikeConfirmedWinRate?: number;
+    averageStrongSpikeConfirmedPnL?: number;
     delayedBorderlineWinRate: number;
     borderlineNetImpact: "positive" | "negative" | "flat";
     verdict: "helpful" | "neutral" | "harmful";

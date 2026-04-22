@@ -47,5 +47,6 @@ export function buildBinaryPaperTradeLog(t: SimulatedTrade): Record<string, unkn
       ? { probabilityTimeHorizonMs: t.probabilityTimeHorizonMs }
       : {}),
     riskAtEntryUsdt: t.riskAtEntry,
+    ...(t.entryOpenReason !== undefined ? { entryOpenReason: t.entryOpenReason } : {}),
   };
 }

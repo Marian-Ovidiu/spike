@@ -44,7 +44,7 @@ describe("buildNormalizedMonitorConfigSummary", () => {
     });
     const meta = metaSignalDefaults();
     const n = buildNormalizedMonitorConfigSummary(cfg, meta);
-    expect(n.schema).toBe("normalized_monitor_config_v2");
+    expect(n.schema).toBe("normalized_monitor_config_v3");
     expect(n.marketMode).toBe("binary");
     expect(n.effectiveExits.takeProfitUnit).toBe("outcome_price_delta");
     expect(n.effectiveExits.takeProfit).toBe(0.04);
@@ -56,6 +56,34 @@ describe("buildNormalizedMonitorConfigSummary", () => {
     if (n.executionVenue.kind === "polymarket_gamma") {
       expect(n.staleFeeds.gammaExecution?.pollIntervalMs).toBeGreaterThanOrEqual(2000);
     }
+    expect(n.binarySideSpecificGating).toEqual({
+      enabled: false,
+      yesEffectiveMinMispricing: cfg.minEdgeThreshold,
+      noEffectiveMinMispricing: cfg.minEdgeThreshold,
+      yesEffectiveMaxEntryPrice: cfg.binaryMaxEntryPrice,
+      noEffectiveMaxEntryPrice: cfg.binaryMaxEntryPrice,
+    });
+  });
+
+  it("binary side-specific gating exposes resolved YES/NO thresholds when enabled", () => {
+    const cfg = baseCfg({
+      marketMode: "binary",
+      binaryEnableSideSpecificGating: true,
+      minEdgeThreshold: 0.02,
+      binaryYesMinMispricingThreshold: 0.05,
+      binaryNoMinMispricingThreshold: -1,
+      binaryMaxEntryPrice: 0.97,
+      binaryYesMaxEntryPrice: 0.92,
+      binaryNoMaxEntryPrice: -1,
+    });
+    const n = buildNormalizedMonitorConfigSummary(cfg, metaSignalDefaults());
+    expect(n.binarySideSpecificGating).toEqual({
+      enabled: true,
+      yesEffectiveMinMispricing: 0.05,
+      noEffectiveMinMispricing: 0.02,
+      yesEffectiveMaxEntryPrice: 0.92,
+      noEffectiveMaxEntryPrice: 0.97,
+    });
   });
 
   it("spot mode reports bps exits and signalDetection", () => {

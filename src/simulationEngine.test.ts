@@ -4,6 +4,7 @@ import {
   BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD,
   BINARY_ENTRY_REJECTION_NEGATIVE_OR_ZERO_MODEL_EDGE,
 } from "./binary/entry/edgeEntryDecision.js";
+import { BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD } from "./binary/monitor/binaryPreEntryAudit.js";
 import {
   buildTransparentTradeLog,
   computePerformanceFromClosedTrades,
@@ -26,6 +27,16 @@ const spotTickConfig = {
   binaryStopLossPriceDelta: 0.05,
   binaryExitTimeoutMs: 90_000,
   binaryMaxEntryPrice: 0.99,
+  binaryEnableSideSpecificGating: false,
+  binaryYesMinMispricingThreshold: -1,
+  binaryNoMinMispricingThreshold: -1,
+  binaryYesMaxEntryPrice: -1,
+  binaryNoMaxEntryPrice: -1,
+  binaryYesMidExtremeFilterEnabled: true,
+  binaryYesMidBandMin: 0.05,
+  binaryYesMidBandMax: 0.95,
+  /** Disabled in tests — binary scenarios use intentionally wide synthetic spreads. */
+  binaryHardMaxSpreadBps: 0,
   entryCooldownMs: 0,
   stakePerTrade: 5,
   allowWeakQualityEntries: false,
@@ -733,6 +744,25 @@ describe("SimulationEngine binary paper mode", () => {
     expect(sim.getOpenPosition()).toBeNull();
     expect(sim.getLastBinaryEntryRejectionReason()).toBe(
       BINARY_ENTRY_REJECTION_MODEL_EDGE_BELOW_MIN_THRESHOLD
+    );
+  });
+
+  it("skips binary entry when venue spread exceeds binaryHardMaxSpreadBps", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    sim.onTick({
+      marketMode: "binary",
+      binaryOutcomes: { yesPrice: 0.49, noPrice: 0.51 },
+      underlyingSignalPrice: 100_000,
+      estimatedProbabilityUp: probUpForYesLeg,
+      now: 1_000,
+      entry: entryOpenUp,
+      executionBook: book(),
+      symbol: SYM,
+      config: { ...binaryExitCfg, binaryHardMaxSpreadBps: 20 },
+    });
+    expect(sim.getOpenPosition()).toBeNull();
+    expect(sim.getLastBinaryEntryRejectionReason()).toBe(
+      BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD
     );
   });
 });

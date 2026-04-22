@@ -209,6 +209,8 @@ describe("MonitorRuntimeStats", () => {
     expect(s.borderlineWins).toBe(1);
     expect(s.borderlineAveragePnL).toBeCloseTo(0.2, 6);
     expect(s.strongSpikeTradesClosed).toBe(1);
+    expect(s.strongSpikeImmediateTradesClosed).toBe(1);
+    expect(s.strongSpikeConfirmedTradesClosed).toBe(0);
     expect(s.strongSpikeLosses).toBe(1);
     expect(s.strongSpikeAveragePnL).toBeCloseTo(-0.1, 6);
 
@@ -507,5 +509,15 @@ describe("monitorConsole periodic / shutdown", () => {
     const combined = log.mock.calls.map((c) => String(c[0])).join("\n");
     expect(combined).toContain("TEST MODE ACTIVE");
     log.mockRestore();
+  });
+
+  it("treats borderline_promoted like borderline and attributes strong_spike_confirmed", () => {
+    const s = new MonitorRuntimeStats();
+    s.observeClosedTrade({ entryPath: "borderline_promoted", profitLoss: 0.1 });
+    expect(s.borderlineTradesClosed).toBe(1);
+    s.observeClosedTrade({ entryPath: "strong_spike_confirmed", profitLoss: 0.2 });
+    expect(s.strongSpikeTradesClosed).toBe(1);
+    expect(s.strongSpikeConfirmedTradesClosed).toBe(1);
+    expect(s.strongSpikeImmediateTradesClosed).toBe(0);
   });
 });

@@ -5,6 +5,7 @@ import {
   PIPELINE_QUALITY_DOWNGRADE_DETAIL_REASONS,
 } from "./decisionReasonBuilder.js";
 import type { BorderlineLifecycleRenderEvent } from "./strategy/strategyDecisionPipeline.js";
+import type { PaperTradeEntryPath } from "./paperEntryPath.js";
 
 const BORDERLINE_TIMEOUT_EXPIRE_REASONS = new Set([
   "borderline_max_lifetime_ms",
@@ -97,10 +98,19 @@ export class StrategyStatsTracker {
   borderlineWins = 0;
   borderlineLosses = 0;
   borderlinePnL = 0;
+  /** Non-borderline strong-spike family (immediate + post-confirmation); legacy aggregate. */
   strongSpikeTradesClosed = 0;
   strongSpikeWins = 0;
   strongSpikeLosses = 0;
   strongSpikePnL = 0;
+  strongSpikeImmediateTradesClosed = 0;
+  strongSpikeImmediateWins = 0;
+  strongSpikeImmediateLosses = 0;
+  strongSpikeImmediatePnL = 0;
+  strongSpikeConfirmedTradesClosed = 0;
+  strongSpikeConfirmedWins = 0;
+  strongSpikeConfirmedLosses = 0;
+  strongSpikeConfirmedPnL = 0;
   qualityWeak = 0;
   qualityStrong = 0;
   qualityExceptional = 0;
@@ -311,10 +321,11 @@ export class StrategyStatsTracker {
   }
 
   observeClosedTrade(trade: {
-    entryPath: "strong_spike_immediate" | "borderline_delayed";
+    entryPath: PaperTradeEntryPath;
     profitLoss: number;
   }): void {
-    if (trade.entryPath === "borderline_delayed") {
+    const ep = trade.entryPath;
+    if (ep === "borderline_delayed" || ep === "borderline_promoted") {
       this.borderlineTradesClosed += 1;
       this.borderlinePnL += trade.profitLoss;
       if (trade.profitLoss > 0) this.borderlineWins += 1;
@@ -325,6 +336,18 @@ export class StrategyStatsTracker {
     this.strongSpikePnL += trade.profitLoss;
     if (trade.profitLoss > 0) this.strongSpikeWins += 1;
     else if (trade.profitLoss < 0) this.strongSpikeLosses += 1;
+
+    if (ep === "strong_spike_confirmed") {
+      this.strongSpikeConfirmedTradesClosed += 1;
+      this.strongSpikeConfirmedPnL += trade.profitLoss;
+      if (trade.profitLoss > 0) this.strongSpikeConfirmedWins += 1;
+      else if (trade.profitLoss < 0) this.strongSpikeConfirmedLosses += 1;
+      return;
+    }
+    this.strongSpikeImmediateTradesClosed += 1;
+    this.strongSpikeImmediatePnL += trade.profitLoss;
+    if (trade.profitLoss > 0) this.strongSpikeImmediateWins += 1;
+    else if (trade.profitLoss < 0) this.strongSpikeImmediateLosses += 1;
   }
 
   get borderlineAveragePnL(): number {
@@ -336,6 +359,32 @@ export class StrategyStatsTracker {
   get strongSpikeAveragePnL(): number {
     return this.strongSpikeTradesClosed > 0
       ? this.strongSpikePnL / this.strongSpikeTradesClosed
+      : 0;
+  }
+
+  get strongSpikeImmediateAveragePnL(): number {
+    return this.strongSpikeImmediateTradesClosed > 0
+      ? this.strongSpikeImmediatePnL / this.strongSpikeImmediateTradesClosed
+      : 0;
+  }
+
+  get strongSpikeConfirmedAveragePnL(): number {
+    return this.strongSpikeConfirmedTradesClosed > 0
+      ? this.strongSpikeConfirmedPnL / this.strongSpikeConfirmedTradesClosed
+      : 0;
+  }
+
+  get strongSpikeImmediateWinRate(): number {
+    return this.strongSpikeImmediateTradesClosed > 0
+      ? (this.strongSpikeImmediateWins / this.strongSpikeImmediateTradesClosed) *
+          100
+      : 0;
+  }
+
+  get strongSpikeConfirmedWinRate(): number {
+    return this.strongSpikeConfirmedTradesClosed > 0
+      ? (this.strongSpikeConfirmedWins / this.strongSpikeConfirmedTradesClosed) *
+          100
       : 0;
   }
 

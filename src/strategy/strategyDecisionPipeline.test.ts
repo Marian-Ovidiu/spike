@@ -9,6 +9,7 @@ import {
   applyQuoteStaleEntryBlock,
   entryEvaluationForPipelinePaperExecution,
   PIPELINE_BLOCKED_ENTRY_REASON,
+  PIPELINE_WATCH_PATH_WARNING_REASON,
   runStrategyDecisionPipeline,
 } from "./strategyDecisionPipeline.js";
 import { syntheticExecutableBookFromMid } from "../executionSpreadFilter.js";
@@ -65,6 +66,7 @@ const pipelineConfig = {
   hardRejectPriorRangePercent: 0.002,
   strongSpikeConfirmationTicks: 1,
   exceptionalSpikePercent: 0.0025,
+  strongSpikeEarlyEntryExceptionalFraction: 0.7,
   exceptionalSpikeOverridesCooldown: true,
   maxEntrySpreadBps: 500,
   entryCooldownMs: 0,
@@ -87,6 +89,11 @@ const pipelineConfig = {
   binaryMaxEntrySidePrice: 0,
   binaryNeutralQuoteBandMin: 0,
   binaryNeutralQuoteBandMax: 0,
+  binaryYesMidExtremeFilterEnabled: true,
+  binaryYesMidBandMin: 0.05,
+  binaryYesMidBandMax: 0.95,
+  binaryHardMaxSpreadBps: 20,
+  binaryPaperSlippageBps: 0,
 } as const;
 
 const spotSimConfig = {
@@ -99,6 +106,15 @@ const spotSimConfig = {
   binaryStopLossPriceDelta: 0.05,
   binaryExitTimeoutMs: 60_000,
   binaryMaxEntryPrice: 0.99,
+  binaryEnableSideSpecificGating: false,
+  binaryYesMinMispricingThreshold: -1,
+  binaryNoMinMispricingThreshold: -1,
+  binaryYesMaxEntryPrice: -1,
+  binaryNoMaxEntryPrice: -1,
+  binaryYesMidExtremeFilterEnabled: true,
+  binaryYesMidBandMin: 0.05,
+  binaryYesMidBandMax: 0.95,
+  binaryHardMaxSpreadBps: 20,
   entryCooldownMs: 120_000,
   stakePerTrade: 5,
   allowWeakQualityEntries: false,
@@ -174,6 +190,129 @@ describe("strategyDecisionPipeline", () => {
     expect(result.decision.qualityGatePassed).toBe(false);
     expect(result.decision.qualityProfile).toBe("strong");
     expect((result.strongSpikeLifecycleMessages ?? []).join(" ")).toContain("detected");
+  });
+
+  it("skips strong-spike confirmation when move exceeds early-entry fraction of exceptional bar", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0004,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.002,
+        strongestMoveAbsolute: 200,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.002,
+        strongestMoveAbsolute: 200,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_200,
+        strongestMove: 0.002,
+        strongestAbsDelta: 200,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: readyTick(entry),
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: pipelineConfig,
+    });
+    expect(result.decision.action).toBe("enter_immediate");
+    expect(result.decision.reason).toBe("strong_spike_immediate_entry_fast_path");
+    expect((result.strongSpikeLifecycleMessages ?? []).join(" ")).toContain(
+      "strong_spike_early_entry skip_confirmation"
+    );
+  });
+
+  it("waits for confirmation when strongSpikeEarlyEntryExceptionalFraction is 0", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const manager = new BorderlineCandidateManager({
+      symbol: "BTCUSD",
+      watchTicks: 2,
+    });
+    const strongSpikeManager = new StrongSpikeCandidateStore({
+      symbol: "BTCUSD",
+      watchTicks: 1,
+    });
+    const entry: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0004,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movement: {
+        strongestMovePercent: 0.002,
+        strongestMoveAbsolute: 200,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.002,
+        strongestMoveAbsolute: 200,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_200,
+        strongestMove: 0.002,
+        strongestAbsDelta: 200,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const result = runStrategyDecisionPipeline({
+      now: 1_000,
+      tick: readyTick(entry),
+      manager,
+      strongSpikeManager,
+      simulation: sim,
+      config: { ...pipelineConfig, strongSpikeEarlyEntryExceptionalFraction: 0 },
+    });
+    expect(result.decision.action).toBe("none");
+    expect(result.decision.reason).toBe("strong_spike_waiting_confirmation_tick");
   });
 
   it("rejects acceptable-profile strong_spike at gate when allow flag is false", () => {
@@ -1133,7 +1272,7 @@ describe("strategyDecisionPipeline", () => {
       manager,
       strongSpikeManager,
       simulation: sim,
-      config: pipelineConfig,
+      config: { ...pipelineConfig, strongSpikeEarlyEntryExceptionalFraction: 0 },
     });
     expect(
       result.borderlineLifecycleEvents.some((e) => e.type === "cancelled")
@@ -1521,7 +1660,7 @@ describe("strategyDecisionPipeline", () => {
       manager,
       strongSpikeManager,
       simulation: sim,
-      config: pipelineConfig,
+      config: { ...pipelineConfig, strongSpikeEarlyEntryExceptionalFraction: 0 },
     });
     expect(first.decision.reason).toBe("strong_spike_waiting_confirmation_tick");
     const confirmTick = readyTick({
@@ -1868,6 +2007,15 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
     binaryStopLossPriceDelta: 0.05,
     binaryExitTimeoutMs: 60_000,
     binaryMaxEntryPrice: 0.99,
+    binaryEnableSideSpecificGating: false,
+    binaryYesMinMispricingThreshold: -1,
+    binaryNoMinMispricingThreshold: -1,
+    binaryYesMaxEntryPrice: -1,
+    binaryNoMaxEntryPrice: -1,
+    binaryYesMidExtremeFilterEnabled: true,
+    binaryYesMidBandMin: 0.05,
+    binaryYesMidBandMax: 0.95,
+    binaryHardMaxSpreadBps: 20,
     entryCooldownMs: 0,
     stakePerTrade: 10,
     allowWeakQualityEntries: false,
@@ -1939,6 +2087,70 @@ describe("entryEvaluationForPipelinePaperExecution", () => {
       config: paperConfig,
     });
     expect(sim.getOpenPosition()).toBeNull();
+  });
+
+  it("keeps shouldEnter when pipeline defers confirmation tick (watch path non-blocking)", () => {
+    const sim = new SimulationEngine({ silent: true, initialEquity: 10_000 });
+    const raw: EntryEvaluation = {
+      shouldEnter: true,
+      direction: "DOWN",
+      reasons: [],
+      stableRangeDetected: true,
+      priorRangeFraction: 0.0005,
+      stableRangeQuality: "good",
+      rangeDecisionNote: "test",
+      movementClassification: "strong_spike",
+      spikeDetected: true,
+      movement: {
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        classification: "strong_spike",
+        sourceWindowLabel: "tick-1",
+      },
+      windowSpike: {
+        classification: "strong_spike",
+        strongestMovePercent: 0.0026,
+        strongestMoveAbsolute: 260,
+        strongestMoveDirection: "UP",
+        thresholdPercent: 0.001,
+        thresholdRatio: 2.6,
+        sourceWindowLabel: "tick-1",
+        borderlineMinRatio: 0.85,
+        detected: true,
+        currentPrice: 100_260,
+        strongestMove: 0.0026,
+        strongestAbsDelta: 260,
+        referencePrice: 100_000,
+        source: "tick-1",
+        direction: "up",
+        comparisons: [],
+      },
+    };
+    const paper = entryEvaluationForPipelinePaperExecution(
+      {
+        action: "none",
+        reason: "strong_spike_waiting_confirmation_tick",
+      },
+      raw
+    );
+    expect(paper.shouldEnter).toBe(true);
+    expect(paper.direction).toBe("DOWN");
+    expect(paper.reasons).toContain(PIPELINE_WATCH_PATH_WARNING_REASON);
+    expect(paper.reasons).not.toContain(PIPELINE_BLOCKED_ENTRY_REASON);
+
+    sim.onTick({
+      marketMode: "spot",
+      binaryOutcomes: null,
+      now: 1,
+      entry: paper,
+      executionBook: syntheticExecutableBookFromMid(100_000, 5),
+      symbol: "BTCUSDT",
+      config: paperConfig,
+    });
+    expect(sim.getOpenPosition()).not.toBeNull();
   });
 
   it("passes through approved enter_immediate unchanged", () => {

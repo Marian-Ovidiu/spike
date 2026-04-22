@@ -9,9 +9,11 @@ import type { Opportunity } from "../opportunityTracker.js";
 import type { SimulatedTrade } from "../simulationEngine.js";
 import type { QualityProfile } from "../preEntryQualityGate.js";
 
-export const BINARY_RUN_ANALYTICS_SCHEMA = "binary_run_analytics_v2" as const;
+export const BINARY_RUN_ANALYTICS_SCHEMA = "binary_run_analytics_v3" as const;
 
 const PRIMARY_REJECTION_REASONS_TOP = 12;
+/** Full normalized rejection strings per side (not only primary blocker). */
+const ALL_REJECTION_REASONS_TOP = 15;
 
 /** Subreasons for `invalid_market_prices` (binary observability). */
 export const INVALID_MARKET_PRICES_SUBREASON_KEYS = [
@@ -105,6 +107,7 @@ export function mispricingBucketDisplayLabel(bucket: EdgeBucketLabel): string {
 export type MispricingBucketTradeStats = {
   bucket: EdgeBucketLabel;
   trades: number;
+  wins: number;
   winRatePercent: number;
   pnlTotal: number;
   avgPnlPerTrade: number;
@@ -175,6 +178,7 @@ function finalizeMispricingBucketTradeStats(
     out.push({
       bucket,
       trades: n,
+      wins: x.wins,
       winRatePercent: wr,
       pnlTotal: x.pnlSum,
       avgPnlPerTrade: avgPnl,
@@ -240,6 +244,17 @@ export type BinaryYesNoSideMetrics = {
   avgMfe: number | null;
   avgMae: number | null;
   avgHoldMs: number | null;
+  /** Closed trades: mispricing / entry edge buckets on this leg. */
+  mispricingBucketTradeStats: MispricingBucketTradeStats[];
+  /** Closed trades: count per entry-model-edge bin (same bins as mispricing rows). */
+  edgeBucketTradeCounts: Record<EdgeBucketLabel, number>;
+  /**
+   * Opportunities with computable model edge at observation (includes valid + rejected).
+   * Same bins as trades; useful when few trades closed.
+   */
+  opportunityEdgeBucketCounts: Record<EdgeBucketLabel, number>;
+  /** Normalized rejection reason counts (all reasons in array, rejected opps only). */
+  rejectionReasonCounts: Array<{ reason: string; count: number }>;
 };
 
 export type BinaryYesNoComparativeReport = {
@@ -254,6 +269,7 @@ type YesNoOppLike = {
   status?: string;
   entryOutcomeSide?: "YES" | "NO" | null;
   entryRejectionPrimaryBlocker?: string | null;
+  entryRejectionReasons?: readonly string[];
   estimatedProbabilityUp?: number;
   yesPrice?: number;
   noPrice?: number;
@@ -286,10 +302,12 @@ type YesNoAcc = {
   opportunitiesRejected: number;
   validOpportunities: number;
   primaryReasons: Map<string, number>;
+  allRejectionReasons: Map<string, number>;
   oppEdgeSum: number;
   oppEdgeN: number;
   oppAskSum: number;
   oppAskN: number;
+  oppEdgeBucket: Record<EdgeBucketLabel, number>;
   tradesClosed: number;
   wins: number;
   pnlSum: number;
@@ -303,7 +321,19 @@ type YesNoAcc = {
   maeN: number;
   holdMsSum: number;
   holdMsN: number;
+  mispricingBuckets: Record<EdgeBucketLabel, MispricingBucketAcc>;
+  edgeTradeCounts: Record<EdgeBucketLabel, number>;
 };
+
+function emptyEdgeCountsRecord(): Record<EdgeBucketLabel, number> {
+  return {
+    "<0.01": 0,
+    "0.01-0.03": 0,
+    "0.03-0.05": 0,
+    ">0.05": 0,
+    unknown: 0,
+  };
+}
 
 function emptyYesNoAcc(): YesNoAcc {
   return {
@@ -311,10 +341,12 @@ function emptyYesNoAcc(): YesNoAcc {
     opportunitiesRejected: 0,
     validOpportunities: 0,
     primaryReasons: new Map(),
+    allRejectionReasons: new Map(),
     oppEdgeSum: 0,
     oppEdgeN: 0,
     oppAskSum: 0,
     oppAskN: 0,
+    oppEdgeBucket: emptyEdgeCountsRecord(),
     tradesClosed: 0,
     wins: 0,
     pnlSum: 0,
@@ -328,6 +360,14 @@ function emptyYesNoAcc(): YesNoAcc {
     maeN: 0,
     holdMsSum: 0,
     holdMsN: 0,
+    mispricingBuckets: {
+      "<0.01": emptyMispricingBucketAcc(),
+      "0.01-0.03": emptyMispricingBucketAcc(),
+      "0.03-0.05": emptyMispricingBucketAcc(),
+      ">0.05": emptyMispricingBucketAcc(),
+      unknown: emptyMispricingBucketAcc(),
+    },
+    edgeTradeCounts: emptyEdgeCountsRecord(),
   };
 }
 
@@ -412,6 +452,17 @@ function accumulateOpportunityForYesNo(
   if (o.status === "rejected") {
     acc.opportunitiesRejected += 1;
     bumpPrimaryReason(acc, o.entryRejectionPrimaryBlocker ?? null);
+    const rs = o.entryRejectionReasons;
+    if (rs !== undefined) {
+      for (const r of rs) {
+        if (typeof r === "string" && r.length > 0) {
+          acc.allRejectionReasons.set(
+            r,
+            (acc.allRejectionReasons.get(r) ?? 0) + 1
+          );
+        }
+      }
+    }
   } else if (o.status === "valid") {
     acc.validOpportunities += 1;
   }
@@ -421,6 +472,8 @@ function accumulateOpportunityForYesNo(
     acc.oppEdgeN += 1;
     acc.oppAskSum += econ.askOnLeg;
     acc.oppAskN += 1;
+    const ob = edgeBucketForModelEdge(econ.edge);
+    acc.oppEdgeBucket[ob] += 1;
   }
 }
 
@@ -514,12 +567,21 @@ function accumulateTradeForYesNo(
     acc.holdMsSum += hold;
     acc.holdMsN += 1;
   }
+
+  const eb = edgeBucketForModelEdge(t.entryModelEdge);
+  acc.edgeTradeCounts[eb] += 1;
+  accumulateMispricingTrade(acc.mispricingBuckets, eb, pnl, t.holdExitAudit);
 }
 
 function finalizeYesNoAcc(acc: YesNoAcc): BinaryYesNoSideMetrics {
   const primaryRejectionReasons = [...acc.primaryReasons.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, PRIMARY_REJECTION_REASONS_TOP)
+    .map(([reason, count]) => ({ reason, count }));
+
+  const rejectionReasonCounts = [...acc.allRejectionReasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, ALL_REJECTION_REASONS_TOP)
     .map(([reason, count]) => ({ reason, count }));
 
   const nTr = acc.tradesClosed;
@@ -545,6 +607,12 @@ function finalizeYesNoAcc(acc: YesNoAcc): BinaryYesNoSideMetrics {
     avgMfe: acc.mfeN > 0 ? acc.mfeSum / acc.mfeN : null,
     avgMae: acc.maeN > 0 ? acc.maeSum / acc.maeN : null,
     avgHoldMs: acc.holdMsN > 0 ? acc.holdMsSum / acc.holdMsN : null,
+    mispricingBucketTradeStats: finalizeMispricingBucketTradeStats(
+      acc.mispricingBuckets
+    ),
+    edgeBucketTradeCounts: { ...acc.edgeTradeCounts },
+    opportunityEdgeBucketCounts: { ...acc.oppEdgeBucket },
+    rejectionReasonCounts,
   };
 }
 
@@ -1032,6 +1100,23 @@ export function formatBinaryYesNoComparativeConsole(
     lines.push(
       `  avg MFE: ${fmtNumOrDash(b.avgMfe, 6)}  avg MAE: ${fmtNumOrDash(b.avgMae, 6)}  avg hold: ${fmtNumOrDash(b.avgHoldMs, 0)} ms`
     );
+    lines.push(
+      `  edge bucket (closed trades): ${JSON.stringify(b.edgeBucketTradeCounts)}`
+    );
+    lines.push(
+      `  edge bucket (opportunities w/ computable edge): ${JSON.stringify(b.opportunityEdgeBucketCounts)}`
+    );
+    lines.push("  mispricing buckets (closed trades — n / wins / win% / ΣPnL / avgPnL / MFE / MAE):");
+    for (const row of b.mispricingBucketTradeStats) {
+      lines.push(
+        `    ${mispricingBucketDisplayLabel(row.bucket).padEnd(14)} n=${String(row.trades).padStart(3)} w=${String(row.wins).padStart(3)} ${row.trades > 0 ? `${row.winRatePercent.toFixed(1)}%` : "  —  "} Σ=${row.pnlTotal.toFixed(4)} avg=${row.avgPnlPerTrade.toFixed(4)} MFE=${fmtNumOrDash(row.avgMfe, 4)} MAE=${fmtNumOrDash(row.avgMae, 4)}`
+      );
+    }
+    if (b.rejectionReasonCounts.length > 0) {
+      lines.push(
+        `  rejection reasons (all tags, rejected opps): ${b.rejectionReasonCounts.map((x) => `${x.reason}×${x.count}`).join(" | ")}`
+      );
+    }
     if (b.primaryRejectionReasons.length > 0) {
       lines.push(
         `  primary rejection blockers: ${b.primaryRejectionReasons.map((p) => `${p.reason}×${p.count}`).join(" | ")}`

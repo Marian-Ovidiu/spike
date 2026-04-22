@@ -128,6 +128,34 @@ describe("buildOpportunityFromReadyTick", () => {
     expect(o!.entryRejectionReasons).toEqual([]);
     expect(o!.spikeDirection).toBe("UP");
   });
+
+  it("allows valid opportunity when pipeline only defers confirmation tick", () => {
+    const prev = 100_000;
+    const last = 100_700;
+    const prices = makeStableThenSpikePrices(prev, 10, last);
+    const entry = entryAtMid(prices, prev, last);
+    const executionBook = bookAtMid(last);
+    const o = buildOpportunityFromReadyTick({
+      timestamp: 3,
+      btcPrice: last,
+      prices,
+      previousPrice: prev,
+      currentPrice: last,
+      executionBook,
+      entry,
+      tradableSpikeMinPercent: cfg.tradableSpikeMinPercent,
+      maxPriorRangeForNormalEntry: cfg.maxPriorRangeForNormalEntry,
+      decision: {
+        action: "none",
+        reason: "strong_spike_waiting_confirmation_tick",
+      },
+    });
+    expect(o).not.toBeNull();
+    expect(o!.entryAllowed).toBe(true);
+    expect(o!.pipelineWatchPathDeferredNonBlocking).toBe(true);
+    expect(o!.status).toBe("valid");
+    expect(o!.entryRejectionReasons).toEqual([]);
+  });
 });
 
 describe("OpportunityTracker", () => {
@@ -187,6 +215,16 @@ describe("OpportunityTracker", () => {
         binaryStopLossPriceDelta: cfg.binaryStopLossPriceDelta,
         binaryExitTimeoutMs: cfg.binaryExitTimeoutMs,
         binaryMaxEntryPrice: cfg.binaryMaxEntryPrice,
+        binaryEnableSideSpecificGating: cfg.binaryEnableSideSpecificGating,
+        binaryYesMinMispricingThreshold: cfg.binaryYesMinMispricingThreshold,
+        binaryNoMinMispricingThreshold: cfg.binaryNoMinMispricingThreshold,
+        binaryYesMaxEntryPrice: cfg.binaryYesMaxEntryPrice,
+        binaryNoMaxEntryPrice: cfg.binaryNoMaxEntryPrice,
+        binaryYesMidExtremeFilterEnabled:
+          cfg.binaryYesMidExtremeFilterEnabled,
+        binaryYesMidBandMin: cfg.binaryYesMidBandMin,
+        binaryYesMidBandMax: cfg.binaryYesMidBandMax,
+        binaryHardMaxSpreadBps: cfg.binaryHardMaxSpreadBps,
         entryCooldownMs: 120_000,
         stakePerTrade: cfg.stakePerTrade,
         allowWeakQualityEntries: cfg.allowWeakQualityEntries,
@@ -229,6 +267,8 @@ describe("OpportunityTracker", () => {
         hardRejectPriorRangePercent: cfg.hardRejectPriorRangePercent,
         strongSpikeConfirmationTicks: cfg.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: cfg.exceptionalSpikePercent,
+        strongSpikeEarlyEntryExceptionalFraction:
+          cfg.strongSpikeEarlyEntryExceptionalFraction,
         exceptionalSpikeOverridesCooldown: cfg.exceptionalSpikeOverridesCooldown,
         maxEntrySpreadBps: cfg.maxEntrySpreadBps,
         entryCooldownMs: cfg.entryCooldownMs,

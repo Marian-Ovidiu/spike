@@ -4,9 +4,10 @@ import type { BorderlineLifecyclePersistedRenderEvent } from "./strategy/strateg
 import type { PostMoveClassification } from "./borderlineCandidate.js";
 import type { StableRangeQuality } from "./stableRangeQuality.js";
 import { type MovementClassification, type WindowSpikeSource } from "./strategy.js";
-import type {
-  PipelineQualityModifier,
-  StrategyDecision,
+import {
+  allowsPaperEntryDespitePipelineWatchDeferral,
+  type PipelineQualityModifier,
+  type StrategyDecision,
 } from "./strategy/strategyDecisionPipeline.js";
 import {
   normalizeBorderlineLifecycleRejection,
@@ -131,6 +132,11 @@ export type Opportunity = {
    * `invalid_market_prices` (spread / book / leg diagnostics).
    */
   invalidMarketPricesAudit?: InvalidMarketPricesAuditRecord;
+  /**
+   * Pipeline deferred strong-spike confirmation (`strong_spike_waiting_confirmation_tick`)
+   * but entry remained allowed for this tick (non-blocking override).
+   */
+  pipelineWatchPathDeferredNonBlocking?: true;
 };
 
 export type RecordReadyTickInput = {
@@ -158,6 +164,7 @@ export type RecordReadyTickInput = {
   decision?: Pick<
     StrategyDecision,
     | "action"
+    | "reason"
     | "reasons"
     | "qualityProfile"
     | "cooldownOverridden"
@@ -243,11 +250,16 @@ export function buildOpportunityFromReadyTick(
       : movement.strongestMoveDirection === "DOWN"
         ? "DOWN"
         : null;
+  const pipelineWatchAllowsEntry =
+    decision !== undefined &&
+    allowsPaperEntryDespitePipelineWatchDeferral(decision, entry.shouldEnter);
+
   const entryAllowed =
-    decision !== undefined
+    pipelineWatchAllowsEntry ||
+    (decision !== undefined
       ? decision.action === "enter_immediate" ||
         decision.action === "promote_borderline_candidate"
-      : entry.shouldEnter;
+      : entry.shouldEnter);
   const entryRejectionReasons =
     entryAllowed ? [] : [...(decision?.reasons ?? entry.reasons)];
   const tradableSpikeMinPercent = Number.isFinite(input.tradableSpikeMinPercent)
@@ -331,6 +343,9 @@ export function buildOpportunityFromReadyTick(
       : {}),
     cooldownOverridden: decision?.cooldownOverridden ?? false,
     overrideReason: decision?.overrideReason ?? null,
+    ...(pipelineWatchAllowsEntry
+      ? { pipelineWatchPathDeferredNonBlocking: true as const }
+      : {}),
     entryAllowed,
     entryRejectionReasons,
     entryRejectionPrimaryBlocker: entryAllowed

@@ -19,8 +19,11 @@ import {
 } from "./simulationEngine.js";
 import {
   entryEvaluationForPipelinePaperExecution,
+  applyBinaryDisableImmediateStrongSpike,
   runStrategyDecisionPipeline,
 } from "./strategy/strategyDecisionPipeline.js";
+import { resolvePaperTradeEntryPath } from "./paperEntryPath.js";
+import { buildTradeEntryOpenReason } from "./tradeEntryOpenDiagnosis.js";
 import { syntheticExecutableBookFromMid } from "./executionSpreadFilter.js";
 import { assertLegacySpotMarketModeAcknowledged } from "./legacy/spot/assertLegacySpotMarketMode.js";
 
@@ -359,6 +362,8 @@ export function runBacktestReplay(
         hardRejectPriorRangePercent: config.hardRejectPriorRangePercent,
         strongSpikeConfirmationTicks: config.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: config.exceptionalSpikePercent,
+        strongSpikeEarlyEntryExceptionalFraction:
+          config.strongSpikeEarlyEntryExceptionalFraction,
         exceptionalSpikeOverridesCooldown: config.exceptionalSpikeOverridesCooldown,
         maxEntrySpreadBps: config.maxEntrySpreadBps,
         entryCooldownMs: config.entryCooldownMs,
@@ -383,6 +388,11 @@ export function runBacktestReplay(
         binaryMaxEntrySidePrice: config.binaryMaxEntrySidePrice,
         binaryNeutralQuoteBandMin: config.binaryNeutralQuoteBandMin,
         binaryNeutralQuoteBandMax: config.binaryNeutralQuoteBandMax,
+        binaryYesMidExtremeFilterEnabled:
+          config.binaryYesMidExtremeFilterEnabled,
+        binaryYesMidBandMin: config.binaryYesMidBandMin,
+        binaryYesMidBandMax: config.binaryYesMidBandMax,
+        binaryHardMaxSpreadBps: config.binaryHardMaxSpreadBps,
         binaryPaperSlippageBps: config.binaryPaperSlippageBps,
       },
     });
@@ -456,10 +466,7 @@ export function runBacktestReplay(
       pipeline.decision,
       entryForSimulation
     );
-    const entryPath =
-      pipeline.decision.action === "promote_borderline_candidate"
-        ? "borderline_delayed"
-        : "strong_spike_immediate";
+    const entryPath = resolvePaperTradeEntryPath(pipeline.decision);
 
     simulation.onTick({
       now,
@@ -483,6 +490,16 @@ export function runBacktestReplay(
         binaryStopLossPriceDelta: config.binaryStopLossPriceDelta,
         binaryExitTimeoutMs: config.binaryExitTimeoutMs,
         binaryMaxEntryPrice: config.binaryMaxEntryPrice,
+        binaryEnableSideSpecificGating: config.binaryEnableSideSpecificGating,
+        binaryYesMinMispricingThreshold: config.binaryYesMinMispricingThreshold,
+        binaryNoMinMispricingThreshold: config.binaryNoMinMispricingThreshold,
+        binaryYesMaxEntryPrice: config.binaryYesMaxEntryPrice,
+        binaryNoMaxEntryPrice: config.binaryNoMaxEntryPrice,
+        binaryYesMidExtremeFilterEnabled:
+          config.binaryYesMidExtremeFilterEnabled,
+        binaryYesMidBandMin: config.binaryYesMidBandMin,
+        binaryYesMidBandMax: config.binaryYesMidBandMax,
+        binaryHardMaxSpreadBps: config.binaryHardMaxSpreadBps,
         entryCooldownMs: config.entryCooldownMs,
         stakePerTrade: config.stakePerTrade,
         allowWeakQualityEntries: config.allowWeakQualityEntries,
@@ -502,10 +519,14 @@ export function runBacktestReplay(
   const trades = simulation.getTradeHistory();
   const stats = simulation.getPerformanceStats();
   const strongTrades = trades.filter(
-    (t) => t.entryPath === "strong_spike_immediate"
+    (t) =>
+      t.entryPath === "strong_spike_immediate" ||
+      t.entryPath === "strong_spike_confirmed"
   );
   const borderlineTrades = trades.filter(
-    (t) => t.entryPath === "borderline_delayed"
+    (t) =>
+      t.entryPath === "borderline_delayed" ||
+      t.entryPath === "borderline_promoted"
   );
   const strongWins = strongTrades.filter((t) => t.profitLoss > 0).length;
   const strongLosses = strongTrades.filter((t) => t.profitLoss < 0).length;
@@ -730,6 +751,8 @@ export function runBinaryBacktestReplay(
     hardRejectPriorRangePercent: config.hardRejectPriorRangePercent,
     strongSpikeConfirmationTicks: config.strongSpikeConfirmationTicks,
     exceptionalSpikePercent: config.exceptionalSpikePercent,
+    strongSpikeEarlyEntryExceptionalFraction:
+      config.strongSpikeEarlyEntryExceptionalFraction,
     exceptionalSpikeOverridesCooldown: config.exceptionalSpikeOverridesCooldown,
     maxEntrySpreadBps: config.maxEntrySpreadBps,
     entryCooldownMs: config.entryCooldownMs,
@@ -752,6 +775,11 @@ export function runBinaryBacktestReplay(
     binaryMaxEntrySidePrice: config.binaryMaxEntrySidePrice,
     binaryNeutralQuoteBandMin: config.binaryNeutralQuoteBandMin,
     binaryNeutralQuoteBandMax: config.binaryNeutralQuoteBandMax,
+    binaryYesMidExtremeFilterEnabled:
+      config.binaryYesMidExtremeFilterEnabled,
+    binaryYesMidBandMin: config.binaryYesMidBandMin,
+    binaryYesMidBandMax: config.binaryYesMidBandMax,
+    binaryHardMaxSpreadBps: config.binaryHardMaxSpreadBps,
     binaryPaperSlippageBps: config.binaryPaperSlippageBps,
   };
 
@@ -765,6 +793,16 @@ export function runBinaryBacktestReplay(
     binaryStopLossPriceDelta: config.binaryStopLossPriceDelta,
     binaryExitTimeoutMs: config.binaryExitTimeoutMs,
     binaryMaxEntryPrice: config.binaryMaxEntryPrice,
+    binaryEnableSideSpecificGating: config.binaryEnableSideSpecificGating,
+    binaryYesMinMispricingThreshold: config.binaryYesMinMispricingThreshold,
+    binaryNoMinMispricingThreshold: config.binaryNoMinMispricingThreshold,
+    binaryYesMaxEntryPrice: config.binaryYesMaxEntryPrice,
+    binaryNoMaxEntryPrice: config.binaryNoMaxEntryPrice,
+    binaryYesMidExtremeFilterEnabled:
+      config.binaryYesMidExtremeFilterEnabled,
+    binaryYesMidBandMin: config.binaryYesMidBandMin,
+    binaryYesMidBandMax: config.binaryYesMidBandMax,
+    binaryHardMaxSpreadBps: config.binaryHardMaxSpreadBps,
     entryCooldownMs: config.entryCooldownMs,
     stakePerTrade: config.stakePerTrade,
     allowWeakQualityEntries: config.allowWeakQualityEntries,
@@ -862,14 +900,17 @@ export function runBinaryBacktestReplay(
       ...(snap !== null ? { syntheticVenuePricing: snap } : {}),
     };
 
-    const pipeline = runStrategyDecisionPipeline({
-      now,
-      tick,
-      manager: borderlineManager,
-      strongSpikeManager,
-      simulation,
-      config: pipelineCfg,
-    });
+    const pipeline = applyBinaryDisableImmediateStrongSpike(
+      runStrategyDecisionPipeline({
+        now,
+        tick,
+        manager: borderlineManager,
+        strongSpikeManager,
+        simulation,
+        config: pipelineCfg,
+      }),
+      { tick, simulation, config }
+    );
     const normalizedReasons = pipeline.decision.reasons ?? [];
     for (const reason of normalizedReasons) {
       rejectionReasonBreakdown[reason] = (rejectionReasonBreakdown[reason] ?? 0) + 1;
@@ -931,15 +972,14 @@ export function runBinaryBacktestReplay(
       pipeline.decision,
       entryForSimulation
     );
-    const entryPath =
-      pipeline.decision.action === "promote_borderline_candidate"
-        ? "borderline_delayed"
-        : "strong_spike_immediate";
+    const entryPath = resolvePaperTradeEntryPath(pipeline.decision);
+    const entryOpenReason = buildTradeEntryOpenReason(pipeline.decision, entryPath);
 
     simulation.onTick({
       now,
       entry: paperEntry,
       entryPath,
+      entryOpenReason,
       marketMode: "binary",
       binaryOutcomes,
       underlyingSignalPrice: btc,
@@ -957,8 +997,16 @@ export function runBinaryBacktestReplay(
 
   const trades = simulation.getTradeHistory();
   const stats = simulation.getPerformanceStats();
-  const strongTrades = trades.filter((t) => t.entryPath === "strong_spike_immediate");
-  const borderlineTrades = trades.filter((t) => t.entryPath === "borderline_delayed");
+  const strongTrades = trades.filter(
+    (t) =>
+      t.entryPath === "strong_spike_immediate" ||
+      t.entryPath === "strong_spike_confirmed"
+  );
+  const borderlineTrades = trades.filter(
+    (t) =>
+      t.entryPath === "borderline_delayed" ||
+      t.entryPath === "borderline_promoted"
+  );
   const strongWins = strongTrades.filter((t) => t.profitLoss > 0).length;
   const strongLosses = strongTrades.filter((t) => t.profitLoss < 0).length;
   const borderlineWins = borderlineTrades.filter((t) => t.profitLoss > 0).length;

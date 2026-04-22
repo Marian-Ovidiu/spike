@@ -11,6 +11,7 @@
     "replay-opportunities": "npm run build && node dist/replayOpportunities.js",
     "validate-binary-market": "npm run build && node dist/validateBinaryMarket.js",
     "analyze-run": "npm run build && node dist/analyzeRun.js",
+    "analyze-sessions": "npm run build && node dist/analyzeSessions.js",
     "analyze-probability-calibration": "npm run build && node dist/analyzeProbabilityCalibration.js",
     "test": "vitest run"
   },

@@ -356,6 +356,9 @@ function main(): void {
                 maxEntrySidePrice: config.binaryMaxEntrySidePrice,
                 neutralBandMin: config.binaryNeutralQuoteBandMin,
                 neutralBandMax: config.binaryNeutralQuoteBandMax,
+                yesMidExtremeFilterEnabled: config.binaryYesMidExtremeFilterEnabled,
+                yesMidBandMin: config.binaryYesMidBandMin,
+                yesMidBandMax: config.binaryYesMidBandMax,
               });
         quoteBlocked = br !== null;
       } else if (rowIsSpot) {
@@ -411,6 +414,9 @@ function main(): void {
                     maxEntrySidePrice: config.binaryMaxEntrySidePrice,
                     neutralBandMin: config.binaryNeutralQuoteBandMin,
                     neutralBandMax: config.binaryNeutralQuoteBandMax,
+                    yesMidExtremeFilterEnabled: config.binaryYesMidExtremeFilterEnabled,
+                    yesMidBandMin: config.binaryYesMidBandMin,
+                    yesMidBandMax: config.binaryYesMidBandMax,
                   });
           } else if (cohortRowSpot) {
             const book = executionBookQuoteFromJsonlRow(row);

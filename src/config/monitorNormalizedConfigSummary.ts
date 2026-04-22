@@ -11,9 +11,13 @@ import {
   type AppConfig,
   type ConfigSourceMeta,
 } from "../config.js";
+import {
+  effectiveBinaryMaxEntryPriceForSide,
+  effectiveBinaryMinMispricingThreshold,
+} from "./binarySideGating.js";
 
 export const NORMALIZED_MONITOR_CONFIG_SCHEMA =
-  "normalized_monitor_config_v2" as const;
+  "normalized_monitor_config_v3" as const;
 
 export type SignalDetectionThresholdEntry = {
   effective: number | boolean;
@@ -86,6 +90,17 @@ export type NormalizedMonitorConfigSummary = {
   };
   /** Effective spike/range/borderline gates + provenance (canonical env names as keys). */
   signalDetection: SignalDetectionThresholdsNormalized;
+  /**
+   * Binary-only: resolved YES/NO entry gates when {@link AppConfig.binaryEnableSideSpecificGating}
+   * is true (otherwise matches globals).
+   */
+  binarySideSpecificGating?: {
+    enabled: boolean;
+    yesEffectiveMinMispricing: number;
+    noEffectiveMinMispricing: number;
+    yesEffectiveMaxEntryPrice: number;
+    noEffectiveMaxEntryPrice: number;
+  };
 };
 
 function envIntPoly(key: string, fallback: number): number {
@@ -216,6 +231,25 @@ export function buildNormalizedMonitorConfigSummary(
           : {}),
       },
       signalDetection,
+      binarySideSpecificGating: {
+        enabled: cfg.binaryEnableSideSpecificGating,
+        yesEffectiveMinMispricing: effectiveBinaryMinMispricingThreshold(
+          cfg,
+          "YES"
+        ),
+        noEffectiveMinMispricing: effectiveBinaryMinMispricingThreshold(
+          cfg,
+          "NO"
+        ),
+        yesEffectiveMaxEntryPrice: effectiveBinaryMaxEntryPriceForSide(
+          cfg,
+          "YES"
+        ),
+        noEffectiveMaxEntryPrice: effectiveBinaryMaxEntryPriceForSide(
+          cfg,
+          "NO"
+        ),
+      },
     };
   }
 

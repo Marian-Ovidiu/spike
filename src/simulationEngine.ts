@@ -1,10 +1,18 @@
 import { debugMonitor } from "./config.js";
 import type { AppConfig } from "./config.js";
+import {
+  effectiveBinaryMaxEntryPriceForSide,
+  effectiveBinaryMinMispricingThreshold,
+} from "./config/binarySideGating.js";
 import type { EntryDirection, EntryEvaluation } from "./entryConditions.js";
 import type { QualityProfile } from "./preEntryQualityGate.js";
 import { resolveQualityStakeMultiplier } from "./stakeSizing.js";
 import type { ExitReason } from "./exitConditions.js";
 import { buildHoldExitAudit, type HoldExitAudit } from "./holdExitAudit.js";
+import {
+  binarySpreadExceedsHardMax,
+  binaryYesMidFailsExtremeBand,
+} from "./binary/entry/binaryQuoteEntryFilter.js";
 import {
   computeBinaryExitDiagnostics,
   evaluateBinaryExitConditions,
@@ -30,6 +38,8 @@ import {
 import {
   BINARY_PRE_ENTRY_REJECT_INVALID_OUTCOME_FILL,
   BINARY_PRE_ENTRY_REJECT_MAX_ENTRY_PRICE,
+  BINARY_PRE_ENTRY_REJECT_YES_MID_EXTREME,
+  BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD,
   BINARY_PRE_ENTRY_REJECT_STAKE_ZERO,
   buildBinaryPreEntryAuditRecord,
   logBinaryPreEntryAuditDebug,
@@ -44,6 +54,8 @@ import {
   type BinaryPaperLivePosition,
 } from "./binary/paper/binaryPaperPosition.js";
 import { buildBinaryPaperTradeLog } from "./binary/paper/binaryPaperTradeLog.js";
+import type { PaperTradeEntryPath } from "./paperEntryPath.js";
+import type { TradeEntryOpenReason } from "./tradeEntryOpenDiagnosis.js";
 import type { BinaryOutcomePrices } from "./market/types.js";
 import type { ExecutableBookQuote } from "./executionSpreadFilter.js";
 import {
@@ -108,11 +120,16 @@ export type SimulatedTrade = {
   entryModelEdge?: number;
   exitReason: ExitReason;
   /** Which strategy path opened this trade. */
-  entryPath: "strong_spike_immediate" | "borderline_delayed";
+  entryPath: PaperTradeEntryPath;
   openedAt: number;
   closedAt: number;
   /** Hold-period mark extrema vs EXIT_PRICE / STOP_LOSS (diagnostics). */
   holdExitAudit?: HoldExitAudit;
+  /**
+   * Binary pipeline-backed entry snapshot (monitor / binary backtest). Omitted when the tick
+   * did not carry pipeline diagnostics (e.g. legacy {@link botLoop} path).
+   */
+  entryOpenReason?: TradeEntryOpenReason;
 };
 
 /** Mark price for position: long → bid, short → ask. */
@@ -172,7 +189,7 @@ type OpenSimPosition = {
   /** Spot only — omitted in binary mode (no BTC bid/ask book semantics). */
   entryBid?: number;
   entryAsk?: number;
-  entryPath: "strong_spike_immediate" | "borderline_delayed";
+  entryPath: PaperTradeEntryPath;
   openedAt: number;
   baseStakePerTrade: number;
   qualityStakeMultiplier: number;
@@ -186,13 +203,15 @@ type OpenSimPosition = {
   /** Min/max mark on the held leg while open (every tick; used for exit audit + MTM logs). */
   holdMarkMin: number;
   holdMarkMax: number;
+  /** Binary: decision snapshot at open (JSONL `entryOpenReason`). */
+  entryOpenReason?: TradeEntryOpenReason;
 };
 
 export type SimulationTickInput = {
   now: number;
   entry: EntryEvaluation;
   /** Optional source tagging for attribution stats. */
-  entryPath?: "strong_spike_immediate" | "borderline_delayed";
+  entryPath?: PaperTradeEntryPath;
   /** From strategy decision / gate; drives stake multiplier when enabled. */
   entryQualityProfile?: QualityProfile;
   /**
@@ -230,6 +249,15 @@ export type SimulationTickInput = {
     | "binaryStopLossPriceDelta"
     | "binaryExitTimeoutMs"
     | "binaryMaxEntryPrice"
+    | "binaryEnableSideSpecificGating"
+    | "binaryYesMinMispricingThreshold"
+    | "binaryNoMinMispricingThreshold"
+    | "binaryYesMaxEntryPrice"
+    | "binaryNoMaxEntryPrice"
+    | "binaryYesMidExtremeFilterEnabled"
+    | "binaryYesMidBandMin"
+    | "binaryYesMidBandMax"
+    | "binaryHardMaxSpreadBps"
     | "entryCooldownMs"
     | "stakePerTrade"
     | "allowWeakQualityEntries"
@@ -242,6 +270,8 @@ export type SimulationTickInput = {
     | "minTradeSize"
     | "probabilityTimeHorizonMs"
   >;
+  /** Binary pipeline-backed: copied onto the open position and closed trade record. */
+  entryOpenReason?: TradeEntryOpenReason;
 };
 
 /** Aggregates from closed trades only (no live equity). */
@@ -816,11 +846,80 @@ export class SimulationEngine {
           return;
         }
       }
+      if (
+        binarySpreadExceedsHardMax(
+          executionBook.spreadBps,
+          config.binaryHardMaxSpreadBps
+        )
+      ) {
+        this.lastBinaryEntryRejectionReason =
+          BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD;
+        if (!this.silent) {
+          console.log(
+            `[SIM] Skip binary entry: ${BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD} spreadBps=${Number.isFinite(executionBook.spreadBps) ? executionBook.spreadBps.toFixed(2) : "NaN"} max=${config.binaryHardMaxSpreadBps}`
+          );
+        }
+        const asksSpread = resolveBinaryVenueAsks({
+          executionBook,
+          yesMid: bo.yesPrice,
+          noMid: bo.noPrice,
+        });
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asksSpread.yesAsk,
+            resolvedNoAsk: asksSpread.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge: Number.NaN,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD,
+          })
+        );
+        return;
+      }
       const asks = resolveBinaryVenueAsks({
         executionBook,
         yesMid: bo.yesPrice,
         noMid: bo.noPrice,
       });
+      if (
+        binaryYesMidFailsExtremeBand(
+          bo.yesPrice,
+          config.binaryYesMidExtremeFilterEnabled,
+          config.binaryYesMidBandMin,
+          config.binaryYesMidBandMax
+        )
+      ) {
+        this.lastBinaryEntryRejectionReason =
+          BINARY_PRE_ENTRY_REJECT_YES_MID_EXTREME;
+        if (!this.silent) {
+          console.log(
+            `[SIM] Skip binary entry: ${BINARY_PRE_ENTRY_REJECT_YES_MID_EXTREME} yesMid=${bo.yesPrice.toFixed(
+              4
+            )} band=[${config.binaryYesMidBandMin},${config.binaryYesMidBandMax}]`
+          );
+        }
+        logBinaryPreEntryAuditDebug(
+          buildBinaryPreEntryAuditRecord({
+            entry,
+            venueYesMid: bo.yesPrice,
+            venueNoMid: bo.noPrice,
+            resolvedYesAsk: asks.yesAsk,
+            resolvedNoAsk: asks.noAsk,
+            estimatedProbabilityUp: input.estimatedProbabilityUp,
+            entryModelEdge: Number.NaN,
+            minEdgeThreshold: config.minEdgeThreshold,
+            qualityProfile: input.entryQualityProfile,
+            action: "reject",
+            primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_YES_MID_EXTREME,
+          })
+        );
+        return;
+      }
       const pUpSzEdge = input.estimatedProbabilityUp;
       // Edge uses mean-reversion fair P on the bought leg (see edgeEntryDecision).
       const entryModelEdge =
@@ -863,7 +962,8 @@ export class SimulationEngine {
         return;
       }
 
-      const minThr = config.minEdgeThreshold;
+      const sideBought = binarySideFromStrategyDirection(entry.direction);
+      const minThr = effectiveBinaryMinMispricingThreshold(config, sideBought);
       if (minThr > 0) {
         const edgeResult = shouldEnterTrade({
           estimatedProbabilityUp: pUpSzEdge!,
@@ -892,7 +992,7 @@ export class SimulationEngine {
               resolvedNoAsk: asks.noAsk,
               estimatedProbabilityUp: input.estimatedProbabilityUp,
               entryModelEdge,
-              minEdgeThreshold: config.minEdgeThreshold,
+              minEdgeThreshold: minThr,
               qualityProfile: input.entryQualityProfile,
               action: "reject",
               primaryRejectionReason:
@@ -903,7 +1003,6 @@ export class SimulationEngine {
         }
       }
 
-      const sideBought = binarySideFromStrategyDirection(entry.direction);
       const fill = binaryOutcomeBuyFillPrice(
         sideBought,
         bo.yesPrice,
@@ -920,7 +1019,7 @@ export class SimulationEngine {
             resolvedNoAsk: asks.noAsk,
             estimatedProbabilityUp: input.estimatedProbabilityUp,
             entryModelEdge,
-            minEdgeThreshold: config.minEdgeThreshold,
+            minEdgeThreshold: minThr,
             qualityProfile: input.entryQualityProfile,
             action: "reject",
             primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_INVALID_OUTCOME_FILL,
@@ -929,13 +1028,11 @@ export class SimulationEngine {
         return;
       }
 
-      if (
-        config.binaryMaxEntryPrice > 0 &&
-        fill > config.binaryMaxEntryPrice
-      ) {
+      const maxEntryPx = effectiveBinaryMaxEntryPriceForSide(config, sideBought);
+      if (maxEntryPx > 0 && fill > maxEntryPx) {
         if (!this.silent) {
           console.log(
-            `[SIM] Skip binary entry: fill ${fill.toFixed(4)} > BINARY_MAX_ENTRY_PRICE ${config.binaryMaxEntryPrice}`
+            `[SIM] Skip binary entry: fill ${fill.toFixed(4)} > max entry price (${sideBought}) ${maxEntryPx}`
           );
         }
         logBinaryPreEntryAuditDebug(
@@ -947,7 +1044,7 @@ export class SimulationEngine {
             resolvedNoAsk: asks.noAsk,
             estimatedProbabilityUp: input.estimatedProbabilityUp,
             entryModelEdge,
-            minEdgeThreshold: config.minEdgeThreshold,
+            minEdgeThreshold: minThr,
             qualityProfile: input.entryQualityProfile,
             action: "reject",
             primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_MAX_ENTRY_PRICE,
@@ -988,7 +1085,7 @@ export class SimulationEngine {
             resolvedNoAsk: asks.noAsk,
             estimatedProbabilityUp: input.estimatedProbabilityUp,
             entryModelEdge,
-            minEdgeThreshold: config.minEdgeThreshold,
+            minEdgeThreshold: minThr,
             qualityProfile: input.entryQualityProfile,
             action: "reject",
             primaryRejectionReason: BINARY_PRE_ENTRY_REJECT_STAKE_ZERO,
@@ -1040,6 +1137,9 @@ export class SimulationEngine {
         Number.isFinite(input.estimatedProbabilityUp)
           ? { estimatedProbabilityUpAtEntry: input.estimatedProbabilityUp }
           : {}),
+        ...(input.entryOpenReason !== undefined
+          ? { entryOpenReason: input.entryOpenReason }
+          : {}),
       };
 
       if (this.paperPositionMtmDiagnostics && paperOpenSeq !== undefined) {
@@ -1069,7 +1169,7 @@ export class SimulationEngine {
           binaryProfitTargetPrice: fill + config.binaryTakeProfitPriceDelta,
           binaryStopLossThresholdPrice: fill - config.binaryStopLossPriceDelta,
           binaryExitTimeoutMs: config.binaryExitTimeoutMs,
-          binaryMaxEntryPrice: config.binaryMaxEntryPrice,
+          binaryMaxEntryPrice: maxEntryPx,
         });
       }
 
@@ -1082,7 +1182,7 @@ export class SimulationEngine {
           resolvedNoAsk: asks.noAsk,
           estimatedProbabilityUp: input.estimatedProbabilityUp,
           entryModelEdge,
-          minEdgeThreshold: config.minEdgeThreshold,
+          minEdgeThreshold: minThr,
           qualityProfile: input.entryQualityProfile,
           action: "enter",
           primaryRejectionReason: null,
@@ -1132,6 +1232,7 @@ export class SimulationEngine {
       holdMarkMax,
       entryBid,
       entryAsk,
+      entryOpenReason,
     } = this.position;
     this.position = null;
 
@@ -1257,6 +1358,7 @@ export class SimulationEngine {
       openedAt,
       closedAt,
       holdExitAudit,
+      ...(isBinary && entryOpenReason !== undefined ? { entryOpenReason } : {}),
     };
     this.trades.push(record);
     this.lastExitAt = closedAt;

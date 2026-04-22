@@ -15,6 +15,12 @@ export const BINARY_PRE_ENTRY_REJECT_INVALID_OUTCOME_FILL =
   "invalid_outcome_fill" as const;
 export const BINARY_PRE_ENTRY_REJECT_MAX_ENTRY_PRICE =
   "binary_max_entry_price_exceeded" as const;
+/** YES mid outside tradeable band (near-resolved market). */
+export const BINARY_PRE_ENTRY_REJECT_YES_MID_EXTREME =
+  "binary_yes_mid_extreme" as const;
+/** Venue book spread above configured `binaryHardMaxSpreadBps`. */
+export const BINARY_PRE_ENTRY_REJECT_SPREAD_TOO_WIDE_HARD =
+  "spread_too_wide_hard_block" as const;
 export const BINARY_PRE_ENTRY_REJECT_STAKE_ZERO = "stake_size_zero" as const;
 
 export type BinaryPreEntryAuditRecord = {

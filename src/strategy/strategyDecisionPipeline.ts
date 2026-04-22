@@ -41,8 +41,12 @@ import {
   shouldOverrideCooldownForExceptional,
   shouldOverrideCooldownForExceptionalCandidate,
 } from "../overridePolicyEngine.js";
-import { evaluateBinaryPaperEntryQuotes } from "../binary/entry/binaryQuoteEntryFilter.js";
+import {
+  binarySpreadExceedsHardMax,
+  evaluateBinaryPaperEntryQuotes,
+} from "../binary/entry/binaryQuoteEntryFilter.js";
 import { evaluateExecutionBookPipeline } from "../executionSpreadFilter.js";
+import { resolvePaperTradeEntryPath } from "../paperEntryPath.js";
 
 export type StrategyAction =
   | "none"
@@ -98,13 +102,38 @@ export type StrategyDecisionPipelineResult = {
 export const PIPELINE_BLOCKED_ENTRY_REASON = "pipeline_blocked_entry";
 
 /**
+ * Appended to {@link EntryEvaluation.reasons} when entry proceeds despite the pipeline
+ * deferring strong-spike confirmation (`strong_spike_waiting_confirmation_tick`) —
+ * observability only; does not block execution.
+ */
+export const PIPELINE_WATCH_PATH_WARNING_REASON = "pipeline_watch_path_warning";
+
+/** Pipeline returned “wait for confirmation tick” instead of immediate entry. */
+export function isStrongSpikeWaitingConfirmationDeferral(
+  decision: Pick<StrategyDecision, "action"> & { reason?: string }
+): boolean {
+  return (
+    decision.action === "none" &&
+    decision.reason === "strong_spike_waiting_confirmation_tick"
+  );
+}
+
+/** Temporary non-blocking mode: deferral alone does not invalidate `shouldEnter`. */
+export function allowsPaperEntryDespitePipelineWatchDeferral(
+  decision: Pick<StrategyDecision, "action"> & { reason?: string },
+  entryShouldEnter: boolean
+): boolean {
+  return isStrongSpikeWaitingConfirmationDeferral(decision) && entryShouldEnter;
+}
+
+/**
  * Paper execution must mirror the strategy pipeline: raw {@link EntryEvaluation}
  * can still have `shouldEnter: true` while {@link StrategyDecision.action} is `none`
  * (quality gate, confirmation watch, cooldown, quotes, etc.). The simulator only
  * consumes this object — clear the entry flag unless the pipeline approved an open.
  */
 export function entryEvaluationForPipelinePaperExecution(
-  decision: Pick<StrategyDecision, "action">,
+  decision: Pick<StrategyDecision, "action"> & { reason?: string },
   entryForSimulation: EntryEvaluation
 ): EntryEvaluation {
   if (
@@ -112,6 +141,22 @@ export function entryEvaluationForPipelinePaperExecution(
     decision.action === "promote_borderline_candidate"
   ) {
     return entryForSimulation;
+  }
+  if (
+    allowsPaperEntryDespitePipelineWatchDeferral(
+      decision,
+      entryForSimulation.shouldEnter
+    )
+  ) {
+    const reasons = entryForSimulation.reasons.includes(
+      PIPELINE_WATCH_PATH_WARNING_REASON
+    )
+      ? entryForSimulation.reasons
+      : [...entryForSimulation.reasons, PIPELINE_WATCH_PATH_WARNING_REASON];
+    return {
+      ...entryForSimulation,
+      reasons,
+    };
   }
   if (!entryForSimulation.shouldEnter) {
     return entryForSimulation;
@@ -326,6 +371,7 @@ type PipelineInput = {
     | "hardRejectPriorRangePercent"
     | "strongSpikeConfirmationTicks"
     | "exceptionalSpikePercent"
+    | "strongSpikeEarlyEntryExceptionalFraction"
     | "exceptionalSpikeOverridesCooldown"
     | "maxEntrySpreadBps"
     | "entryCooldownMs"
@@ -349,6 +395,10 @@ type PipelineInput = {
     | "binaryMaxEntrySidePrice"
     | "binaryNeutralQuoteBandMin"
     | "binaryNeutralQuoteBandMax"
+    | "binaryYesMidExtremeFilterEnabled"
+    | "binaryYesMidBandMin"
+    | "binaryYesMidBandMax"
+    | "binaryHardMaxSpreadBps"
     | "binaryPaperSlippageBps"
   >;
 };
@@ -823,6 +873,45 @@ export function runStrategyDecisionPipeline(
     movementCls: StrategyDecision["movementClassification"]
   ): StrategyDecisionPipelineResult | null => {
     if (config.marketMode !== "binary") return null;
+    if (
+      tick.kind === "ready" &&
+      binarySpreadExceedsHardMax(
+        tick.executionBook.spreadBps,
+        config.binaryHardMaxSpreadBps
+      )
+    ) {
+      strongSpikeLifecycleMessages.push(
+        `[strategy] binary_hard_spread_block spreadBps=${Number.isFinite(tick.executionBook.spreadBps) ? tick.executionBook.spreadBps.toFixed(2) : "NaN"} max=${config.binaryHardMaxSpreadBps}`
+      );
+      return {
+        decision: nrm({
+          tick,
+          simulation,
+          tradableSpikeMinPercent: config.tradableSpikeMinPercent,
+          pipelineQualityGate: qualityGate,
+          decision: {
+            action: "none",
+            direction: null,
+            stableRangeQuality,
+            movementClassification: movementCls,
+            qualityGatePassed: qualityGate.qualityGatePassed,
+            qualityGateReasons: qualityGate.qualityGateReasons,
+            qualityProfile: qualityGate.qualityProfile,
+            hardRejectApplied: false,
+            hardRejectReason: null,
+            cooldownOverridden: false,
+            overrideReason: null,
+            spikeDetected: tick.entry.spikeDetected,
+            fastPathUsed,
+            criticalBlockerUsed: null,
+            reason: "spread_too_wide_hard_block",
+          },
+        }),
+        entryForSimulation: tick.entry,
+        borderlineLifecycleEvents: renderEvents,
+        strongSpikeLifecycleMessages,
+      };
+    }
     const br = evaluateBinaryPaperEntryQuotes({
       binaryOutcomes: tick.binaryOutcomes,
       direction,
@@ -830,6 +919,9 @@ export function runStrategyDecisionPipeline(
       maxEntrySidePrice: config.binaryMaxEntrySidePrice,
       neutralBandMin: config.binaryNeutralQuoteBandMin,
       neutralBandMax: config.binaryNeutralQuoteBandMax,
+      yesMidExtremeFilterEnabled: config.binaryYesMidExtremeFilterEnabled,
+      yesMidBandMin: config.binaryYesMidBandMin,
+      yesMidBandMax: config.binaryYesMidBandMax,
     });
     if (br === null) return null;
     strongSpikeLifecycleMessages.push(
@@ -1057,10 +1149,40 @@ export function runStrategyDecisionPipeline(
       };
     }
     const isExceptionalStrongSpike = qualityGate.qualityProfile === "exceptional";
-    if (!isExceptionalStrongSpike) {
-      strongSpikeLifecycleMessages.push(
-        ...strongSpikeManager.createFromTick(now, tick).map((ev) => ev.message)
-      );
+    const exceptionalMinForEarly = Math.max(
+      config.tradableSpikeMinPercent,
+      config.exceptionalSpikePercent
+    );
+    const earlyFrac = config.strongSpikeEarlyEntryExceptionalFraction;
+    const strongSpikeEarlySkipConfirmation =
+      !isExceptionalStrongSpike &&
+      earlyFrac > 0 &&
+      tick.entry.movement.strongestMovePercent >= earlyFrac * exceptionalMinForEarly;
+
+    const mustDeferStrongSpikeForConfirmation =
+      !isExceptionalStrongSpike && !strongSpikeEarlySkipConfirmation;
+    /**
+     * Binary: no fill on the detection tick — always queue {@link StrongSpikeCandidateStore}
+     * and enter only after {@link decideStrongSpikeWatch} promotes (top-of-pipeline block).
+     */
+    const binaryStrongSpikeConfirmationWatchOnly =
+      config.marketMode === "binary";
+    const activeStrongSpikeForBinaryWatch =
+      strongSpikeManager.getActive();
+    const binaryAwaitingStrongSpikeConfirmationTicks =
+      binaryStrongSpikeConfirmationWatchOnly &&
+      activeStrongSpikeForBinaryWatch?.status === "watching" &&
+      activeStrongSpikeForBinaryWatch.watchTicksRemaining > 0;
+
+    if (
+      mustDeferStrongSpikeForConfirmation ||
+      binaryStrongSpikeConfirmationWatchOnly
+    ) {
+      if (!binaryAwaitingStrongSpikeConfirmationTicks) {
+        strongSpikeLifecycleMessages.push(
+          ...strongSpikeManager.createFromTick(now, tick).map((ev) => ev.message)
+        );
+      }
       return {
         decision: nrm({
           tick,
@@ -1087,6 +1209,15 @@ export function runStrategyDecisionPipeline(
         borderlineLifecycleEvents: renderEvents,
         strongSpikeLifecycleMessages,
       };
+    }
+    if (strongSpikeEarlySkipConfirmation) {
+      strongSpikeLifecycleMessages.push(
+        `[strategy] strong_spike_early_entry skip_confirmation move=${(
+          tick.entry.movement.strongestMovePercent * 100
+        ).toFixed(4)}% >= ${(earlyFrac * 100).toFixed(0)}%×exceptionalMin=${(
+          exceptionalMinForEarly * 100
+        ).toFixed(4)}%`
+      );
     }
     if (config.marketMode === "binary") {
       if (tick.entry.direction !== null) {
@@ -1233,7 +1364,11 @@ export function runStrategyDecisionPipeline(
         strongSpikeLifecycleMessages,
       };
     }
-    if (tick.entry.direction !== null && tick.entry.shouldEnter) {
+    if (
+      tick.entry.direction !== null &&
+      tick.entry.shouldEnter &&
+      config.marketMode !== "binary"
+    ) {
       const binBlockFast = tryBinaryPaperQuoteGateBlock(
         tick.entry.direction,
         true,
@@ -1321,6 +1456,9 @@ export function runStrategyDecisionPipeline(
         maxEntrySidePrice: config.binaryMaxEntrySidePrice,
         neutralBandMin: config.binaryNeutralQuoteBandMin,
         neutralBandMax: config.binaryNeutralQuoteBandMax,
+        yesMidExtremeFilterEnabled: config.binaryYesMidExtremeFilterEnabled,
+        yesMidBandMin: config.binaryYesMidBandMin,
+        yesMidBandMax: config.binaryYesMidBandMax,
       });
       if (br !== null) {
         effectiveWatch = {
@@ -1492,7 +1630,8 @@ export function runStrategyDecisionPipeline(
     tick.entry.shouldEnter &&
     tick.entry.direction !== null &&
     tick.entry.movementClassification === "strong_spike" &&
-    qualityGate.qualityGatePassed
+    qualityGate.qualityGatePassed &&
+    config.marketMode !== "binary"
   ) {
     if (simulation.canOpenNewPosition(now, config.entryCooldownMs)) {
       if (tick.entry.direction !== null) {
@@ -1598,6 +1737,58 @@ export function runStrategyDecisionPipeline(
     entryForSimulation: tick.entry,
     borderlineLifecycleEvents: renderEvents,
     strongSpikeLifecycleMessages,
+  };
+}
+
+/**
+ * After {@link runStrategyDecisionPipeline}, blocks binary fills that would persist as
+ * {@link resolvePaperTradeEntryPath} `strong_spike_immediate` (same-tick strong-spike entry).
+ * Confirmation (`strong_spike_confirmed_*`) and borderline promotes are unchanged.
+ */
+export function applyBinaryDisableImmediateStrongSpike(
+  result: StrategyDecisionPipelineResult,
+  input: {
+    tick: StrategyTickResult;
+    simulation: SimulationEngine;
+    config: Pick<
+      AppConfig,
+      | "marketMode"
+      | "binaryDisableImmediateStrongSpike"
+      | "tradableSpikeMinPercent"
+    >;
+  }
+): StrategyDecisionPipelineResult {
+  if (input.tick.kind !== "ready") return result;
+  if (
+    input.config.marketMode !== "binary" ||
+    !input.config.binaryDisableImmediateStrongSpike
+  ) {
+    return result;
+  }
+  const act = result.decision.action;
+  if (act !== "enter_immediate") return result;
+  if (resolvePaperTradeEntryPath(result.decision) !== "strong_spike_immediate") {
+    return result;
+  }
+  const d = result.decision;
+  const blocked: StrategyDecision = {
+    ...d,
+    action: "none",
+    direction: null,
+    cooldownOverridden: false,
+    overrideReason: null,
+    criticalBlockerUsed: "binary_immediate_strong_spike_disabled",
+    reason: "binary_immediate_strong_spike_disabled",
+  };
+  return {
+    ...result,
+    decision: withNormalizedReasons({
+      decision: blocked,
+      tick: input.tick,
+      simulation: input.simulation,
+      tradableSpikeMinPercent: input.config.tradableSpikeMinPercent,
+    }),
+    entryForSimulation: input.tick.entry,
   };
 }
 

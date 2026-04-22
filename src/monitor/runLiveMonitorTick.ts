@@ -28,12 +28,16 @@ import { SpikeDebugTracker } from "../spikeDebugTracker.js";
 import type { BorderlineCandidateStore } from "../borderlineCandidateStore.js";
 import type { StrongSpikeCandidateStore } from "../strongSpikeCandidateStore.js";
 import {
+  applyBinaryDisableImmediateStrongSpike,
   applyFeedStaleEntryBlock,
   entryEvaluationForPipelinePaperExecution,
   formatStrategyDecisionLog,
   isPersistedBorderlineLifecycleEvent,
+  PIPELINE_WATCH_PATH_WARNING_REASON,
   runStrategyDecisionPipeline,
 } from "../strategy/strategyDecisionPipeline.js";
+import { resolvePaperTradeEntryPath } from "../paperEntryPath.js";
+import { buildTradeEntryOpenReason } from "../tradeEntryOpenDiagnosis.js";
 import {
   formatBinaryProbabilityDebugLine,
   getBinaryProbabilityDiagnostics,
@@ -265,6 +269,8 @@ export async function runLiveMonitorTick(
         hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
         strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
         exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
+        strongSpikeEarlyEntryExceptionalFraction:
+          ctx.config.strongSpikeEarlyEntryExceptionalFraction,
         exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
         maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
         entryCooldownMs: ctx.config.entryCooldownMs,
@@ -291,6 +297,11 @@ export async function runLiveMonitorTick(
         binaryMaxEntrySidePrice: ctx.config.binaryMaxEntrySidePrice,
         binaryNeutralQuoteBandMin: ctx.config.binaryNeutralQuoteBandMin,
         binaryNeutralQuoteBandMax: ctx.config.binaryNeutralQuoteBandMax,
+        binaryYesMidExtremeFilterEnabled:
+          ctx.config.binaryYesMidExtremeFilterEnabled,
+        binaryYesMidBandMin: ctx.config.binaryYesMidBandMin,
+        binaryYesMidBandMax: ctx.config.binaryYesMidBandMax,
+        binaryHardMaxSpreadBps: ctx.config.binaryHardMaxSpreadBps,
         binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
       },
     });
@@ -353,6 +364,8 @@ export async function runLiveMonitorTick(
       hardRejectPriorRangePercent: ctx.config.hardRejectPriorRangePercent,
       strongSpikeConfirmationTicks: ctx.config.strongSpikeConfirmationTicks,
       exceptionalSpikePercent: ctx.config.exceptionalSpikePercent,
+      strongSpikeEarlyEntryExceptionalFraction:
+        ctx.config.strongSpikeEarlyEntryExceptionalFraction,
       exceptionalSpikeOverridesCooldown: ctx.config.exceptionalSpikeOverridesCooldown,
       maxEntrySpreadBps: ctx.config.maxEntrySpreadBps,
       entryCooldownMs: ctx.config.entryCooldownMs,
@@ -378,8 +391,18 @@ export async function runLiveMonitorTick(
       binaryMaxEntrySidePrice: ctx.config.binaryMaxEntrySidePrice,
       binaryNeutralQuoteBandMin: ctx.config.binaryNeutralQuoteBandMin,
       binaryNeutralQuoteBandMax: ctx.config.binaryNeutralQuoteBandMax,
+      binaryYesMidExtremeFilterEnabled:
+        ctx.config.binaryYesMidExtremeFilterEnabled,
+      binaryYesMidBandMin: ctx.config.binaryYesMidBandMin,
+      binaryYesMidBandMax: ctx.config.binaryYesMidBandMax,
+      binaryHardMaxSpreadBps: ctx.config.binaryHardMaxSpreadBps,
       binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
     },
+  });
+  pipeline = applyBinaryDisableImmediateStrongSpike(pipeline, {
+    tick,
+    simulation: sim,
+    config: ctx.config,
   });
   pipeline = applyFeedStaleEntryBlock(pipeline, {
     tick,
@@ -433,6 +456,14 @@ export async function runLiveMonitorTick(
     pipeline.decision,
     entryForSimulation
   );
+  if (
+    debugMonitor &&
+    paperEntry.reasons.includes(PIPELINE_WATCH_PATH_WARNING_REASON)
+  ) {
+    logMonitorDebug(
+      "[strategy] pipeline_watch_path deferred — entry allowed (non-blocking): strong_spike_waiting_confirmation_tick"
+    );
+  }
   if (debugMonitor && tick.entry.spikeDetected) {
     logSpikeDecisionTrace(
       buildSpikeDecisionTracePayload({
@@ -441,10 +472,11 @@ export async function runLiveMonitorTick(
       })
     );
   }
-  const entryPath =
-    pipeline.decision.action === "promote_borderline_candidate"
-      ? "borderline_delayed"
-      : "strong_spike_immediate";
+  const entryPath = resolvePaperTradeEntryPath(pipeline.decision);
+  const entryOpenReason =
+    ctx.config.marketMode === "binary"
+      ? buildTradeEntryOpenReason(pipeline.decision, entryPath)
+      : undefined;
   const hadOpenPosition = sim.getOpenPosition() !== null;
   const action = pipeline.decision.action;
   const enteringImmediate = action === "enter_immediate";
@@ -463,6 +495,7 @@ export async function runLiveMonitorTick(
     ...(pipeline.decision.qualityProfile !== undefined
       ? { entryQualityProfile: pipeline.decision.qualityProfile }
       : {}),
+    ...(entryOpenReason !== undefined ? { entryOpenReason } : {}),
     executionBook: tick.executionBook,
     symbol: ctx.tradeSymbol,
     config: {
@@ -475,6 +508,16 @@ export async function runLiveMonitorTick(
       binaryStopLossPriceDelta: ctx.config.binaryStopLossPriceDelta,
       binaryExitTimeoutMs: ctx.config.binaryExitTimeoutMs,
       binaryMaxEntryPrice: ctx.config.binaryMaxEntryPrice,
+      binaryEnableSideSpecificGating: ctx.config.binaryEnableSideSpecificGating,
+      binaryYesMinMispricingThreshold: ctx.config.binaryYesMinMispricingThreshold,
+      binaryNoMinMispricingThreshold: ctx.config.binaryNoMinMispricingThreshold,
+      binaryYesMaxEntryPrice: ctx.config.binaryYesMaxEntryPrice,
+      binaryNoMaxEntryPrice: ctx.config.binaryNoMaxEntryPrice,
+      binaryYesMidExtremeFilterEnabled:
+        ctx.config.binaryYesMidExtremeFilterEnabled,
+      binaryYesMidBandMin: ctx.config.binaryYesMidBandMin,
+      binaryYesMidBandMax: ctx.config.binaryYesMidBandMax,
+      binaryHardMaxSpreadBps: ctx.config.binaryHardMaxSpreadBps,
       entryCooldownMs: ctx.config.entryCooldownMs,
       stakePerTrade: ctx.config.stakePerTrade,
       allowWeakQualityEntries: ctx.config.allowWeakQualityEntries,

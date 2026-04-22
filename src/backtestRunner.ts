@@ -195,7 +195,7 @@ async function main(): Promise<void> {
   if (result.binaryRunAnalytics !== undefined && result.binaryRunAnalytics !== null) {
     const b = result.binaryRunAnalytics;
     console.log("");
-    console.log("  Binary run analytics (binary_run_analytics_v2):");
+    console.log("  Binary run analytics (binary_run_analytics_v3):");
     console.log(
       `    opened ${b.openedTrades}  | closed ${b.closedTrades}  | win ${b.winRate.toFixed(2)}%  | Σ pnl ${b.pnlTotal >= 0 ? "+" : ""}${b.pnlTotal.toFixed(4)}  | timeout rate ${(b.timeoutRate * 100).toFixed(1)}%`
     );
