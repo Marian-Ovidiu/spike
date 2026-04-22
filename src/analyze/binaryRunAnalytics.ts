@@ -76,6 +76,115 @@ export function edgeBucketForModelEdge(edge: number | null | undefined): EdgeBuc
   return ">0.05";
 }
 
+/** Display order for mispricing tables (matches {@link edgeBucketForModelEdge} buckets). */
+export const MISPRICING_BUCKET_DISPLAY_ORDER: readonly EdgeBucketLabel[] = [
+  "<0.01",
+  "0.01-0.03",
+  "0.03-0.05",
+  ">0.05",
+  "unknown",
+];
+
+/** Human-readable range for console / reports (maps internal bucket keys). */
+export function mispricingBucketDisplayLabel(bucket: EdgeBucketLabel): string {
+  switch (bucket) {
+    case "<0.01":
+      return "0–0.01";
+    case "0.01-0.03":
+      return "0.01–0.03";
+    case "0.03-0.05":
+      return "0.03–0.05";
+    case ">0.05":
+      return ">0.05";
+    default:
+      return "unknown (edge)";
+  }
+}
+
+/** Closed-trade stats by entry {@link SimulatedTrade.entryModelEdge} bucket (mispricing calibration). */
+export type MispricingBucketTradeStats = {
+  bucket: EdgeBucketLabel;
+  trades: number;
+  winRatePercent: number;
+  pnlTotal: number;
+  avgPnlPerTrade: number;
+  avgMfe: number | null;
+  avgMae: number | null;
+};
+
+type MispricingBucketAcc = {
+  n: number;
+  wins: number;
+  pnlSum: number;
+  mfeSum: number;
+  mfeN: number;
+  maeSum: number;
+  maeN: number;
+};
+
+function emptyMispricingBucketAcc(): MispricingBucketAcc {
+  return {
+    n: 0,
+    wins: 0,
+    pnlSum: 0,
+    mfeSum: 0,
+    mfeN: 0,
+    maeSum: 0,
+    maeN: 0,
+  };
+}
+
+function emptyMispricingAcc(): Record<EdgeBucketLabel, MispricingBucketAcc> {
+  return {
+    "<0.01": emptyMispricingBucketAcc(),
+    "0.01-0.03": emptyMispricingBucketAcc(),
+    "0.03-0.05": emptyMispricingBucketAcc(),
+    ">0.05": emptyMispricingBucketAcc(),
+    unknown: emptyMispricingBucketAcc(),
+  };
+}
+
+function accumulateMispricingTrade(
+  acc: Record<EdgeBucketLabel, MispricingBucketAcc>,
+  bucket: EdgeBucketLabel,
+  pnl: number,
+  holdAudit: HoldExitAudit | undefined
+): void {
+  const b = acc[bucket];
+  b.n += 1;
+  b.pnlSum += pnl;
+  if (pnl > 0) b.wins += 1;
+  const mm = mfeMaeFromHoldAudit(holdAudit);
+  if (mm !== null) {
+    b.mfeSum += mm.mfe;
+    b.mfeN += 1;
+    b.maeSum += mm.mae;
+    b.maeN += 1;
+  }
+}
+
+function finalizeMispricingBucketTradeStats(
+  acc: Record<EdgeBucketLabel, MispricingBucketAcc>
+): MispricingBucketTradeStats[] {
+  const out: MispricingBucketTradeStats[] = [];
+  for (const bucket of MISPRICING_BUCKET_DISPLAY_ORDER) {
+    const x = acc[bucket];
+    const n = x.n;
+    const wr = n > 0 ? (x.wins / n) * 100 : 0;
+    const avgPnl = n > 0 ? x.pnlSum / n : 0;
+    out.push({
+      bucket,
+      trades: n,
+      winRatePercent: wr,
+      pnlTotal: x.pnlSum,
+      avgPnlPerTrade: avgPnl,
+      avgMfe: x.mfeN > 0 ? x.mfeSum / x.mfeN : null,
+      avgMae: x.maeN > 0 ? x.maeSum / x.maeN : null,
+    });
+  }
+  return out;
+}
+
 function inc<K extends string>(m: Record<K, number>, k: K): void {
   m[k] = (m[k] ?? 0) + 1;
 }
@@ -471,6 +580,11 @@ export type BinaryRunAnalyticsReport = {
   avgPnlPerTrade: number;
   timeoutRate: number;
   edgeBucketBreakdown: Record<EdgeBucketLabel, number>;
+  /**
+   * Per trade: entry {@link SimulatedTrade.entryModelEdge} (mispricing) vs outcome.
+   * MFE/MAE from {@link HoldExitAudit} when present (binary price points or long convention).
+   */
+  mispricingBucketTradeStats: MispricingBucketTradeStats[];
   qualityBucketBreakdown: Record<string, number>;
   borderlineFunnelBreakdown: BorderlineFunnelBreakdown;
   tradeOutcomeBreakdown: TradeOutcomeBreakdown;
@@ -576,6 +690,7 @@ export function computeBinaryRunAnalytics(input: {
   };
   const qualityBucketBreakdown: Record<string, number> = {};
   const tradeOutcome = emptyTradeOutcomeBreakdown();
+  const mispricingAcc = emptyMispricingAcc();
 
   for (const t of binaryTrades) {
     const pnl = t.profitLoss;
@@ -586,6 +701,7 @@ export function computeBinaryRunAnalytics(input: {
 
     const bucket = edgeBucketForModelEdge(t.entryModelEdge);
     edgeBucketBreakdown[bucket] += 1;
+    accumulateMispricingTrade(mispricingAcc, bucket, pnl, t.holdExitAudit);
 
     const q = (t.entryQualityProfile ?? "unknown") as string;
     inc(qualityBucketBreakdown as Record<string, number>, q);
@@ -629,6 +745,7 @@ export function computeBinaryRunAnalytics(input: {
     avgPnlPerTrade,
     timeoutRate,
     edgeBucketBreakdown,
+    mispricingBucketTradeStats: finalizeMispricingBucketTradeStats(mispricingAcc),
     qualityBucketBreakdown,
     borderlineFunnelBreakdown,
     tradeOutcomeBreakdown: tradeOutcome,
@@ -706,6 +823,7 @@ export function computeBinaryRunAnalyticsFromJsonlRows(input: {
   };
   const qualityBucketBreakdown: Record<string, number> = {};
   const tradeOutcome = emptyTradeOutcomeBreakdown();
+  const mispricingAcc = emptyMispricingAcc();
 
   for (const t of binaryTrades) {
     const pnl = Number(t.netPnlUsdt);
@@ -719,6 +837,7 @@ export function computeBinaryRunAnalyticsFromJsonlRows(input: {
       t.entryModelEdge === null ? undefined : t.entryModelEdge
     );
     edgeBucketBreakdown[bucket] += 1;
+    accumulateMispricingTrade(mispricingAcc, bucket, pnlSafe, t.holdExitAudit);
 
     const q = String(t.entryQualityProfile ?? "unknown");
     inc(qualityBucketBreakdown as Record<string, number>, q);
@@ -759,6 +878,7 @@ export function computeBinaryRunAnalyticsFromJsonlRows(input: {
     avgPnlPerTrade,
     timeoutRate,
     edgeBucketBreakdown,
+    mispricingBucketTradeStats: finalizeMispricingBucketTradeStats(mispricingAcc),
     qualityBucketBreakdown,
     borderlineFunnelBreakdown: input.borderlineFunnel ?? {
       borderlineEntered: 0,
@@ -852,6 +972,37 @@ function fmtNumOrDash(n: number | null, digits: number): string {
   return n.toFixed(digits);
 }
 
+/** Mispricing buckets × closed-trade performance (shutdown + `npm run analyze-run`). */
+export function formatMispricingBucketAnalysisConsole(
+  rows: readonly MispricingBucketTradeStats[]
+): string {
+  const lines: string[] = [
+    "──────── Binary — mispricing (entry model edge) vs outcomes ──",
+    "  Entry edge = stored mispricing at open (fair − ask on bought leg). Compare buckets for real edge.",
+    "",
+    `${"Edge (mispricing)".padEnd(18)} ${"n".padStart(4)} ${"win%".padStart(
+      7
+    )} ${"ΣPnL".padStart(10)} ${"avgPnL".padStart(10)} ${"avgMFE".padStart(
+      10
+    )} ${"avgMAE".padStart(10)}`,
+  ];
+  for (const r of rows) {
+    const lab = mispricingBucketDisplayLabel(r.bucket).padEnd(18);
+    const n = String(r.trades).padStart(4);
+    const wr =
+      r.trades > 0 ? `${r.winRatePercent.toFixed(1)}%`.padStart(7) : "      —".padStart(7);
+    const sumPnl =
+      r.trades > 0 ? r.pnlTotal.toFixed(4).padStart(10) : "       —".padStart(10);
+    const avgPnl =
+      r.trades > 0 ? r.avgPnlPerTrade.toFixed(4).padStart(10) : "       —".padStart(10);
+    const mfe = fmtNumOrDash(r.avgMfe, 6).padStart(10);
+    const mae = fmtNumOrDash(r.avgMae, 6).padStart(10);
+    lines.push(`${lab} ${n} ${wr} ${sumPnl} ${avgPnl} ${mfe} ${mae}`);
+  }
+  lines.push("──────────────────────────────────────────────────────────────");
+  return lines.join("\n");
+}
+
 /** Multi-line block for shutdown console + analyze-run text output. */
 export function formatBinaryYesNoComparativeConsole(
   y: BinaryYesNoComparativeReport
@@ -915,6 +1066,9 @@ export function formatBinaryRunAnalyticsConsole(
     `Timeout rate %: ${report.timeoutRate.toFixed(2)}`,
     "",
     `Edge buckets (entry model edge): ${JSON.stringify(report.edgeBucketBreakdown)}`,
+    "",
+    formatMispricingBucketAnalysisConsole(report.mispricingBucketTradeStats),
+    "",
     `Quality buckets (closed trades): ${JSON.stringify(report.qualityBucketBreakdown)}`,
     "",
     `Borderline funnel: ${JSON.stringify(report.borderlineFunnelBreakdown)}`,

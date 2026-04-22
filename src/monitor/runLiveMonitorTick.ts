@@ -291,6 +291,7 @@ export async function runLiveMonitorTick(
         binaryMaxEntrySidePrice: ctx.config.binaryMaxEntrySidePrice,
         binaryNeutralQuoteBandMin: ctx.config.binaryNeutralQuoteBandMin,
         binaryNeutralQuoteBandMax: ctx.config.binaryNeutralQuoteBandMax,
+        binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
       },
     });
     if (debugMonitor) {
@@ -377,6 +378,7 @@ export async function runLiveMonitorTick(
       binaryMaxEntrySidePrice: ctx.config.binaryMaxEntrySidePrice,
       binaryNeutralQuoteBandMin: ctx.config.binaryNeutralQuoteBandMin,
       binaryNeutralQuoteBandMax: ctx.config.binaryNeutralQuoteBandMax,
+      binaryPaperSlippageBps: ctx.config.binaryPaperSlippageBps,
     },
   });
   pipeline = applyFeedStaleEntryBlock(pipeline, {

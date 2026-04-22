@@ -265,7 +265,10 @@ function gracefulShutdown(): void {
             ),
             binaryQuoteSession: binaryQuoteSessionStats.snapshot(),
             ...(binaryRunAnalytics !== null
-              ? { binaryYesNoComparative: binaryRunAnalytics.yesNoComparative }
+              ? {
+                  binaryYesNoComparative: binaryRunAnalytics.yesNoComparative,
+                  binaryRunAnalytics,
+                }
               : {}),
           }
         : {}),

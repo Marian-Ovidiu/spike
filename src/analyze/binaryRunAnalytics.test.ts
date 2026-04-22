@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import type { HoldExitAudit } from "../holdExitAudit.js";
+
 import {
   computeBinaryRunAnalyticsFromJsonlRows,
   edgeBucketForModelEdge,
@@ -70,6 +72,39 @@ describe("binaryRunAnalytics", () => {
     expect(report.invalidMarketPricesSubreasonBreakdown.invalid_price_not_finite).toBe(
       0
     );
+    expect(report.mispricingBucketTradeStats).toHaveLength(5);
+    const mp01 = report.mispricingBucketTradeStats.find((r) => r.bucket === "0.01-0.03");
+    expect(mp01?.trades).toBe(1);
+    expect(mp01?.pnlTotal).toBeCloseTo(0.5, 6);
+    expect(mp01?.winRatePercent).toBe(100);
+    const mpHigh = report.mispricingBucketTradeStats.find((r) => r.bucket === ">0.05");
+    expect(mpHigh?.trades).toBe(1);
+    expect(mpHigh?.pnlTotal).toBeCloseTo(-0.2, 6);
+    expect(mpHigh?.winRatePercent).toBe(0);
+  });
+
+  it("mispricing buckets aggregate avg MFE MAE from holdExitAudit when present", () => {
+    const audit = {
+      maxFavorableExcursion: 0.03,
+      maxAdverseExcursion: 0.02,
+    } as HoldExitAudit;
+    const report = computeBinaryRunAnalyticsFromJsonlRows({
+      opportunityRows: [],
+      tradeRows: [
+        {
+          marketMode: "binary",
+          netPnlUsdt: 1,
+          exitReason: "profit",
+          outcomeTokenBought: "YES",
+          entryModelEdge: 0.015,
+          holdExitAudit: audit,
+        },
+      ],
+    });
+    const row = report.mispricingBucketTradeStats.find((r) => r.bucket === "0.01-0.03");
+    expect(row?.trades).toBe(1);
+    expect(row?.avgMfe).toBeCloseTo(0.03, 6);
+    expect(row?.avgMae).toBeCloseTo(0.02, 6);
   });
 
   it("counts invalid_market_prices subreasons on binary rejected opportunities", () => {

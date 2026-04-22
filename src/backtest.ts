@@ -383,6 +383,7 @@ export function runBacktestReplay(
         binaryMaxEntrySidePrice: config.binaryMaxEntrySidePrice,
         binaryNeutralQuoteBandMin: config.binaryNeutralQuoteBandMin,
         binaryNeutralQuoteBandMax: config.binaryNeutralQuoteBandMax,
+        binaryPaperSlippageBps: config.binaryPaperSlippageBps,
       },
     });
     const normalizedReasons = pipeline.decision.reasons ?? [];
@@ -751,6 +752,7 @@ export function runBinaryBacktestReplay(
     binaryMaxEntrySidePrice: config.binaryMaxEntrySidePrice,
     binaryNeutralQuoteBandMin: config.binaryNeutralQuoteBandMin,
     binaryNeutralQuoteBandMax: config.binaryNeutralQuoteBandMax,
+    binaryPaperSlippageBps: config.binaryPaperSlippageBps,
   };
 
   const simCfg = {

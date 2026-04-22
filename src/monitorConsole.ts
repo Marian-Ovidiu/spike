@@ -37,6 +37,8 @@ import {
 } from "./rejectionReasons.js";
 import {
   formatBinaryYesNoComparativeConsole,
+  formatMispricingBucketAnalysisConsole,
+  type BinaryRunAnalyticsReport,
   type BinaryYesNoComparativeReport,
 } from "./analyze/binaryRunAnalytics.js";
 
@@ -83,6 +85,12 @@ const LIVE_IT_REJECTION: Record<NormalizedRejectionReason, string> = {
   negative_or_zero_model_edge: "edge modello assente o non positivo",
   model_edge_below_min_threshold: "edge modello sotto soglia minima",
   pipeline_quality_downgrade: "qualità/conferma pipeline insufficiente",
+  pipeline_profile_weak: "profilo qualità pipeline non forte/eccezionale",
+  pipeline_delayed_confirmation_failed: "conferma ritardata non soddisfatta",
+  pipeline_confirmation_noise: "tick di conferma rumoroso",
+  pipeline_watch_path_blocked: "in attesa conferma watch (pipeline)",
+  pipeline_invalid_market_coupled_downgrade:
+    "libro/spread non valido in conferma forte",
 };
 
 /** Fallback when reasons are not yet normalized to {@link NormalizedRejectionReason}. */
@@ -1157,6 +1165,8 @@ export function printShutdownReport(
     pipelineQualityDowngradeBreakdown?: Record<string, number>;
     /** Binary: YES vs NO funnel + trade aggregates (see session `binaryRunAnalytics.yesNoComparative`). */
     binaryYesNoComparative?: BinaryYesNoComparativeReport;
+    /** Binary: full run analytics (mispricing table, session-summary parity). */
+    binaryRunAnalytics?: BinaryRunAnalyticsReport | null;
   }
 ): void {
   const durationMs = Math.max(0, Date.now() - startedAtMs);
@@ -1243,6 +1253,14 @@ export function printShutdownReport(
     if (extended.binaryYesNoComparative !== undefined) {
       console.log("");
       console.log(formatBinaryYesNoComparativeConsole(extended.binaryYesNoComparative));
+    }
+    if (extended.binaryRunAnalytics !== undefined && extended.binaryRunAnalytics !== null) {
+      console.log("");
+      console.log(
+        formatMispricingBucketAnalysisConsole(
+          extended.binaryRunAnalytics.mispricingBucketTradeStats
+        )
+      );
     }
     console.log(`${"Border verdict".padEnd(14)} ${extended.verdict.toUpperCase()}`);
     if (extended.gateFunnel !== undefined) {

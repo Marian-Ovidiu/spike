@@ -4,11 +4,13 @@ import type { ExecutableTopOfBook } from "../../market/types.js";
 import { evaluateExecutionBookPipeline } from "../../executionSpreadFilter.js";
 import {
   binaryLegFromDirection,
-  binarySideFromStrategyDirection,
   computeBinaryEntryEdge,
   resolveBinaryVenueAsks,
 } from "../entry/edgeEntryDecision.js";
-import { binaryOutcomeBuyFillPrice } from "../paper/binaryPaperExecution.js";
+import {
+  binaryOutcomeBuyFillPrice,
+  binarySideFromStrategyDirection,
+} from "../paper/binaryPaperExecution.js";
 import {
   SYNTHETIC_PRICE_MAX,
   SYNTHETIC_PRICE_MIN,

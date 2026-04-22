@@ -349,6 +349,7 @@ type PipelineInput = {
     | "binaryMaxEntrySidePrice"
     | "binaryNeutralQuoteBandMin"
     | "binaryNeutralQuoteBandMax"
+    | "binaryPaperSlippageBps"
   >;
 };
 
