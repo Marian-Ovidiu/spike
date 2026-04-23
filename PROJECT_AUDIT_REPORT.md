@@ -1,403 +1,255 @@
-Report tecnico del repository **spike-bot**: documento interno di audit.  
-Analisi basata sul codice TypeScript in `src/`, `package.json`, `.env.example`, `AGENTS.md` e script npm. Dove qualcosa non è implementato o non è ricavabile dal codice, è indicato esplicitamente.
+# Ricognizione tecnica del repository (spike-bot)
+
+Documento di audit per un possibile **pivot verso un engine futures/microstructure**: analisi basata sul **codice reale** in `src/`, `package.json`, `.env.example`, `AGENTS.md` e script npm. **Nessuna modifica al codice** è stata effettuata in fase di ricognizione. Dove qualcosa non è deducibile dal repository, è indicato esplicitamente.
+
+**Aggiornamento post-pivot:** lo stato operativo del nuovo stack futures e la mappa legacy sono descritti in **`docs/FUTURES_MIGRATION.md`** (entry point `monitor:futures`, `replay:futures`, isolamento `src/binary/*`).
 
 ---
 
-# 1. Executive Summary
+## 1. Executive summary
 
-Il progetto è un **bot di paper trading** orientato ai **mercati binari YES/NO** (stile Polymarket), con **segnale di movimento da mid BTC spot** (default: Binance via WebSocket) e **venue di esecuzione** separata: per default un **libro sintetico** (`BinarySyntheticFeed`), opzionalmente **quote pubbliche Gamma** (`BinaryMarketFeed`) senza ordini reali verso exchange.
+- **Scopo attuale (dal codice e da `AGENTS.md`)**  
+  Bot di **mean-reversion su “spike”** con segnale su **finestra di prezzi** (default: **Binance spot** per `MARKET_MODE=binary`) e **esecuzione paper** su **mercato binario**: per default **sintetico YES/NO** (`BinarySyntheticFeed`), opzionale **Polymarket Gamma** (`BinaryMarketFeed`). Flusso operativo principale: `npm run monitor` → `dist/liveMonitor.js`.
 
-La logica core documentata in `AGENTS.md` è **mean-reversion su spike**: finestra relativamente stabile, spike sul prezzo spot, ingresso **contrarian** (direzione opposta al movimento), uscita su TP/SL/timeout su **prezzo del token comprato** (non sul BTC).
+- **Stato architetturale**  
+  C’è **separazione parziale** (interfaccia `MarketDataFeed`, doppio feed signal/execution in binary, `config` con gruppi `shared` / `binary` / `spot`), ma la **strategia “reale”** vive in un **unico pipeline** (`strategyDecisionPipeline`) e in `SimulationEngine` con **rami espliciti** spot vs binary. **Modularità “a strategie pluggabili” non c’è**: c’è un percorso unico con molte feature flag e rami `marketMode === "binary"`.
 
-Il codice mostra **maturità da framework di ricerca / laboratorio**: pipeline articolata (`strategyDecisionPipeline.ts`), osservabilità ricca (JSONL, summary, funnel, reason codes), **test unitari estesi** (Vitest su decine di moduli), **backtest/replay** su CSV. Non risulta integrato un **client di trading live** che invii ordini firmati; l’esecuzione è **simulata** (`SimulationEngine`).
+- **Accoppiamento al binary**  
+  **Alto** su esecuzione, P/L, filtri quote, calibrazione probabilità, report e analisi. **Medio** sul moto spike (logica su serie di prezzi astratta ma nominata e cablata “BTC” ovunque). **`binaryOnlyRuntime`** può **vietare** proprio il ramo `spot`.
 
-**Punti di forza:** separazione netta signal vs execution feed in modalità binary; moduli dedicati per edge semantico (`binaryEdgeSemantics.ts`, `edgeEntryDecision.ts`); paper execution con fee/slippage e diagnostica; script di analisi post-sessione (`analyzeRun`, `analyzeSessions`, `analyzeProbabilityCalibration`).
-
-**Lacune principali:** la “probabilità” BTC è **euristica** (`binaryProbabilityEngine.ts`), non un modello di mercato calibrato; **non c’è scelta del lato migliore** tra YES e NO per massimo edge — il lato deriva solo dalla direzione contrarian allo spike; **nessun database** e **nessun frontend** nel repo; strategia “alpha” fuori dal micro-loop spike+gate non è modellata.
-
----
-
-# 2. Repository Overview
-
-### Struttura ad alto livello
-
-| Percorso | Ruolo | Importanza |
-|----------|--------|------------|
-| `src/` | Tutta la logica applicativa TypeScript | **Critica** |
-| `src/binary/` | Signal BTC, venue (synthetic/Gamma), entry/exit paper, monitor | **Critica** |
-| `src/adapters/` | Feed Binance spot (`binanceSpotFeed.ts`) | Alta |
-| `src/monitor/` | Orchestrazione tick live (`runLiveMonitorTick.ts`), debug | Alta |
-| `src/strategy/` | Pipeline decisionale (`strategyDecisionPipeline.ts`) | **Critica** |
-| `src/analyze/` | Analytics run/session (`binaryRunAnalytics.ts`, `binaryMultiSessionAggregate.ts`) | Media |
-| `src/legacy/spot/` | Modalità deprecata `MARKET_MODE=spot` (un solo feed Binance) | Bassa / legacy |
-| `dist/` | Output `tsc` (non versionare per audit logico; è build) | Derivato |
-| `output/monitor/` | Artefatti runtime default (`MONITOR_OUTPUT_DIR`) | Runtime |
-| `.env` / `.env.example` | Configurazione | **Critica** |
-| `package.json` | Script npm, dipendenze | **Critica** |
-| `AGENTS.md` | Obiettivo prodotto in 15 righe | Contesto |
-
-**Monorepo / packages:** no — progetto **singolo package** npm (`spike-bot`).
-
-**Root rilevanti:** `package.json`, `tsconfig` (presenza standard), `.env.example`, `PROJECT_AUDIT_REPORT.md`, `AGENTS.md`, `vitest.config.ts`.
-
-### Script npm (`package.json`)
-
-| Script | Comando effettivo | Ruolo |
-|--------|-------------------|--------|
-| `build` | `tsc` | Compila `src/` → `dist/` |
-| `dev` | `tsc --watch` | Watch build |
-| `monitor` | `npm run build && node dist/liveMonitor.js` | **Monitor live** (default produzione osservativa) |
-| `backtest` | `npm run build && node dist/backtestRunner.js` | Replay CSV + summary JSON |
-| `replay-opportunities` | `npm run build && node dist/replayOpportunities.js` | Riesame opportunità JSONL |
-| `validate-binary-market` | build + `validateBinaryMarket.js` | Validazione mercato binario |
-| `analyze-run` / `analyze-sessions` / `analyze-probability-calibration` | build + rispettivo `dist/*.js` | Analytics offline |
-| `test` | `vitest run` | Test automatici |
-
-**Entrypoint runtime principali:** `src/liveMonitor.ts` (monitor), `src/index.ts` (loop paper con `paper: true` sui feed), `src/backtestRunner.ts`, `src/replayOpportunities.ts`.
+- **Fattibilità pivot futures**  
+  **Media.**  
+  **Riutilizzabile senza strappi**: matematica spike/range su buffer (`strategy.ts`, `entryConditions.ts`, parti di `botLoop`), adattatore WebSocket Binance (`adapters/binanceSpotFeed.ts`), schema “tick periodico”, persistenza JSONL (`monitorPersistence.ts`).  
+  **Da rifare o sostituire**: modello di **book eseguibile**, **position sizing**, **exit**, **risk**, **instrument/symbol**, e tutto ciò che assume **prezzi in [0,1]**, **YES/NO**, fee paper binario. Il progetto **non** contiene futures, order flow L2/L3 serio o microstructure exchange-specific oltre spread L1 sintetizzato.
 
 ---
 
-# 3. Stack tecnico reale
+## 2. Mappa del repository
 
-| Area | Cosa si usa | Dove si vede |
-|------|-------------|----------------|
-| **Runtime** | Node.js (ESM `"type": "module"`) | `package.json` |
-| **Linguaggio** | TypeScript → JS compilato | `package.json`, `src/*.ts`, `dist/*.js` |
-| **HTTP client** | `axios` | `binary/venue/binaryMarketFeed.ts`, discovery Gamma |
-| **WebSocket** | `ws` | `adapters/binanceSpotFeed.ts` |
-| **Config env** | `dotenv` | `config.ts` (`dotenv.config()`) |
-| **Logging** | `console` (+ helper dedicati in `monitorConsole.ts`, `monitorDebugLog.ts`) | Tutto il progetto; nessun Winston/pino |
-| **Database** | *Assente* nel codice analizzato | — |
-| **Frontend / dashboard** | *Assente* | `package.json` non ha React/Vite/etc. |
-| **Test** | Vitest | `package.json`, `vitest.config.ts`, `src/**/*.test.ts` |
-| **Build** | TypeScript compiler | `typescript`, script `build` |
+| Percorso | Ruolo | Dipendenze principali | Classificazione |
+|---------|--------|-------------------------|-----------------|
+| `src/liveMonitor.ts` | Entry **monitor** prod/research: bootstrap feed, tick, shutdown, JSONL | `botLoop`, `monitor/runLiveMonitorTick`, `config`, `binary/*`, `monitorPersistence` | **Entry / runtime core** |
+| `src/index.ts` | Entry alternativo: loop semplificato senza persistence monitor | `startBotLoop`, stessi feed factory | **Entry spot/binary paper** |
+| `src/backtestRunner.ts`, `src/backtest.ts` | Replay CSV / summary JSON | `strategyDecisionPipeline`, `SimulationEngine`, synthetic binary | **Simulation / backtest** |
+| `src/config.ts` | Caricamento env, defaults, grouping, alias Gamma, `DEBUG_MONITOR` | dotenv | **Config core** |
+| `src/config/monitorNormalizedConfigSummary.ts`, `binarySideGating.ts` | Snapshot JSON per sessione + gating YES/NO | `config`, `binaryMarketSelector` | **Config / reporting** |
+| `src/botLoop.ts` | Tick strategia: buffer, probabilità binary, book execution, `runStrategyTick` | `entryConditions`, `binaryProbabilityEngine`, feed | **Strategy + orchestration** |
+| `src/strategy/strategyDecisionPipeline.ts` | Gate borderline/strong spike, quote binary, spread, qualità | molti moduli root + `binary/entry/*` | **Strategy (fortemente binary-aware)** |
+| `src/simulationEngine.ts` | Apertura/chiusura paper, spot vs binary, audit exit | `binary/paper/*`, `legacy/spot/*` | **Execution paper (core accoppiato)** |
+| `src/market/types.ts`, `marketFeedFactory.ts` | Contratto feed, factory signal/execution | `adapters`, `binary/venue`, `binary/signal` | **Adapter boundary** |
+| `src/adapters/binanceSpotFeed.ts` | WS + REST Binance spot, book normalizzato | `ws` | **Adapter exchange (spot)** |
+| `src/binary/venue/*` | Synthetic feed, Gamma, discovery, pricing sintetico | axios, env massiccio | **Adapter + lab binary** |
+| `src/binary/signal/*` | Probabilità da buffer, calibration, ring buffer mids | — | **Signal binary-specific** |
+| `src/binary/paper/*`, `binary/exit/*`, `binary/monitor/*`, `binary/entry/*` | Paper YES/NO, exit Δ prezzo, log, audit | — | **Binary domain** |
+| `src/legacy/spot/*` | Exit bps, book quote spot per paper legacy | — | **Legacy spot execution** |
+| `src/monitorPersistence.ts`, `monitorConsole.ts`, `monitorRuntimeStats.ts` | JSONL, banner, statistiche | — | **Reporting / observability** |
+| `src/analyze/*.ts`, `analyzeRun.ts`, `analyzeSessions.ts`, `analyzeProbabilityCalibration.ts` | Analytics post-run su sessioni/trades | output JSON | **Reporting / offline** |
+| `src/validateBinaryMarket.ts` | CLI diagnostica Gamma | — | **Script / integration** |
+| `src/replayOpportunities.ts` | Re-analisi JSONL opportunità | — | **Script analisi** |
+| `src/legacy/btcPriceService.ts` | REST ticker Binance | axios | **Archiviata** — nessun import in `src/`; spostata da `src/btcPriceService.ts` |
+| `src/binaryOnlyRuntime.ts` | Guard `BINARY_ONLY_RUNTIME` | — | **Config guard** |
+| `AGENTS.md` | Intent document | — | **Doc** |
+| `package.json` | Scripts: `monitor`, `backtest`, analyze, `validate-binary-market`, `test` | — | **Build entry** |
+| `dist/` | Output `tsc` | — | **Build artifact** |
 
----
-
-# 4. Come gira il sistema end-to-end
-
-### 4.1 Bootstrap
-
-1. **`liveMonitor.ts`** (script `npm run monitor`): importa `config` (che esegue `dotenv.config()`), `logConfig()`, assert su modalità (`assertLegacySpotMarketModeAcknowledged`, `assertBinaryOnlyRuntime` opzionale), eventuale auto-discovery mercato (`ensureAutoDiscoveredBinaryMarketSlug`).
-2. **`createSignalAndExecutionFeeds(config.marketMode, …)`** (`market/marketFeedFactory.ts`): in `binary` crea **due feed** — segnale BTC (`createBinarySignalDataFeed`) e venue (`createBinaryExecutionFeed`: sintetico o Gamma).
-3. Avvio WebSocket/REST: `bootstrapRest()` poi `start()` sui feed (logica in `liveMonitor.ts` con gestione same-instance vs dual feed).
-
-### 4.2 Config
-
-- **`loadConfig()`** in `config.ts` → oggetto **`AppConfig`** + **`configMeta`** per provenienza env. Chiavi canoniche in `ENV_KEYS`; alias deprecati in `DEPRECATED_CONFIG_ENV_ALIASES`.
-
-### 4.3 Tick operativo (monitor)
-
-1. **`runLiveMonitorTick`** (`monitor/runLiveMonitorTick.ts`) chiama **`runStrategyTick`** (`botLoop.ts`).
-2. **`runStrategyTick`**: aggiorna **`RollingPriceBuffer`** con mid dal **signal feed**; se `marketMode === "binary"` calcola **`estimateProbabilityUpFromPriceBuffer`** (`binary/signal/binaryProbabilityEngine.ts`); se execution è **`BinarySyntheticFeed`**, applica probabilità al venue sintetico (`applySignalProbability`).
-3. Legge **top of book** dal **execution feed**; costruisce **`evaluateEntryConditions`** (`entryConditions.ts`) — spike/window, range, spread execution.
-
-### 4.4 Spike / movement
-
-- Implementazione detection in **`strategy.ts`** (nome file **fuorviante**: contiene `detectWindowSpike`, `detectStableRange`, `isMoveDominantVsChop`, non un layer “strategy” alto livello).
-- **`evaluateEntryConditions`**: classificazione `strong_spike` / `borderline` / `no_signal`; gate range; direzione **contrarian** (spike UP → `direction: "DOWN"`, ecc.).
-
-### 4.5 Validation / gating (pipeline)
-
-- **`runStrategyDecisionPipeline`** (`strategy/strategyDecisionPipeline.ts`): qualità pre-entry, hard reject, borderline / strong-spike watch, cooldown, override eccezionali, integrazione filtri quote binari (`binaryQuoteEntryFilter.ts`). Allinea paper a decisioni con **`entryEvaluationForPipelinePaperExecution`**.
-
-### 4.6 Execution (solo paper)
-
-- **`SimulationEngine.onTick` / binary branch** (`simulationEngine.ts`): richiede **`entryModelEdge > 0`** da **`computeBinaryEntryEdge`** (mapping contrarian `binaryEdgeSemantics.ts`); opzionale **`MIN_EDGE_THRESHOLD`** via **`shouldEnterTrade`**; fill **`binaryOutcomeBuyFillPrice`**; posizione **`binaryPaperPosition.ts`**.
-
-### 4.7 Exit
-
-- Binary: **`evaluateBinaryExitConditions`** (`binary/exit/binaryExitConditions.ts`) — Δ assoluto su prezzo outcome, timeout.
-
-### 4.8 Reporting
-
-- **`MonitorFilePersistence`** (`monitorPersistence.ts`): JSONL opportunità/trades, summary sessione, calibration events, diagnostica sintetica, ecc. sotto **`MONITOR_OUTPUT_DIR`** (default `output/monitor`).
-- Shutdown: report console, **`buildMonitorSessionSummary`**, analytics **`computeBinaryRunAnalytics`**, interpretazione sessione.
-
-### Passaggi **non** presenti come codice dedicato
-
-- Invio ordini firmati a Polymarket/CLOB (**non trovato**): solo REST pubblico Gamma + paper.
-- Motore ML esterno / feature store / DB storico (**non presenti**).
+**Nota:** `package.json` ha `"main": "index.js"` mentre TypeScript emette in `dist/` — il punto di ingresso reale degli script è `node dist/...`, non necessariamente `main`.
 
 ---
 
-# 5. Configurazione ed environment variables
+## 3. Entry points e runtime flow
 
-### 5.1 Chiavi centrali in `AppConfig` (`config.ts` + `ENV_KEYS`)
+### Entry points reali
 
-Lette tramite **`loadConfig()`** / **`canonicalEnvKeyFor`**. Esempi (non esaustivo ma copre il grosso):
+- **`npm run monitor`** → `tsc` → `node dist/liveMonitor.js` — **percorso principale**.
+- **`node dist/index.js`** (dopo build) — `src/index.ts`: avvio `startBotLoop` con paper flag.
+- **`npm run backtest`** → `dist/backtestRunner.js`.
+- **`npm run replay-opportunities`**, **`validate-binary-market`**, **`analyze-run`**, **`analyze-sessions`**, **`analyze-probability-calibration`** — tool offline.
+- **`npm test`** → `vitest run` (`tsconfig` **esclude** `*.test.ts` dalla compilazione ma vitest usa i sorgenti).
 
-- **Shared / signal:** `SPIKE_THRESHOLD`, `TRADABLE_SPIKE_MIN_PERCENT`, `RANGE_THRESHOLD`, `SPIKE_MIN_RANGE_MULT`, `EXCEPTIONAL_SPIKE_PERCENT`, `ENABLE_BORDERLINE_MODE`, `BORDERLINE_*`, `FEED_STALE_MAX_AGE_MS`, `BLOCK_ENTRIES_ON_STALE_FEED`, `PRICE_BUFFER_SIZE`, `ENTRY_COOLDOWN_MS`, `MAX_ENTRY_SPREAD_BPS`, …
-- **Binary signal:** `BINARY_SIGNAL_SOURCE` (solo `binance_spot` supportato nel parser), `BINARY_SIGNAL_SYMBOL`; alias deprecato **`SIGNAL_MODE`**.
-- **Binary paper / risk sizing:** `MIN_EDGE_THRESHOLD`, `INITIAL_CAPITAL`, `RISK_PERCENT_PER_TRADE`, `STAKE_PER_TRADE`, `MAX_TRADE_SIZE`, `MIN_TRADE_SIZE`, `BINARY_PAPER_SLIPPAGE_BPS`, `PAPER_FEE_ROUND_TRIP_BPS`, alias `PAPER_SLIPPAGE_BPS` deprecato verso `BINARY_PAPER_SLIPPAGE_BPS`.
-- **Binary exits:** `BINARY_TAKE_PROFIT_PRICE_DELTA`, `BINARY_STOP_LOSS_PRICE_DELTA`, `BINARY_EXIT_TIMEOUT_MS`.
-- **Binary quote gates:** `BINARY_MAX_ENTRY_PRICE`, `BINARY_MAX_OPPOSITE_SIDE_ENTRY_PRICE`, banda neutra, **`BINARY_HARD_MAX_SPREAD_BPS`**, YES mid extreme filter, side-specific gating (`BINARY_ENABLE_SIDE_SPECIFIC_GATING`, soglie YES/NO).
-- **Probability heuristic:** `PROBABILITY_WINDOW_SIZE`, `PROBABILITY_TIME_HORIZON_MS`, `PROBABILITY_SIGMOID_K`.
-- **Spot-only (legacy):** `TAKE_PROFIT_BPS`, `STOP_LOSS_BPS`, `EXIT_TIMEOUT_MS` — in binary sono solo per confronto/warning (`warnCrossModeEnvAmbiguities`).
+### Flusso principale monitor (file/funzioni)
 
-### 5.2 Chiavi lette fuori da `AppConfig` (file dedicati)
+1. **Config** — `config.ts`: `dotenv.config()`, `loadConfig()`, export `config` / `configMeta`; `liveMonitor.ts` chiama `logConfig()`.
+2. **Guard / discovery** — `assertLegacySpotMarketModeAcknowledged`, `assertBinaryOnlyRuntime`, `ensureAutoDiscoveredBinaryMarketSlug`.
+3. **Market data** — `createSignalAndExecutionFeeds` (`marketFeedFactory.ts`): in binary, **signal** = `createBinarySignalDataFeed` → `BinaryBtcSpotSignalFeed` + `BinanceSpotFeed`; **execution** = `createBinaryExecutionFeed` → `BinarySyntheticFeed` **o** `BinaryMarketFeed` (Gamma).
+4. **Context** — `RollingPriceBuffer`, `SimulationEngine`, `OpportunityTracker`, `BotContext` in `liveMonitor.ts`.
+5. **Tick** — `setInterval` → `runLiveMonitorTick` (`monitor/runLiveMonitorTick.ts`) → `runStrategyTick` (`botLoop.ts`) → `evaluateEntryConditions` → pipeline `runStrategyDecisionPipeline` → aggiornamento `SimulationEngine` / opportunità.
+6. **Execution paper** — `SimulationEngine`: entrate/uscite binary (`binary/paper`, `binary/exit`) o spot legacy.
+7. **Reporting** — append JSONL (`monitorPersistence`), shutdown: `printShutdownReport`, `buildMonitorSessionSummary`, analytics/calibration.
 
-| Chiave | Significato | Dove |
-|--------|-------------|------|
-| `DEBUG_MONITOR` | Verbosità debug monitor | `config.ts` → `debugMonitor` |
-| `MONITOR_OUTPUT_DIR` | Directory output artifact | `monitorPersistence.ts` |
-| `SYNTHETIC_*`, `SYNTHETIC_MARKET_*`, `MAX_LIQUIDITY_PER_TRADE`, `SYNTHETIC_MARKET_PROFILE` | Venue sintetico | `syntheticBinaryMarket.ts`, `syntheticVenuePricing.ts`, `syntheticMarketProfile.ts`, `binarySyntheticFeed.ts` |
-| `BINARY_UP_PRICE`, `BINARY_DOWN_PRICE`, `UP_SIDE_PRICE`, `DOWN_SIDE_PRICE` | Seed prezzi sintetici | `binarySyntheticFeed.ts` |
-| `BINARY_SYMBOL` | Simbolo sintetico | `binarySyntheticFeed.ts` |
-| `BINARY_MARKET_*`, `POLYMARKET_*`, `AUTO_DISCOVER_BINARY_MARKET` | Selezione mercato Gamma | `binaryMarketSelector.ts`, `discoverBtc5mUpDownMarket.ts` |
-| `BINARY_POLL_INTERVAL_MS`, `BINARY_QUOTE_STALE_MAX_MS`, … (alias POLYMARKET_) | Polling Gamma | `binaryMarketFeed.ts`, hydrate in `config.ts` |
-| `BINARY_GAMMA_BOOTSTRAP_LOG` | Log bootstrap | `binaryMarketFeed.ts` |
-| `SYNTHETIC_VENUE_PRICE_LOG` | Log prezzi venue | `runLiveMonitorTick.ts` |
-| `BINARY_COMPARE_DIAG` | Diagnostica confronto signal×binary | `liveMonitor.ts` |
-| `BINARY_ONLY_RUNTIME` | Rifiuta `MARKET_MODE=spot` | `binaryOnlyRuntime.ts` |
-| `LEGACY_SPOT_MARKET_MODE` | Ack uso spot | `legacy/spot/assertLegacySpotMarketMode.ts` |
-| `BINANCE_SYMBOL` | Simbolo spot legacy / fallback signal | `binanceSpotFeed.ts`, `config.ts` |
-| `BINANCE_FEED_DEBUG_LOG_EVERY_N`, `BINANCE_FEED_WARN_UNCHANGED_MID_AFTER` | Debug feed | `binanceSpotFeed.ts` |
-| `BTC_SYMBOL` | Alt simbolo (servizio prezzo) | `btcPriceService.ts` |
-
-### 5.3 Osservazioni su pulizia / duplicazioni
-
-- **`DEPRECATED_CONFIG_ENV_ALIASES`** e **`POLYMARKET_*` vs `BINARY_*`**: convivenza documentata; startup stampa warning incrociati (`warnCrossModeEnvAmbiguities`).
-- **`POLYMARKET_DISCOVERY_*`**: dichiarati deprecati e ignorati (`warnDeprecatedPolymarketEnv`).
-- **`strategy.ts`** come nome file per la detection: **confuso** rispetto a `strategy/strategyDecisionPipeline.ts`.
-
-### 5.4 Env dichiarate ma non wired (esplicito nel codice)
-
-- Chiavi discovery Polymarket deprecate → **ignorate**.
+**Divergenza importante:** `startBotLoop` (`botLoop.ts`) usa `runBotTick` che chiama `simulation.onTick` **senza** il pipeline monitor completo — **due runtime** (monitor vs `index`) **non equivalenti**.
 
 ---
 
-# 6. Architettura logica del bot
+## 4. Analisi config/env
 
-| Modulo | Scopo | File principali | Input → output | Completezza |
-|--------|-------|-----------------|----------------|-------------|
-| **Feed signal** | Mid BTC per buffer e spike | `binary/signal/createBinarySignalFeed.ts`, `binaryBtcSpotSignalFeed.ts`, `adapters/binanceSpotFeed.ts` | WS/REST → `NormalizedSpotBook` | **Buona** (solo Binance per signal) |
-| **Feed execution** | Quote YES/NO per paper | `createBinaryExecutionFeed.ts`, `binarySyntheticFeed.ts`, `binaryMarketFeed.ts` | env → feed | **Buona** (synthetic default; Gamma opzionale) |
-| **Movement / spike** | Range + window spike | `strategy.ts`, `movementClassifier.ts`, `entryConditions.ts` | prezzi → `EntryEvaluation` | **Buona** |
-| **Probability (euristica)** | Score P(up) da buffer | `binaryProbabilityEngine.ts` | buffer → [0,1] | **Embrionale** (non mercato reale) |
-| **Pipeline strategica** | Gate e azioni | `strategy/strategyDecisionPipeline.ts` | tick + stores → `StrategyDecision` | **Buona** (complessa, testata) |
-| **Edge / fair mapping** | Contrarian vs momentum per edge | `binary/entry/binaryEdgeSemantics.ts`, `edgeEntryDecision.ts` | p_up, asks, side → edge | **Parziale** (euristica + mapping) |
-| **Execution paper** | Fill, PnL, fee | `simulationEngine.ts`, `binary/paper/*` | tick → trade | **Buona** |
-| **Exit** | TP/SL/timeout | `binary/exit/binaryExitConditions.ts`, spot legacy separato | mark → exit | **Buona** (binary); spot separato |
-| **Opportunità / tracking** | Registro candidati | `opportunityTracker.ts` | decisioni → opportunity | **Buona** |
-| **Persistenza artifact** | JSONL / JSON | `monitorPersistence.ts` | eventi → file | **Buona** |
-| **Analytics** | Metriche run/session | `analyze/binaryRunAnalytics.ts`, `analyzeSessions.ts`, ecc. | file → report | **Parziale** (dipende da dati salvati) |
+### Lette da `src/config.ts` (`loadConfig` + meta)
 
----
+Tutte le chiavi in `ENV_KEYS` / `AppConfig` (es. `SPIKE_THRESHOLD`, `MARKET_MODE`, `BINARY_*`, `TAKE_PROFIT_BPS`, …). Extra nello stesso modulo:
 
-# 7. Stato reale della strategia
+- **`DEBUG_MONITOR`** → `debugMonitor` (non è campo di `AppConfig`).
+- **`TEST_MODE_SOFT_UNSTABLE`** (solo con `TEST_MODE=true`).
+- Alias **`SIGNAL_MODE`** → `BINARY_SIGNAL_SOURCE`.
+- Alias legacy (`PAPER_SLIPPAGE_BPS`, `MAX_OPPOSITE_SIDE_ENTRY_PRICE`, ecc. — vedere `DEPRECATED_CONFIG_ENV_ALIASES`).
+- **`hydrateBinaryGammaEnvAliases`**: copia `BINARY_*` → `POLYMARKET_*` quando il target è vuoto.
 
-### Cosa decide l’ingresso
+### Lette altrove (non tutte in `AppConfig`)
 
-1. **Segnale primario:** spike/dettaglio movimento su **serie BTC spot** (non sul prezzo YES Polymarket per la detection).
-2. **Direzione trade:** **mean-reversion** — movimento forte UP → direzione ingresso **DOWN** (e viceversa), codificato in **`evaluateEntryConditions`** (`entryConditions.ts`).
-3. **Mapping outcome:** `binaryLegFromDirection` (`edgeEntryDecision.ts`) — `UP → YES`, `DOWN → NO` **per convenzione tipo “side bought”**: con spike UP si entra `direction DOWN` → lato **NO** (fade del rally).
+| Variabile | Dove | Uso |
+|-----------|------|-----|
+| `MONITOR_OUTPUT_DIR` | `monitorPersistence.ts` | Directory output JSONL |
+| `BINARY_COMPARE_DIAG` | `liveMonitor.ts` | Diagnostica |
+| `SYNTHETIC_VENUE_PRICE_LOG` | `runLiveMonitorTick.ts` | Log pricing sintetico |
+| `BINARY_ONLY_RUNTIME` | `binaryOnlyRuntime.ts` | Blocco `MARKET_MODE=spot` |
+| `LEGACY_SPOT_MARKET_MODE` | `legacy/spot/assertLegacySpotMarketMode.ts`, `backtestRunner.ts` | Acknowledgment spot / backtest legacy |
+| `AUTO_DISCOVER_BINARY_MARKET`, `BINARY_MARKET_*`, `POLYMARKET_*`, `POLYMARKET_GAMMA_API_BASE`, `POLYMARKET_CLOB_API_BASE`, `BINARY_GAMMA_BOOTSTRAP_LOG`, `VITEST` | `discoverBtc5mUpDownMarket.ts`, `binaryMarketFeed.ts`, `binaryMarketSelector.ts` | Discovery / Gamma |
+| `POLYMARKET_POLL_INTERVAL_MS`, `POLYMARKET_QUOTE_STALE_MAX_MS`, `POLYMARKET_POLL_SILENCE_MAX_MS`, `POLYMARKET_SYNTHETIC_SPREAD_BPS` | `binaryMarketFeed.ts` | Polling Gamma (nomi POLYMARKET_* anche se `config` idrata da `BINARY_*`) |
+| `BINANCE_SYMBOL`, `BINANCE_FEED_DEBUG_LOG_EVERY_N`, `BINANCE_FEED_WARN_UNCHANGED_MID_AFTER` | `binanceSpotFeed.ts` | Spot feed |
+| `BINARY_SYMBOL`, `BINARY_UP_PRICE`, `UP_SIDE_PRICE`, `BINARY_DOWN_PRICE`, `DOWN_SIDE_PRICE` | `binarySyntheticFeed.ts` | Synthetic venue |
+| `SYNTHETIC_SPREAD_BPS`, `BINARY_SYNTHETIC_SPREAD_BPS`, `SYNTHETIC_MARKET_MAX_SPREAD_BPS`, `SYNTHETIC_SLIPPAGE_BPS`, `MAX_LIQUIDITY_PER_TRADE`, `SYNTHETIC_MID_SMOOTH_NEW_WEIGHT`, `SYNTHETIC_QUOTE_LOG` | `syntheticBinaryMarket.ts` | Book sintetico |
+| `SYNTHETIC_MARKET_PROFILE`, `SYNTHETIC_MARKET_LAG_TICKS`, `SYNTHETIC_MARKET_REACTION_ALPHA`, `SYNTHETIC_MARKET_NOISE_BPS`, `SYNTHETIC_MARKET_BIAS_BPS`, `SYNTHETIC_MARKET_NOISE_SEED`, `SYNTHETIC_MARKET_WIDEN_ON_VOLATILITY` | `syntheticMarketProfile.ts`, `syntheticVenuePricing.ts`, `binarySyntheticFeed.ts` | Venue model |
+| `BTC_SYMBOL` | `legacy/btcPriceService.ts` | REST (**nessun import riscontrato altrove in `src/`** → effetto morto per il resto dell’app) |
+| `POLYMARKET_DISCOVERY_QUERY`, `POLYMARKET_DISCOVERY_MIN_CONFIDENCE` | `config.ts` | Solo **warning**, valori ignorati |
 
-### Mispricing / fair value
+### Classificazione
 
-- **`estimateProbabilityUpFromPriceBuffer`** è esplicitamente **euristico / momentum**, non prezzo di mercato YES (`binaryProbabilityEngine.ts` commenti).
-- Per l’edge paper si usa **`fairBuyLegProbabilityFromMomentumUp`** con semantica default **`contrarian_mean_reversion`** (`binaryEdgeSemantics.ts`): trasforma P(up) momentum in **P_model sul token comprato**, poi **`edge = P_model − ask`** (`edgeEntryDecision.ts`).
-- **`SimulationEngine`** **rifiuta** ingressi con **`entryModelEdge <= 0`** (`negative_or_zero_model_edge`) — quindi serve edge positivo sul lato **già fissato** dalla direzione contrarian, non un confronto YES vs NO.
-
-### Scelta YES vs NO
-
-- **Non** esiste nel codice una funzione del tipo “scegli il lato con edge massimo”. Il lato è **implicato** dalla direzione contrarian allo spike.
-
-### Strategia vs trigger
-
-- Oltre ai trigger di movimento c’è una **pipeline** pesante (qualità, borderline, cooldown, quote), quindi non è “solo un if sullo spike”, ma **non** è una strategia di pricing multi-fattore sul libro reale: resta **spike mean-reversion + filtri + edge sul lato assegnato**.
-
-**Frase secca:** *Attualmente il bot è principalmente un **motore di mean-reversion su spike BTC** con **gating multi-livello** e **controllo edge paper** sul lato outcome determinato contrarian; **non** implementa una logica di **opt-in tra YES e NO per massimo mispricing**.*
+- **Solo binary / synthetic lab:** quasi tutto `BINARY_*`, `SYNTHETIC_*`, quote YES/NO, calibration, analytics in `analyze/binary*`, env Gamma/Polymarket.
+- **Solo spike / shared (serie prezzi + soglie):** `SPIKE_*`, `RANGE_*`, `BORDERLINE_*`, `EXCEPTIONAL_*`, `STRONG_SPIKE_*`, `PRICE_BUFFER_SIZE`, `MAX_ENTRY_SPREAD_BPS`, `ENTRY_COOLDOWN_MS`, risk sizing generico, `FEED_STALE_*`, `BLOCK_ENTRIES_ON_STALE_FEED`.
+- **Solo legacy spot:** `TAKE_PROFIT_BPS`, `STOP_LOSS_BPS`, `EXIT_TIMEOUT_MS` come exit spot quando `MARKET_MODE=spot`; in binary sono “reference” nel print.
+- **Condivise ma naming BTC-centric:** `PROBABILITY_*` usata **solo** con `marketMode === "binary"` nel tick (`botLoop.ts`).
+- **Morta / fuorviante:** `legacy/btcPriceService.ts` + `BTC_SYMBOL` se il modulo resta senza import; `POLYMARKET_DISCOVERY_*` deprecate ignorate.
+- **Mismatch:** **`BINARY_POLL_INTERVAL_MS`** documentato in `config` vs **`POLYMARKET_POLL_INTERVAL_MS`** letto in `BinaryMarketFeed` — coerenza tramite idratazione env quando `config.ts` è caricato per primo.
 
 ---
 
-# 8. Stato rispetto a una roadmap di trading edge
+## 5. Accoppiamento a binary/spike
 
-Per ogni punto: **stato**, **motivazione**, **file**, **cosa manca**.
-
-### 1. Pricing inefficiency exploitation
-- **Stato:** **Parziale**
-- **Motivazione:** Edge calcolato come model−ask su lato fisso; synthetic venue introduce lag/rumore (`syntheticVenuePricing.ts`) — utile per lab, non prova inefficienza reale.
-- **File:** `edgeEntryDecision.ts`, `simulationEngine.ts`, `binarySyntheticFeed.ts`
-- **Manca:** Confronto sistematico con mid/order book reale persistente e costi transazione reali.
-
-### 2. Edge reale persistente
-- **Stato:** **Assente** come validazione statistica nel repo (nessuno studio empirico versionato; solo analytics su run salvati).
-
-### 3. Edge per lato (YES vs NO)
-- **Stato:** **Assente** come ottimizzazione — side-specific gating (`config/binarySideGating.ts`) è **filtro**, non scelta dell’edge migliore.
-
-### 4. Market microstructure understanding
-- **Stato:** **Embrionale** — spread/quote stale/slippage simulati; niente depth L2, niente queue.
-
-### 5. Execution edge
-- **Stato:** **Assente** per trading reale; paper con slippage/fee configurabili.
-
-### 6. Meta-strategy layer
-- **Stato:** **Assente**
-
-### 7. Risk & payoff optimization
-- **Stato:** **Parziale** — `riskPositionSizing.ts`, moltiplicatori qualità (`stakeSizing.ts`); nessun Kelly/portfolio nel codice analizzato.
-
-### 8. Trade outcome analysis engine
-- **Stato:** **Parziale** — `analyzeRun.ts`, `binaryRunAnalytics.ts`, calibration (`probabilityCalibrationResolve.ts`); dipende da sessioni salvate.
-
-### 9. Regime detection
-- **Stato:** **Embrionale** — range quality, unstable context (`hardRejectEngine.ts`); non regime macro esplicito.
-
-### 10. Feature engineering serio
-- **Stato:** **Assente** (feature tabellari / dataset ML).
-
-### 11. Data & backtesting serio
-- **Stato:** **Parziale** — CSV replay (`backtest.ts`, `backtestRunner.ts`), confronti in test; non piattaforma dataset né walk-forward formalizzato nel codice.
-
-### 12. Strategy evaluation framework
-- **Stato:** **Parziale** — summary JSON backtest + test; non framework multi-strategy comparabile out-of-the-box.
+| Area | Moduli | Livello | Perché | Difficoltà estrazione |
+|------|--------|---------|--------|------------------------|
+| Quote 0–1, YES/NO | `binary/*`, `market/types.ts` (`BinaryOutcomePrices`), `simulationEngine`, `executionSpreadFilter` | **Alto** | Semantica contratto e P/L | Nuovo modello prezzo/position |
+| Fair / mispricing / edge | `binary/entry/edgeEntryDecision.ts`, `binaryProbabilityEngine.ts` | **Alto** | Edge vs ask YES/NO e momentum P(up) | Riscrittura verso fair futures |
+| Side UP/DOWN vs futures | `entryConditions`, pipeline | **Medio-alto** | Spike → outcome, non contratto | Mapping diverso |
+| Spike stabile / borderline / strong | `strategy.ts`, `entryConditions.ts`, `strategyDecisionPipeline`, stores | **Medio** | Numerica generica ma integrata con gate binary | Spezzare pipeline |
+| Calibration probabilità | `probabilityCalibration*`, `SignalMidRingBuffer`, JSONL | **Alto** | Label binary vs BTC horizon | Non trasferibile così |
+| Synthetic venue / Polymarket | `binary/venue/*` | **Alto** | Lab prediction market | Isolare/eliminare |
+| Legacy spot paper | `legacy/spot/*` | **Medio** | Bps su Binance spot | Parziale concettuale vs futures |
 
 ---
 
-# 9. Reporting, metriche e diagnostica
+## 6. Moduli riutilizzabili (pivot futures)
 
-### Cosa produce
-
-- **Console:** banner monitor, periodic summary, shutdown report (`monitorConsole.ts`, `liveMonitor.ts`).
-- **File:** `opportunities.jsonl`, `trades.jsonl`, `session-summary.json`, `probability-calibration-events.jsonl`, diagnostica sintetica (`monitorPersistence.ts`), path sotto `MONITOR_OUTPUT_DIR`.
-- **Metriche funnel:** `monitorFunnelDiagnostics.ts`, `MonitorRuntimeStats`, `StrongSpikeGateFunnel`.
-- **Reason codes:** `ENTRY_REASON_CODES`, `rejectionReasons.ts`, normalizzazione `decisionReasonBuilder.ts`.
-
-### Cosa è misurato
-
-- Tick, spike classification, opportunità valide/rifiutate, trade paper chiusi, PnL, attributi binary (quote, stale), audit hold exit (`holdExitAudit.ts`).
-
-### Limiti per capire “perché vinco/perdo”
-
-- Senza mercato reale e senza storico centralizzato, il **perché** resta legato al **modello sintetico** o a sessioni Gamma puntuali.
-- Distinzione per rejection reason: **sì** (campi in opportunity JSONL). Distinzione per regime macro: **limitata** ai gate interni.
+| Modulo | Verdetto | Note |
+|--------|-----------|------|
+| `rollingPriceBuffer.ts`, `strategy.ts`, `movementClassifier.ts`, `movementAnalysis.ts`, `rangeQualityEvaluator.ts`, `entryConditions.ts` (nucleo spike) | **KEEP** | Serie temporale + soglie; naming “BTC” da generalizzare |
+| `adapters/binanceSpotFeed.ts` | **KEEP WITH SMALL REFACTOR** | Pattern WS utile; futures richiede altro contratto/simbolo |
+| `config.ts` | **KEEP WITH SMALL REFACTOR** | Grouping/provenance utili; snellire chiavi binary |
+| `monitorPersistence.ts` | **KEEP WITH SMALL REFACTOR** | Pattern JSONL ok; schema oggi binary-denso |
+| `botLoop.ts` | **KEEP BUT WRAP/ISOLATE** | Signal/execution separati; estrarre ramo binary |
+| `simulationEngine.ts` | **ISOLATE / REWRITE** per futures | Troppo accoppiato binary+spot |
+| `strategyDecisionPipeline.ts` | **ISOLATE / REWRITE** | Cuore ma non trasportabile come blocco unico |
+| `market/types.ts` | **KEEP WITH SMALL REFACTOR** | Estendere con tipi Instrument / order book futures |
 
 ---
 
-# 10. Risk management e payoff
+## 7. Moduli da eliminare o isolare
 
-| Tema | Presente? | Dettaglio |
-|------|-----------|-----------|
-| **Sizing** | Sì | `getPositionSize`, stake da equity/risk%, limiti min/max (`riskPositionSizing.ts`) |
-| **Stop loss / TP (binary)** | Sì | Δ prezzo outcome (`binaryExitConditions.ts`) |
-| **Timeout** | Sì | `BINARY_EXIT_TIMEOUT_MS` |
-| **Fee / spread / slippage** | Sì (paper) | `paperFeeRoundTripBps`, `BINARY_PAPER_SLIPPAGE_BPS`, spread gates |
-| **Filtri rischio quote** | Sì | `binaryQuoteEntryFilter.ts`, opposite side cap, YES mid band |
-| **Max concurrency** | Non esplicito come limite posizioni parallele nel codice letto | Il simulatore gestisce posizioni in modo sequenziale tipico single-position (verificare invarianti in `simulationEngine.ts` per overlap) |
-| **Cooldown** | Sì | `entryCooldownMs`, override eccezionali (`overridePolicyEngine.ts`) |
-
-Complessivamente il risk è **centricale per il paper**, non per un book di produzione.
+- **DELETE o ARCHIVE (se si abbandonano i prediction market):** `src/binary/**`, `validateBinaryMarket.ts`, `analyze/binary*.ts`, `replayOpportunities` (se non si usano JSONL binary).
+- **DELETE (candidate):** `src/legacy/btcPriceService.ts` se confermato inutilizzato anche fuori repo.
+- **ISOLATE:** `legacy/spot` — tenere solo per confronto storico.
+- **REWRITE:** `simulationEngine.ts`, `strategyDecisionPipeline.ts`, schema `monitorPersistence`, report/shutdown fortemente binary-centrici.
 
 ---
 
-# 11. Backtesting, replay e valutazione strategie
+## 8. Debito tecnico e problemi architetturali
 
-- **`backtestRunner.ts` + `backtest.ts`**: replay da file prezzi; modalità default **binary-first**; flag `--spot-legacy` per CSV legacy.
-- **`replayOpportunities.ts`**: riesame opportunità JSONL con gating corrente (analisi, non trading).
-- **Dataset / serializzazione tick storici:** non c’è un datastore; solo CSV/input file.
-- **Benchmark:** nessun indice di riferimento esterno codificato.
-
----
-
-# 12. Problemi tecnici e debiti del progetto
-
-### Critici (per obiettivo “trading reale”)
-- **Nessuna esecuzione ordini reali** nel percorso analizzato — solo paper e API pubbliche.
-- **Nome `strategy.ts`** duplica concetto con `strategy/strategyDecisionPipeline.ts` → onboarding difficile.
-
-### Medi
-- **Due entrypoint** (`liveMonitor` vs `index.ts` con paper feeds) da documentare mentalmente.
-- **Env surface ampia** (synthetic vs config centralizzato) → rischio chiavi morte o incoerenze cross-mode.
-
-### Minori
-- Dipendenza da `console` per tutto (nessun logging strutturato centralizzato).
-- `dist/` non in `.gitignore` nello status iniziale — rumore repo.
+- **Due runtime diversi:** `liveMonitor` + pipeline completa vs `index.ts` + `runBotTick` senza stesso pipeline — comportamenti divergenti possibili.
+- **`strategyDecisionPipeline.ts` molto grande:** responsabilità miste (gate, quote binary, borderline, diagnostica).
+- **`SimulationEngine`:** spot + binary intrecciati — difficile test/sostituzione.
+- **Naming:** “BTC”, “binary”, “spot”, “signal” incrociati; `MARKET_MODE=binary` = prediction market, non opzione digitale su futures.
+- **`BinarySignalSource`:** un solo valore valido `binance_spot` — estensibilità apparente, realtà monolitica.
+- **`package.json` `main`:** probabilmente non allineato agli entry reali in `dist/`.
+- **Test:** Vitest su molti moduli; copertura futures assente per definizione.
 
 ---
 
-# 13. Punti forti del progetto
+## 9. Stima refactor vs rewrite
 
-- **Pipeline testabile:** `strategyDecisionPipeline.test.ts`, `simulationEngine.test.ts`, `entryConditions.test.ts`, ecc.
-- **Separazione signal/execution** chiara in `marketFeedFactory.ts` / `botLoop.ts`.
-- **Edge semantics documentate nel codice** (`binaryEdgeSemantics.ts`).
-- **Osservabilità:** JSONL ricchi, summary sessione, normalized config (`monitorNormalizedConfigSummary.ts`).
-- **Backtest e script di analisi** utilizzabili senza UI.
+**Raccomandazione: B — Nuovo core + migrazione pezzi sani.**
+
+Motivo: il cuore runtime (`SimulationEngine` + pipeline + persistence + report) è **così permeato da semantica binary** che un refactor “incrementale” verso futures equivale a **reimplementare motore di esecuzione e datastore**. Conviene un **nuovo nucleo** (instrument, feed, position, execution sim, strategy interface) e importare buffer spike, helper numerici, pattern adapter dopo riduzione delle superfici.
 
 ---
 
-# 14. Priorità consigliate
+## 10. Piano chirurgico preliminare
 
-## Priorità immediate
-1. **Chiarire nel repo** (commento root o README minimo): `npm run monitor` vs `node dist/index.js` — *obiettivo:* evitare avvii sbagliati; *file:* `package.json`, `index.ts`, `liveMonitor.ts`.
-2. **Rinominare o etichettare** `strategy.ts` → evitare collisione semantica; *dipendenze:* tutti gli import `./strategy.js`.
+- **Fase 1 — Inventario e confini**  
+  Obiettivo: tracciare dipendenze binary vs shared. Moduli: documentazione implicita, script npm. Rischio: basso.
 
-## Priorità a breve
-3. **Feature “scegli lato migliore”** (opt) — max edge tra YES/NO soggetto a direzione/constraints; *file:* `edgeEntryDecision.ts`, `simulationEngine.ts`, test.
-4. **Consolidare env** — tabella unica generata da script che elenca `process.env` letti vs `ENV_KEYS`; *area:* `config.ts` + venue.
+- **Fase 2 — Estrazione “signal domain”**  
+  Obiettivo: buffer + spike + entry evaluation **senza** YES/NO. Moduli: `strategy.ts`, `entryConditions.ts`, parti di `botLoop`. Rischio: medio (regressione backtest).
 
-## Priorità successive
-5. **Storage run** (SQLite/Parquet) per analytics multi-sessione senza solo JSONL.
-6. **Integrazione ordine reale** (fuori scope attuale) con layer separato da `SimulationEngine`.
+- **Fase 3 — Adapter isolation**  
+  Obiettivo: interfaccia chiara price feed vs tradable book per futures vs legacy binary. Moduli: `market/types.ts`, `marketFeedFactory.ts`. Rischio: medio-alto.
 
----
+- **Fase 4 — Nuovo execution sim futures**  
+  Obiettivo: posizioni, fee, SL/TP — **parallelo** a `SimulationEngine` legacy. Rischio: alto. Dipende da Fase 3.
 
-# 15. Mappa dei file chiave
+- **Fase 5 — Migrazione reporting**  
+  Obiettivo: JSONL/schema neutri o ramificati. Moduli: `monitorPersistence`, analyze scripts. Rischio: medio.
 
-Ordine consigliato di lettura (dal più al meno utile per capire il sistema):
-
-1. **`src/liveMonitor.ts`** — Bootstrap monitor, shutdown, persistence.
-2. **`src/monitor/runLiveMonitorTick.ts`** — Tick live, logging, collegamento pipeline.
-3. **`src/strategy/strategyDecisionPipeline.ts`** — Decisioni operative complete.
-4. **`src/botLoop.ts`** — `runStrategyTick`, composizione signal/execution.
-5. **`src/entryConditions.ts`** — Regole ingresso mean-reversion + spread.
-6. **`src/simulationEngine.ts`** — Paper trading, edge binary, fill.
-7. **`src/config.ts`** — Tutta la configurazione tipizzata.
-8. **`src/binary/entry/binaryEdgeSemantics.ts`** + **`edgeEntryDecision.ts`** — Significato di edge/fair.
-9. **`src/binary/venue/createBinaryExecutionFeed.ts`** — Synthetic vs Gamma.
-10. **`src/monitorPersistence.ts`** — Cosa viene scritto su disco.
+- **Fase 6 — Rimozione binary**  
+  Obiettivo: archive / pacchetto separato per `src/binary`. Rischio: basso se il nuovo core è validato.
 
 ---
 
-# 16. Verdict finale
+## 11. Allegato — classificazione file/moduli
 
-**Cos’è oggi:** un **laboratorio software** per **mean-reversion su spike** con **segnale BTC spot** e **paper trading** su **mercato binario** (sintetico di default, Gamma opzionale), con **pipeline di qualità ricca** e **ottima tracciabilità** via file e test.
+**KEEP**
 
-**Cosa NON è ancora:** un **bot di esecuzione garantita su Polymarket**, un **motore di alpha** misurato sul lungo periodo, né un sistema che **ottimizza** la scelta YES/NO per edge.
+- `src/strategy.ts`, `src/rollingPriceBuffer.ts`, `src/movementClassifier.ts`, `src/movementAnalysis.ts`, `src/rangeQualityEvaluator.ts`, `src/entryConditions.ts` (nucleo matematico)
+- `src/adapters/binanceSpotFeed.ts`
+- Idea struttura `src/config.ts` (non l’intera lista chiavi così com’è)
 
-**Prossimo salto di qualità:** definire esplicitamente (e implementare) **selezione del lato** e/o **modello di probabilità** ancorato al mercato reale, oppure integrare **esecuzione** con gestione chiavi e rischio pre-ordine — a seconda dell’obiettivo prodotto.
+**KEEP WITH SMALL REFACTOR**
+
+- `src/botLoop.ts`
+- `src/market/types.ts`, `src/market/marketFeedFactory.ts`
+- `src/monitorPersistence.ts`
+- `src/config/monitorNormalizedConfigSummary.ts`
+
+**ISOLATE**
+
+- `src/simulationEngine.ts`
+- `src/strategy/strategyDecisionPipeline.ts`
+- `src/monitor/runLiveMonitorTick.ts`, `src/monitorConsole.ts`
+- `src/legacy/spot/*`
+
+**REWRITE** (per dominio futures)
+
+- Motore esecuzione paper/sim
+- Pipeline strategia come plugin con contratto chiaro
+- Schema persistenza e analytics
+
+**DELETE / ARCHIVE**
+
+- `src/binary/**` (se si abbandona il dominio prediction market)
+- `src/legacy/btcPriceService.ts` (se confermato senza referenze nel codebase)
+- Script/analyze strettamente binary-only se non servono
+- Valutare `src/replayOpportunities.ts`, `src/validateBinaryMarket.ts`
+
+**NON CHIARO / DA VERIFICARE MANUALMENTE**
+
+- Adozione effettiva degli script `analyze-*` in CI/workflow personale (non deducibile solo dal codice).
+- Contenuto `.env` locale (non incluso nell’audit).
 
 ---
 
-# Appendix — Quick Answers
+## Incongruenze naming / config / comportamento
 
-1. **Il progetto usa davvero mispricing o fair value?**  
-   Usa un **edge** = probabilità di modello (euristica sui mid BTC, mappata in **fair sul lato comprato** in semantica contrarian) **meno** ask — non un fair value di mercato indipendente verificato.
+- **`createBinarySignalFeed`**: solo `binance_spot` è realmente supportato senza fallback warning per altri valori di `BINARY_SIGNAL_SOURCE`.
+- **`index.ts` vs `liveMonitor.ts`**: stack strategico diverso → rischio comportamenti non allineati.
+- **Gamma polling:** lettura `POLYMARKET_POLL_*` in `binaryMarketFeed.ts` vs alias `BINARY_POLL_*` in `config.ts` — OK se `config` caricato per primo.
+- **`legacy/btcPriceService`:** `BTC_SYMBOL` senza effetto sul resto dell’app se il modulo non è importato da nessuna parte.
 
-2. **Il progetto sceglie davvero tra YES e NO in base all’edge?**  
-   **No.** Il lato è **determinato** dalla direzione contrarian allo spike; l’edge filtra/rigetta su quel lato.
+---
 
-3. **Vera strategia o solo trigger + filtri + execution?**  
-   **Trigger spike + filtri + pipeline + execution paper**, con layer edge **subordinato** al lato già scelto.
-
-4. **Separazione detection / strategy / execution?**  
-   **Parziale:** detection in `entryConditions.ts`/`strategy.ts`; “strategy” orchestrata in `strategyDecisionPipeline.ts`; execution in `simulationEngine.ts`. I confini sono chiari ma il naming `strategy.ts` confonde.
-
-5. **Env pulite o confusione?**  
-   **Alias e sezioni** (binary vs spot vs synthetic) — funziona ma richiede attenzione; chiavi deprecate avvisate a startup.
-
-6. **Il reporting basta per il perché dei trade?**  
-   **Parzialmente** — buono per funnel e reason codes; **non** spiega da solo l’alpha su mercato reale senza dati esterni.
-
-7. **Base seria per backtest / replay?**  
-   **Sì per replay CSV e coerenza pipeline** (`backtest.ts`); **non** come piattaforma istituzionale.
-
-8. **Priorità: ricerca edge o engineering?**  
-   Il codice è **molto orientato all’engineering** (pipeline, test, osservabilità); la **ricerca edge** è lasciata al contenuto dei parametri e del venue.
-
-9. **Una frase tecnica sul progetto?**  
-   *Pipeline TypeScript di paper trading che combina spike mean-reversion su BTC spot, gating multi-livello e simulazione di mercato binario sintetico o Gamma-only.*
-
-10. **Primi 5 file da leggere?**  
-   `liveMonitor.ts`, `runLiveMonitorTick.ts`, `strategyDecisionPipeline.ts`, `botLoop.ts`, `simulationEngine.ts`.
+*Documento generato come snapshot di ricognizione tecnica; aggiornarlo dopo modifiche architetturali significative.*

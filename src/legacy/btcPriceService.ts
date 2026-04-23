@@ -1,3 +1,12 @@
+/**
+ * Archived REST helper — **not wired** elsewhere in `src/` (verified: no imports).
+ *
+ * Primary price path in this repo uses {@link BinanceSpotFeed} (WebSocket book + aggTrade).
+ * **Futures core** uses `BinanceSpotCoreFeed` → same adapter family.
+ *
+ * Retained as an optional utility for one-off scripts; treat as **archive candidate**
+ * before deletion if no external repo depends on this path.
+ */
 import axios from "axios";
 
 const BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price";

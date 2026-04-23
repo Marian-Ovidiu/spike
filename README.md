@@ -1,5 +1,8 @@
 # Spike trading bot
 
+> **Futures core (new stack):** neutral signal → risk → **paper futures** pipeline without YES/NO execution. Run **`npm run monitor:futures`** (live) or **`npm run replay:futures`** (CSV/JSONL). Details: **[`docs/FUTURES_MIGRATION.md`](docs/FUTURES_MIGRATION.md)**.  
+> The paths below (`npm run monitor`, `src/binary/*`, Polymarket/synthetic 0–1) remain the **legacy binary-first product** and are **not** removed.
+
 Mean-reversion spike strategy on a **rolling price window**: stable range → spike → contrarian entry → exit on reversion, TP, SL, or timeout. The repo is **binary-first** (`MARKET_MODE=binary` by default). A **legacy** single-feed spot execution mode remains behind `LEGACY_SPOT_MARKET_MODE=1` (see below).
 
 | Mode | Price feed | Paper execution |

@@ -7,6 +7,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "monitor": "npm run build && node dist/liveMonitor.js",
+    "monitor:futures": "npm run build && node dist/core/runtime/runFuturesMonitor.js",
+    "replay:futures": "npm run build && node dist/core/replay/runFuturesReplay.js",
     "backtest": "npm run build && node dist/backtestRunner.js",
     "replay-opportunities": "npm run build && node dist/replayOpportunities.js",
     "validate-binary-market": "npm run build && node dist/validateBinaryMarket.js",
