@@ -102,6 +102,15 @@ function getProfitLockThresholdQuote(cfg: FuturesPaperEngineConfig): number {
     : 1;
 }
 
+function isTrailingProfitEnabled(cfg: FuturesPaperEngineConfig): boolean {
+  return cfg.trailingProfitEnabled === true;
+}
+
+function getTrailingProfitDropQuote(cfg: FuturesPaperEngineConfig): number {
+  const explicit = cfg.trailingProfitDropQuote;
+  return Number.isFinite(explicit) && (explicit ?? 0) >= 0 ? explicit! : 0;
+}
+
 function getLotSize(contract?: ContractMeta | null): number {
   const lot = contract?.lotSize ?? 0;
   return Number.isFinite(lot) && lot > 0 ? lot : 0;
@@ -257,6 +266,7 @@ export class FuturesPaperEngine {
   private pos: InternalPosition | null = null;
   private exitState: InternalExitState | null = null;
   private cumulativeRealizedPnlQuote = 0;
+  private peakExecutableNetPnlQuote: number | null = null;
 
   constructor(config: FuturesPaperEngineConfig) {
     this.cfg = { ...config };
@@ -336,6 +346,7 @@ export class FuturesPaperEngine {
       openedAtMs: input.nowMs,
       feesOpenQuote: feesOpen,
     };
+    this.peakExecutableNetPnlQuote = null;
 
     return { ok: true, avgEntryPrice: fill, feesOpenQuote: feesOpen };
   }
@@ -384,6 +395,7 @@ export class FuturesPaperEngine {
       openedAtMs: input.nowMs,
       feesOpenQuote: feesOpen,
     };
+    this.peakExecutableNetPnlQuote = null;
 
     return { ok: true, avgEntryPrice: fill, feesOpenQuote: feesOpen };
   }
@@ -407,10 +419,11 @@ export class FuturesPaperEngine {
     const p = this.pos;
     if (!p) return null;
 
-    const profitLockCandidate = this.detectProfitLockTrigger(book, contract);
+    const profitProtectionCandidate =
+      this.detectProfitProtectionTrigger(book, contract);
     const trigger =
       this.detectExitTrigger(book?.midPrice ?? null, nowMs) ??
-      profitLockCandidate?.trigger ??
+      profitProtectionCandidate?.trigger ??
       null;
     const activeTrigger = this.exitState?.trigger ?? trigger;
     if (!activeTrigger) {
@@ -424,21 +437,41 @@ export class FuturesPaperEngine {
 
     if (isExecutableBook(book)) {
       const closed =
-        activeTrigger === "profit_lock" && profitLockCandidate
+        (activeTrigger === "profit_lock" || activeTrigger === "trailing_profit") &&
+        profitProtectionCandidate
           ? this.closeAtBook(book, nowMs, activeTrigger, false, contract)
           : this.closeAtBook(book, nowMs, activeTrigger, false, contract);
       this.exitState = null;
       if (!closed) {
         throw new Error("Invariant: executable book must close position");
       }
+      const profitProtectionDetails =
+        activeTrigger === "trailing_profit" &&
+        profitProtectionCandidate &&
+        profitProtectionCandidate.trigger === "trailing_profit"
+          ? {
+              peakEstimatedNetPnlAtExitQuote:
+                profitProtectionCandidate.peakEstimatedNetPnlAtExitQuote,
+              dropFromPeakQuote: profitProtectionCandidate.dropFromPeakQuote,
+              dropThresholdQuote:
+                profitProtectionCandidate.dropThresholdQuote,
+              thresholdQuote: profitProtectionCandidate.thresholdQuote,
+            }
+          : activeTrigger === "profit_lock" &&
+              profitProtectionCandidate &&
+              profitProtectionCandidate.trigger === "profit_lock"
+            ? { thresholdQuote: getProfitLockThresholdQuote(this.cfg) }
+            : {};
       return {
         kind: "closed",
         trigger: activeTrigger,
         forced: false,
         estimatedNetPnlAtExitQuote:
-          activeTrigger === "profit_lock" && profitLockCandidate
-            ? profitLockCandidate.estimatedNetPnlAtExitQuote
+          activeTrigger === "profit_lock" ||
+          activeTrigger === "trailing_profit"
+            ? profitProtectionCandidate?.estimatedNetPnlAtExitQuote ?? closed.netPnlQuote
             : closed.netPnlQuote,
+        ...profitProtectionDetails,
         roundtrip: closed,
       };
     }
@@ -640,6 +673,7 @@ export class FuturesPaperEngine {
     };
 
     this.pos = null;
+    this.peakExecutableNetPnlQuote = null;
     return roundtrip;
   }
 
@@ -692,6 +726,7 @@ export class FuturesPaperEngine {
       closeReason: "forced_exit",
     };
     this.pos = null;
+    this.peakExecutableNetPnlQuote = null;
     return roundtrip;
   }
 
@@ -747,15 +782,31 @@ export class FuturesPaperEngine {
       closeReason: "paper_liquidation",
     };
     this.pos = null;
+    this.peakExecutableNetPnlQuote = null;
     return roundtrip;
   }
 
-  private detectProfitLockTrigger(
+  private detectProfitProtectionTrigger(
     book: TopOfBookL1 | null,
     contract?: ContractMeta
-  ): { trigger: "profit_lock"; estimatedNetPnlAtExitQuote: number } | null {
+  ):
+    | {
+        trigger: "profit_lock";
+        estimatedNetPnlAtExitQuote: number;
+      }
+      | {
+          trigger: "trailing_profit";
+          estimatedNetPnlAtExitQuote: number;
+          peakEstimatedNetPnlAtExitQuote: number;
+          dropFromPeakQuote: number;
+          dropThresholdQuote: number;
+          thresholdQuote: number;
+        }
+    | null {
     const p = this.pos;
-    if (!p || !isProfitLockEnabled(this.cfg)) return null;
+    if (!p || (!isProfitLockEnabled(this.cfg) && !isTrailingProfitEnabled(this.cfg))) {
+      return null;
+    }
     if (!isExecutableBook(book)) return null;
 
     const estimate = estimateNetPnlAtExecutableExit({
@@ -768,11 +819,34 @@ export class FuturesPaperEngine {
     if (!estimate) return null;
 
     const threshold = getProfitLockThresholdQuote(this.cfg);
-    if (estimate.estimatedNetPnlAtExitQuote < threshold) return null;
+    const trailingEnabled = isTrailingProfitEnabled(this.cfg);
+    const currentEstimate = estimate.estimatedNetPnlAtExitQuote;
+    const priorPeak = this.peakExecutableNetPnlQuote ?? Number.NEGATIVE_INFINITY;
+    const nextPeak = Math.max(priorPeak, currentEstimate);
+    this.peakExecutableNetPnlQuote = nextPeak;
+
+    if (trailingEnabled) {
+      if (nextPeak < threshold) return null;
+      const dropThreshold = getTrailingProfitDropQuote(this.cfg);
+      const dropFromPeak = nextPeak - currentEstimate;
+      if (dropThreshold >= 0 && dropFromPeak >= dropThreshold) {
+    return {
+      trigger: "trailing_profit",
+      estimatedNetPnlAtExitQuote: currentEstimate,
+      peakEstimatedNetPnlAtExitQuote: nextPeak,
+      dropFromPeakQuote: dropFromPeak,
+      dropThresholdQuote: dropThreshold,
+      thresholdQuote: threshold,
+    };
+  }
+      return null;
+    }
+
+    if (currentEstimate < threshold) return null;
 
     return {
       trigger: "profit_lock",
-      estimatedNetPnlAtExitQuote: estimate.estimatedNetPnlAtExitQuote,
+      estimatedNetPnlAtExitQuote: currentEstimate,
     };
   }
 

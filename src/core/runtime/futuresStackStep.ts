@@ -57,6 +57,11 @@ export type FuturesStackStepInput = {
   /** Age of execution path for staleness gates (replay: use 0 to disable age-based stale). */
   lastMessageAgeMs: number;
   lastCooldownAnchorMs: number | null;
+  /**
+   * Optional hook after a close is detected but before any new entry can be opened.
+   * Return true to block new entries for this tick.
+   */
+  onClosedRoundtrip?: (roundtrip: FuturesPaperRoundtrip) => boolean;
 };
 
 export type FuturesStackOpenAttempt =
@@ -385,10 +390,14 @@ export function runFuturesStackStep(
   }
 
   let closedRoundtrip: FuturesPaperRoundtrip | null = null;
+  let blockNewEntriesAfterClose = false;
   const exitDecision = paper.evaluateExit(input.book, input.nowMs, contract);
   if (exitDecision?.kind === "closed") {
     closedRoundtrip = exitDecision.roundtrip;
     lastCooldownAnchorMs = exitDecision.roundtrip.closedAtMs;
+    if (input.onClosedRoundtrip) {
+      blockNewEntriesAfterClose = input.onClosedRoundtrip(exitDecision.roundtrip);
+    }
   }
 
   const marginDecision = paper.evaluateMargin({
@@ -480,6 +489,10 @@ export function runFuturesStackStep(
   });
 
   if (liquidatedThisTick) {
+    return emptyResult();
+  }
+
+  if (blockNewEntriesAfterClose) {
     return emptyResult();
   }
 

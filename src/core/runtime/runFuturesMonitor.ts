@@ -6,10 +6,17 @@
 import { randomUUID } from "node:crypto";
 import type { InstrumentId } from "../domain/instrument.js";
 import type { TopOfBookL1 } from "../domain/book.js";
+import { BalanceEngine } from "./BalanceEngine.js";
 import type { FuturesPaperExitDecision } from "../execution/futuresPaperTypes.js";
 import type { FuturesPaperMarginDecision } from "../execution/futuresPaperTypes.js";
 import type { FuturesPaperRoundtrip } from "../execution/futuresPaperTypes.js";
-import type { FuturesJsonlEvent, FuturesSessionSummary } from "../reporting/futuresEventTypes.js";
+import type {
+  FuturesBalanceDailyCurvePoint,
+  FuturesBalanceSnapshot,
+  FuturesBalanceHistoryRecord,
+  FuturesJsonlEvent,
+  FuturesSessionSummary,
+} from "../reporting/futuresEventTypes.js";
 import {
   FuturesReportingPersistence,
   buildEntryConfirmationCancelledEvent,
@@ -22,9 +29,12 @@ import {
   buildOrderInvalidQuantityEvent,
   buildOrderNotionalMismatchEvent,
   buildOrderQuantityRoundedEvent,
+  buildBalanceProgressEvent,
+  buildBalanceHistoryRecord,
   buildLiquidationRiskEvent,
   buildMarginWarningEvent,
   buildProfitLockTriggeredEvent,
+  buildTrailingProfitTriggeredEvent,
   buildPaperCloseEvent,
   buildPaperLiquidationEvent,
   buildPaperOpenEvent,
@@ -57,6 +67,22 @@ type ActiveTradeState = {
   contractMultiplier: number;
 };
 
+type BalanceSnapshotState = FuturesBalanceSnapshot | null;
+
+type BalanceConfigState = {
+  startingBalance: number;
+  reserveBalance: number;
+  minBalanceToContinue: number;
+  fixedStakeUntilBalance: number;
+} | null;
+
+type FeedSnapshotState = {
+  lastMessageAgeMs: number | null;
+  feedStale: boolean | null;
+  bookValid: boolean | null;
+  markPrice: number | null;
+};
+
 type ActiveExitState = {
   tradeId: string;
   trigger: FuturesPaperExitDecision["trigger"];
@@ -86,6 +112,17 @@ class FuturesMonitorReporter {
   private readonly startedAtIso = new Date(this.startedAtMs).toISOString();
   private activeTrade: ActiveTradeState | null = null;
   private finalized = false;
+  private bootstrapRestOk = false;
+  private feedSnapshot: FeedSnapshotState = {
+    lastMessageAgeMs: null,
+    feedStale: null,
+    bookValid: null,
+    markPrice: null,
+  };
+  private balanceSnapshot: BalanceSnapshotState = null;
+  private balanceConfig: BalanceConfigState = null;
+  private peakBalanceQuote: number | null = null;
+  private balanceHistory: FuturesBalanceHistoryRecord[] = [];
 
   private ticks = 0;
   private signalsEvaluated = 0;
@@ -107,7 +144,11 @@ class FuturesMonitorReporter {
   private marginWarningCount = 0;
   private liquidationRiskCount = 0;
   private profitLockTriggeredCount = 0;
+  private trailingProfitTriggeredCount = 0;
   private paperLiquidationCount = 0;
+  private cumulativeRealizedNetPnlQuote = 0;
+  private cumulativeWinNetPnlQuote = 0;
+  private cumulativeLossNetPnlQuote = 0;
   private closedWinCount = 0;
   private closedLossCount = 0;
   private closedBreakevenCount = 0;
@@ -127,8 +168,148 @@ class FuturesMonitorReporter {
     return this.persistence.getOutputDir();
   }
 
+  getProgressPath(): string {
+    return this.persistence.getBalanceProgressPath();
+  }
+
+  getHistoryPath(): string {
+    return this.persistence.getBalanceHistoryPath();
+  }
+
+  setBalanceConfig(config: NonNullable<BalanceConfigState>): void {
+    this.balanceConfig = config;
+    this.peakBalanceQuote = config.startingBalance;
+  }
+
+  setBalanceSnapshot(snapshot: BalanceSnapshotState): void {
+    this.balanceSnapshot = snapshot;
+    if (snapshot !== null) {
+      this.peakBalanceQuote =
+        this.peakBalanceQuote === null
+          ? snapshot.currentBalance
+          : Math.max(this.peakBalanceQuote, snapshot.currentBalance);
+    }
+  }
+
+  recordBalanceInitialized(recordedAtMs: number): void {
+    const snapshot = this.balanceSnapshot;
+    if (snapshot === null || this.balanceConfig === null) return;
+    this.appendBalanceHistory(
+      buildBalanceHistoryRecord({
+        sessionId: this.sessionId,
+        recordedAtMs,
+        kind: "balance_initialized",
+        currentBalance: snapshot.currentBalance,
+        currentEquity: snapshot.currentEquity,
+        activeStake: snapshot.activeStake,
+        stakeMode: snapshot.stakeMode,
+        realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+        tradesClosed: this.tradesClosed,
+        closedWinCount: this.closedWinCount,
+        closedLossCount: this.closedLossCount,
+        stopRequested: snapshot.stopRequested,
+        stopReason: snapshot.stopReason,
+      })
+    );
+  }
+
+  recordBalanceAfterTrade(recordedAtMs: number, previous: BalanceSnapshotState): void {
+    const snapshot = this.balanceSnapshot;
+    if (snapshot === null) return;
+    this.appendBalanceHistory(
+      buildBalanceHistoryRecord({
+        sessionId: this.sessionId,
+        recordedAtMs,
+        kind: "balance_updated_after_trade",
+        currentBalance: snapshot.currentBalance,
+        currentEquity: snapshot.currentEquity,
+        activeStake: snapshot.activeStake,
+        stakeMode: snapshot.stakeMode,
+        realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+        tradesClosed: this.tradesClosed,
+        closedWinCount: this.closedWinCount,
+        closedLossCount: this.closedLossCount,
+        stopRequested: snapshot.stopRequested,
+        stopReason: snapshot.stopReason,
+      })
+    );
+
+    if (previous !== null && previous.stakeMode !== snapshot.stakeMode) {
+      this.appendBalanceHistory(
+        buildBalanceHistoryRecord({
+          sessionId: this.sessionId,
+          recordedAtMs,
+          kind: "stake_mode_changed",
+          currentBalance: snapshot.currentBalance,
+          currentEquity: snapshot.currentEquity,
+          activeStake: snapshot.activeStake,
+          stakeMode: snapshot.stakeMode,
+          realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+          tradesClosed: this.tradesClosed,
+          closedWinCount: this.closedWinCount,
+          closedLossCount: this.closedLossCount,
+          previousStakeMode: previous.stakeMode,
+          previousActiveStake: previous.activeStake,
+          newStakeMode: snapshot.stakeMode,
+          newActiveStake: snapshot.activeStake,
+        })
+      );
+    }
+
+    if (previous !== null && !previous.stopRequested && snapshot.stopRequested) {
+      this.appendBalanceHistory(
+        buildBalanceHistoryRecord({
+          sessionId: this.sessionId,
+          recordedAtMs,
+          kind: "stop_triggered_due_to_balance",
+          currentBalance: snapshot.currentBalance,
+          currentEquity: snapshot.currentEquity,
+          activeStake: snapshot.activeStake,
+          stakeMode: snapshot.stakeMode,
+          realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+          tradesClosed: this.tradesClosed,
+          closedWinCount: this.closedWinCount,
+          closedLossCount: this.closedLossCount,
+          stopRequested: snapshot.stopRequested,
+          stopReason: snapshot.stopReason,
+        })
+      );
+    }
+  }
+
+  recordPeriodicBalanceSnapshot(recordedAtMs: number): void {
+    const snapshot = this.balanceSnapshot;
+    if (snapshot === null) return;
+    this.appendBalanceHistory(
+      buildBalanceHistoryRecord({
+        sessionId: this.sessionId,
+        recordedAtMs,
+        kind: "periodic_balance_snapshot",
+        currentBalance: snapshot.currentBalance,
+        currentEquity: snapshot.currentEquity,
+        activeStake: snapshot.activeStake,
+        stakeMode: snapshot.stakeMode,
+        realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+        tradesClosed: this.tradesClosed,
+        closedWinCount: this.closedWinCount,
+        closedLossCount: this.closedLossCount,
+        stopRequested: snapshot.stopRequested,
+        stopReason: snapshot.stopReason,
+      })
+    );
+  }
+
+  private appendBalanceHistory(record: FuturesBalanceHistoryRecord): void {
+    this.balanceHistory.push(record);
+    this.persistence.appendBalanceHistory(record);
+  }
+
   hasActiveTrade(): boolean {
     return this.activeTrade !== null;
+  }
+
+  getActiveTrade(): ActiveTradeState | null {
+    return this.activeTrade;
   }
 
   private logConsole(event: Record<string, unknown>): void {
@@ -138,6 +319,24 @@ class FuturesMonitorReporter {
   private append(event: FuturesJsonlEvent): void {
     this.persistence.appendEvent(event);
     this.logConsole(event);
+  }
+
+  setBootstrapRestOk(ok: boolean): void {
+    this.bootstrapRestOk = ok;
+  }
+
+  recordFeedSnapshot(input: {
+    lastMessageAgeMs: number;
+    feedStale: boolean;
+    bookValid: boolean;
+    markPrice: number | null;
+  }): void {
+    this.feedSnapshot = {
+      lastMessageAgeMs: input.lastMessageAgeMs,
+      feedStale: input.feedStale,
+      bookValid: input.bookValid,
+      markPrice: input.markPrice,
+    };
   }
 
   recordTick(): void {
@@ -408,6 +607,45 @@ class FuturesMonitorReporter {
     );
   }
 
+  recordTrailingProfitTriggered(
+    recordedAtMs: number,
+    nowMs: number,
+    decision: Extract<FuturesPaperExitDecision, { kind: "closed" }>,
+    thresholdQuote: number
+  ): void {
+    const trade = this.activeTrade;
+    if (!trade || decision.trigger !== "trailing_profit") return;
+    this.trailingProfitTriggeredCount += 1;
+    const peakEstimatedNetPnlAtExitQuote =
+      decision.peakEstimatedNetPnlAtExitQuote ??
+      decision.estimatedNetPnlAtExitQuote;
+    const dropFromPeakQuote =
+      decision.dropFromPeakQuote ??
+      Math.max(0, peakEstimatedNetPnlAtExitQuote - decision.estimatedNetPnlAtExitQuote);
+    const dropThresholdQuote =
+      decision.dropThresholdQuote ?? thresholdQuote;
+    const effectiveThresholdQuote =
+      decision.thresholdQuote ?? thresholdQuote;
+    this.append(
+      buildTrailingProfitTriggeredEvent({
+        sessionId: this.sessionId,
+        recordedAtMs,
+        tradeId: trade.tradeId,
+        instrumentId: this.instrumentId,
+        side: trade.side,
+        quantityBase: decision.roundtrip.quantity,
+        entryPrice: decision.roundtrip.entryPrice,
+        exitPrice: decision.roundtrip.exitPrice,
+        estimatedNetPnlAtExitQuote: decision.estimatedNetPnlAtExitQuote,
+        peakEstimatedNetPnlAtExitQuote,
+        dropFromPeakQuote,
+        dropThresholdQuote,
+        thresholdQuote: effectiveThresholdQuote,
+        holdDurationMs: Math.max(0, nowMs - trade.openedAtMs),
+      })
+    );
+  }
+
   recordMarginLifecycle(
     recordedAtMs: number,
     nowMs: number,
@@ -497,9 +735,16 @@ class FuturesMonitorReporter {
   ): void {
     const tradeId = this.activeTrade?.tradeId ?? `${this.sessionId}:trade:orphan`;
     this.tradesClosed += 1;
-    this.closedWinCount += roundtrip.netPnlQuote > 0 ? 1 : 0;
-    this.closedLossCount += roundtrip.netPnlQuote < 0 ? 1 : 0;
-    this.closedBreakevenCount += roundtrip.netPnlQuote === 0 ? 1 : 0;
+    this.cumulativeRealizedNetPnlQuote += roundtrip.netPnlQuote;
+    if (roundtrip.netPnlQuote > 0) {
+      this.closedWinCount += 1;
+      this.cumulativeWinNetPnlQuote += roundtrip.netPnlQuote;
+    } else if (roundtrip.netPnlQuote < 0) {
+      this.closedLossCount += 1;
+      this.cumulativeLossNetPnlQuote += roundtrip.netPnlQuote;
+    } else {
+      this.closedBreakevenCount += 1;
+    }
     this.activeTrade = null;
     this.activeExit = null;
     this.activeMarginLevel = null;
@@ -538,6 +783,180 @@ class FuturesMonitorReporter {
         holdDurationMs: Math.max(0, nowMs - trade.openedAtMs),
       })
     );
+  }
+
+  writeProgressSnapshot(recordedAtMs: number): void {
+    this.recordPeriodicBalanceSnapshot(recordedAtMs);
+    this.persistence.writeBalanceProgress(this.buildBalanceProgressSnapshot(recordedAtMs));
+  }
+
+  private deriveDailyCurve(): FuturesBalanceDailyCurvePoint[] {
+    const groups = new Map<
+      string,
+      {
+        startAtMs: number;
+        endAtMs: number;
+        startBalance: number;
+        endBalance: number;
+        peakBalance: number;
+        maxDrawdownPct: number;
+      }
+    >();
+
+    for (const record of this.balanceHistory) {
+      const date = new Date(record.recordedAtMs).toISOString().slice(0, 10);
+      const currentBalance = record.currentBalance;
+      const existing = groups.get(date);
+      if (!existing) {
+        groups.set(date, {
+          startAtMs: record.recordedAtMs,
+          endAtMs: record.recordedAtMs,
+          startBalance: currentBalance,
+          endBalance: currentBalance,
+          peakBalance: currentBalance,
+          maxDrawdownPct: 0,
+        });
+        continue;
+      }
+
+      existing.endAtMs = record.recordedAtMs;
+      existing.endBalance = currentBalance;
+      existing.peakBalance = Math.max(existing.peakBalance, currentBalance);
+      const drawdownPct =
+        existing.peakBalance > 0
+          ? Math.max(0, ((existing.peakBalance - currentBalance) / existing.peakBalance) * 100)
+          : 0;
+      existing.maxDrawdownPct = Math.max(existing.maxDrawdownPct, drawdownPct);
+    }
+
+    return [...groups.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([date, entry]) => {
+        const spanHours = Math.max((entry.endAtMs - entry.startAtMs) / 3_600_000, 0);
+        const dailyReturnPct =
+          entry.startBalance > 0
+            ? ((entry.endBalance - entry.startBalance) / entry.startBalance) * 100
+            : 0;
+        const returnRatePctPerHour = spanHours > 0 ? dailyReturnPct / spanHours : 0;
+        return {
+          date,
+          balanceStartOfDay: entry.startBalance,
+          balanceEndOfDay: entry.endBalance,
+          dailyReturnPct,
+          returnRatePctPerHour,
+          peakBalanceSeen: entry.peakBalance,
+          maxDrawdownPctSeen: entry.maxDrawdownPct,
+        };
+      });
+  }
+
+  private buildBalanceProgressSnapshot(recordedAtMs: number) {
+    const nowIso = new Date(recordedAtMs).toISOString();
+    const trade = this.activeTrade;
+    const markPrice = this.feedSnapshot.markPrice;
+    const hasOpenPosition =
+      trade !== null && Number.isFinite(markPrice ?? Number.NaN);
+    const balance = this.balanceSnapshot ?? {
+      currentBalance: 0,
+      currentEquity: 0,
+      activeStake: 0,
+      stakeMode: "fixed" as const,
+      stopRequested: false,
+      stopReason: null,
+    };
+    const balanceConfig = this.balanceConfig ?? {
+      startingBalance: 0,
+      reserveBalance: 0,
+      minBalanceToContinue: 0,
+      fixedStakeUntilBalance: 0,
+    };
+    const peakBalance = this.peakBalanceQuote ?? balance.currentBalance;
+    const winRate = this.tradesClosed > 0 ? this.closedWinCount / this.tradesClosed : 0;
+    const avgWin = this.closedWinCount > 0 ? this.cumulativeWinNetPnlQuote / this.closedWinCount : 0;
+    const avgLoss = this.closedLossCount > 0 ? this.cumulativeLossNetPnlQuote / this.closedLossCount : 0;
+    const returnPctOnStartingBalance =
+      balanceConfig.startingBalance > 0
+        ? ((balance.currentBalance - balanceConfig.startingBalance) /
+            balanceConfig.startingBalance) *
+          100
+        : 0;
+    const drawdownPct =
+      peakBalance > 0
+        ? Math.max(0, ((peakBalance - balance.currentBalance) / peakBalance) * 100)
+        : 0;
+
+    return buildBalanceProgressEvent({
+      sessionId: this.sessionId,
+      recordedAtMs,
+      sessionStartedAt: this.startedAtIso,
+      snapshotAt: nowIso,
+      runtimeMs: Math.max(0, recordedAtMs - this.startedAtMs),
+      outputDirectory: this.persistence.getBalanceProgressOutputDir(),
+      instrumentId: this.instrumentId,
+      dailyCurve: this.deriveDailyCurve(),
+      balance: {
+        startingBalance: balanceConfig.startingBalance,
+        reserveBalance: balanceConfig.reserveBalance,
+        currentBalance: balance.currentBalance,
+        currentEquity: balance.currentEquity,
+        activeStake: balance.activeStake,
+        stakeMode: balance.stakeMode,
+        minBalanceToContinue: balanceConfig.minBalanceToContinue,
+        fixedStakeUntilBalance: balanceConfig.fixedStakeUntilBalance,
+        stopRequested: balance.stopRequested,
+        stopReason: balance.stopReason,
+      },
+      performance: {
+        realizedNetPnlQuote: this.cumulativeRealizedNetPnlQuote,
+        unrealizedPnlQuote:
+          hasOpenPosition && trade && Number.isFinite(markPrice ?? Number.NaN)
+            ? this.computeUnrealizedPnlQuote(markPrice as number)
+            : 0,
+        returnPctOnStartingBalance,
+        peakBalance,
+        drawdownPct,
+        tradesOpened: this.tradesOpened,
+        tradesClosed: this.tradesClosed,
+        closedWinCount: this.closedWinCount,
+        closedLossCount: this.closedLossCount,
+        closedBreakevenCount: this.closedBreakevenCount,
+        avgWin,
+        avgLoss,
+        winRate,
+      },
+      runStatus: hasOpenPosition && trade && Number.isFinite(markPrice ?? Number.NaN)
+        ? {
+            hasOpenPosition: true as const,
+            currentTradeId: trade.tradeId,
+            side: trade.side,
+            entryPrice: trade.avgEntryPrice,
+            currentMarkPrice: markPrice as number,
+            holdDurationMs: Math.max(0, recordedAtMs - trade.openedAtMs),
+          }
+        : {
+            hasOpenPosition: false as const,
+          },
+      feed: {
+        bootstrapRestOk: this.bootstrapRestOk,
+        ...(this.feedSnapshot.lastMessageAgeMs !== null
+          ? { lastMessageAgeMs: this.feedSnapshot.lastMessageAgeMs }
+          : {}),
+        ...(this.feedSnapshot.feedStale !== null
+          ? { feedStale: this.feedSnapshot.feedStale }
+          : {}),
+        ...(this.feedSnapshot.bookValid !== null
+          ? { bookValid: this.feedSnapshot.bookValid }
+          : {}),
+      },
+    });
+  }
+
+  private computeUnrealizedPnlQuote(markPrice: number): number {
+    const trade = this.activeTrade;
+    if (!trade || !Number.isFinite(markPrice)) return 0;
+    return trade.side === "long"
+      ? (markPrice - trade.avgEntryPrice) * trade.quantity * trade.contractMultiplier
+      : (trade.avgEntryPrice - markPrice) * trade.quantity * trade.contractMultiplier;
   }
 
   recordOpenSuccess(
@@ -709,6 +1128,7 @@ class FuturesMonitorReporter {
         marginWarningCount: this.marginWarningCount,
         liquidationRiskCount: this.liquidationRiskCount,
         profitLockTriggeredCount: this.profitLockTriggeredCount,
+        trailingProfitTriggeredCount: this.trailingProfitTriggeredCount,
         paperLiquidationCount: this.paperLiquidationCount,
         riskBlockedEntries: this.riskBlockedEntries,
         entryConfirmationPendingCount: this.entryConfirmationPendingCount,
@@ -729,6 +1149,9 @@ class FuturesMonitorReporter {
         closedLossCount: this.closedLossCount,
         closedBreakevenCount: this.closedBreakevenCount,
       },
+      ...(this.balanceSnapshot !== null
+        ? { balance: this.balanceSnapshot }
+        : {}),
       feed: {
         bootstrapRestOk,
       },
@@ -751,6 +1174,22 @@ function runMonitorLoop(
   reporter: FuturesMonitorReporter
 ): Promise<void> {
   const { feed } = ctx;
+  const balanceEngine = new BalanceEngine({
+    enabled: ctx.balanceTrackingEnabled,
+    startingBalance: ctx.balanceStartingBalance,
+    reserveBalance: ctx.balanceReserveBalance,
+    fixedStakeUntilBalance: ctx.balanceFixedStakeUntilBalance,
+    minBalanceToContinue: ctx.balanceMinBalanceToContinue,
+    fixedStakeQuote: 100,
+  });
+  reporter.setBalanceConfig({
+    startingBalance: ctx.balanceStartingBalance,
+    reserveBalance: ctx.balanceReserveBalance,
+    minBalanceToContinue: ctx.balanceMinBalanceToContinue,
+    fixedStakeUntilBalance: ctx.balanceFixedStakeUntilBalance,
+  });
+  reporter.setBalanceSnapshot(balanceEngine.getSnapshot());
+  reporter.recordBalanceInitialized(Date.now());
   const profitLockThresholdQuote =
     ctx.paper.getConfig().profitLockThresholdQuote ?? 1;
   const rt: FuturesStackRuntime = {
@@ -770,6 +1209,14 @@ function runMonitorLoop(
 
   let lastCooldownAnchorMs: number | null = null;
   let tradeSequence = 0;
+  const progressIntervalMs = 5 * 60 * 1000;
+  let requestShutdown: (() => void) | null = null;
+
+  const writeProgressNow = (): void => {
+    reporter.writeProgressSnapshot(Date.now());
+  };
+
+  writeProgressNow();
 
   const tick = (): void => {
     reporter.recordTick();
@@ -777,6 +1224,17 @@ function runMonitorLoop(
     const hadOpenTrade = reporter.hasActiveTrade();
     const book = feed.getExecutionBook();
     const markPrice = feed.getMarkPrice();
+    const lastMessageAgeMs = feed.getLastMessageAgeMs(now);
+    let closedTradePreviousBalanceSnapshot: BalanceSnapshotState = null;
+    reporter.recordFeedSnapshot({
+      lastMessageAgeMs,
+      feedStale: ctx.feedStaleMaxAgeMs > 0 && lastMessageAgeMs > ctx.feedStaleMaxAgeMs,
+      bookValid: isExecutableBook(book),
+      markPrice,
+    });
+    if (ctx.balanceTrackingEnabled) {
+      ctx.risk.setConfig({ baseStakeQuote: balanceEngine.activeStake });
+    }
     tradeSequence += 1;
     const step = runFuturesStackStep(rt, {
       nowMs: now,
@@ -786,6 +1244,12 @@ function runMonitorLoop(
       book,
       lastMessageAgeMs: feed.getLastMessageAgeMs(now),
       lastCooldownAnchorMs,
+      onClosedRoundtrip: (roundtrip) => {
+        closedTradePreviousBalanceSnapshot = balanceEngine.getSnapshot();
+        const snapshot = balanceEngine.applyRealizedNetPnlQuote(roundtrip.netPnlQuote);
+        reporter.setBalanceSnapshot(snapshot);
+        return snapshot.stopRequested;
+      },
     });
     lastCooldownAnchorMs = step.lastCooldownAnchorMs;
     reporter.recordExitLifecycle(now, step.exitDecision, book);
@@ -796,11 +1260,23 @@ function runMonitorLoop(
         step.exitDecision,
         profitLockThresholdQuote
       );
+    } else if (
+      step.exitDecision?.kind === "closed" &&
+      step.exitDecision.trigger === "trailing_profit"
+    ) {
+      reporter.recordTrailingProfitTriggered(
+        now,
+        now,
+        step.exitDecision,
+        profitLockThresholdQuote
+      );
     }
     reporter.recordMarginLifecycle(now, now, step.marginDecision);
 
     if (step.closedRoundtrip) {
       reporter.recordTradeClosed(now, step.closedRoundtrip);
+      reporter.recordBalanceAfterTrade(now, closedTradePreviousBalanceSnapshot);
+      writeProgressNow();
     }
 
     if (step.signalEvaluation) {
@@ -840,18 +1316,50 @@ function runMonitorLoop(
         reporter.recordTradeUpdate(now, now, book.midPrice, markPrice ?? book.midPrice);
       }
     }
+
+    const activeTrade = reporter.getActiveTrade();
+    const currentMarkPrice = markPrice ?? book?.midPrice ?? null;
+    if (activeTrade && currentMarkPrice !== null && Number.isFinite(currentMarkPrice)) {
+      const unrealizedPnlQuote =
+        activeTrade.side === "long"
+          ? (currentMarkPrice - activeTrade.avgEntryPrice) * activeTrade.quantity * activeTrade.contractMultiplier
+          : (activeTrade.avgEntryPrice - currentMarkPrice) * activeTrade.quantity * activeTrade.contractMultiplier;
+      balanceEngine.setUnrealizedPnlQuote(unrealizedPnlQuote);
+    } else {
+      balanceEngine.setUnrealizedPnlQuote(0);
+    }
+    reporter.setBalanceSnapshot(balanceEngine.getSnapshot());
+
+    if (balanceEngine.stopRequested && requestShutdown) {
+      console.log(
+        JSON.stringify({
+          channel: "futures_monitor",
+          type: "balance_stop_requested",
+          sessionId: reporter.getSessionId(),
+          balance: balanceEngine.getSnapshot(),
+          reason: balanceEngine.stopReason,
+        })
+      );
+      requestShutdown();
+    }
   };
 
   return new Promise<void>((resolve) => {
     const id = setInterval(tick, ctx.tickIntervalMs);
-    const shutdown = (): void => {
+    const progressId = setInterval(writeProgressNow, progressIntervalMs);
+    requestShutdown = (): void => {
       clearInterval(id);
+      clearInterval(progressId);
+      writeProgressNow();
       try {
         feed.stop();
       } catch {
         /* ignore */
       }
       resolve();
+    };
+    const shutdown = (): void => {
+      requestShutdown?.();
     };
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
@@ -881,9 +1389,12 @@ async function main(): Promise<void> {
       priceSources: feed.priceSources,
       entryConfirmationTicks: ctx.entryConfirmationTicks,
       entryRequireReversal: ctx.entryRequireReversal,
+      balanceTrackingEnabled: ctx.balanceTrackingEnabled,
       tickIntervalMs,
       paperFeed: feed.implementationKind === "futures_native_paper",
       reportDir: reporter.getOutputDir(),
+      progressReportPath: reporter.getProgressPath(),
+      balanceHistoryPath: reporter.getHistoryPath(),
     })
   );
 
@@ -896,10 +1407,12 @@ async function main(): Promise<void> {
         sessionId: reporter.getSessionId(),
       })
     );
+    reporter.writeProgressSnapshot(Date.now());
     reporter.finish(false, ctx.paper.getCumulativeRealizedPnlQuote());
     process.exitCode = 1;
     return;
   }
+  reporter.setBootstrapRestOk(true);
 
   feed.start();
   await runMonitorLoop(ctx, reporter);

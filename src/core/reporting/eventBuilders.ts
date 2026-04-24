@@ -13,6 +13,7 @@ import {
   type ForcedCloseEvent,
   type MarginWarningEvent,
   type ProfitLockTriggeredEvent,
+  type TrailingProfitTriggeredEvent,
   type OrderInvalidQuantityEvent,
   type OrderNotionalMismatchEvent,
   type OrderQuantityRoundedEvent,
@@ -20,6 +21,8 @@ import {
   type PaperCloseEvent,
   type PaperOpenEvent,
   type PaperOpenRejectedEvent,
+  type FuturesBalanceHistoryRecord,
+  type FuturesBalanceProgress,
   type EntryConfirmationPendingEvent,
   type EntryConfirmationCancelledEvent,
   type RiskEvaluatedEvent,
@@ -29,6 +32,7 @@ import {
   type TradeOpenedEvent,
   type TradeUpdatedEvent,
   type SessionSummaryEvent,
+  type FuturesSessionProgress,
 } from "./futuresEventTypes.js";
 
 function movementSummary(
@@ -229,6 +233,43 @@ export function buildProfitLockTriggeredEvent(input: {
     thresholdQuote: input.thresholdQuote,
     holdDurationMs: input.holdDurationMs,
     closeReason: "profit_lock",
+  };
+}
+
+export function buildTrailingProfitTriggeredEvent(input: {
+  sessionId: string;
+  recordedAtMs: number;
+  tradeId: string;
+  instrumentId: InstrumentId;
+  side: PositionSide;
+  quantityBase: number;
+  entryPrice: number;
+  exitPrice: number;
+  estimatedNetPnlAtExitQuote: number;
+  peakEstimatedNetPnlAtExitQuote: number;
+  dropFromPeakQuote: number;
+  dropThresholdQuote: number;
+  thresholdQuote: number;
+  holdDurationMs: number;
+}): TrailingProfitTriggeredEvent {
+  return {
+    schemaVersion: FUTURES_REPORT_SCHEMA_VERSION,
+    recordedAtMs: input.recordedAtMs,
+    sessionId: input.sessionId,
+    kind: "trailing_profit_triggered",
+    tradeId: input.tradeId,
+    instrumentId: input.instrumentId,
+    side: input.side,
+    quantityBase: input.quantityBase,
+    entryPrice: input.entryPrice,
+    exitPrice: input.exitPrice,
+    estimatedNetPnlAtExitQuote: input.estimatedNetPnlAtExitQuote,
+    peakEstimatedNetPnlAtExitQuote: input.peakEstimatedNetPnlAtExitQuote,
+    dropFromPeakQuote: input.dropFromPeakQuote,
+    dropThresholdQuote: input.dropThresholdQuote,
+    thresholdQuote: input.thresholdQuote,
+    holdDurationMs: input.holdDurationMs,
+    closeReason: "trailing_profit",
   };
 }
 
@@ -724,6 +765,117 @@ export function buildSessionSummaryEvent(input: {
     sessionId: input.sessionId,
     kind: "session_summary",
     summary: input.summary,
+  };
+}
+
+export function buildSessionProgressEvent(input: {
+  sessionId: string;
+  recordedAtMs: number;
+  sessionStartedAt: string;
+  snapshotAt: string;
+  runtimeMs: number;
+  outputDirectory: string;
+  instrumentId?: InstrumentId;
+  counters: FuturesSessionProgress["counters"];
+  pnl: FuturesSessionProgress["pnl"];
+  balance?: FuturesSessionProgress["balance"];
+  feed: FuturesSessionProgress["feed"];
+  position?: FuturesSessionProgress["position"];
+}): FuturesSessionProgress {
+  return {
+    schemaVersion: FUTURES_REPORT_SCHEMA_VERSION,
+    recordedAtMs: input.recordedAtMs,
+    sessionId: input.sessionId,
+    kind: "session_progress",
+    sessionStartedAt: input.sessionStartedAt,
+    snapshotAt: input.snapshotAt,
+    runtimeMs: input.runtimeMs,
+    outputDirectory: input.outputDirectory,
+    ...(input.instrumentId !== undefined ? { instrumentId: input.instrumentId } : {}),
+    counters: input.counters,
+    pnl: input.pnl,
+    ...(input.balance !== undefined ? { balance: input.balance } : {}),
+    ...(input.position !== undefined ? { position: input.position } : {}),
+    feed: input.feed,
+  };
+}
+
+export function buildBalanceProgressEvent(input: {
+  sessionId: string;
+  recordedAtMs: number;
+  sessionStartedAt: string;
+  snapshotAt: string;
+  runtimeMs: number;
+  outputDirectory: string;
+  instrumentId?: InstrumentId;
+  dailyCurve: FuturesBalanceProgress["dailyCurve"];
+  balance: FuturesBalanceProgress["balance"];
+  performance: FuturesBalanceProgress["performance"];
+  runStatus: FuturesBalanceProgress["runStatus"];
+  feed: FuturesBalanceProgress["feed"];
+}): FuturesBalanceProgress {
+  return {
+    schemaVersion: FUTURES_REPORT_SCHEMA_VERSION,
+    recordedAtMs: input.recordedAtMs,
+    sessionId: input.sessionId,
+    kind: "balance_progress",
+    sessionStartedAt: input.sessionStartedAt,
+    snapshotAt: input.snapshotAt,
+    runtimeMs: input.runtimeMs,
+    outputDirectory: input.outputDirectory,
+    ...(input.instrumentId !== undefined ? { instrumentId: input.instrumentId } : {}),
+    dailyCurve: input.dailyCurve,
+    balance: input.balance,
+    performance: input.performance,
+    runStatus: input.runStatus,
+    feed: input.feed,
+  };
+}
+
+export function buildBalanceHistoryRecord(input: {
+  sessionId: string;
+  recordedAtMs: number;
+  kind: FuturesBalanceHistoryRecord["kind"];
+  currentBalance: number;
+  currentEquity: number;
+  activeStake: number;
+  stakeMode: FuturesBalanceHistoryRecord["stakeMode"];
+  realizedNetPnlQuote: number;
+  tradesClosed: number;
+  closedWinCount: number;
+  closedLossCount: number;
+  stopRequested?: boolean;
+  stopReason?: string | null;
+  previousStakeMode?: FuturesBalanceHistoryRecord["previousStakeMode"];
+  previousActiveStake?: number;
+  newStakeMode?: FuturesBalanceHistoryRecord["newStakeMode"];
+  newActiveStake?: number;
+}): FuturesBalanceHistoryRecord {
+  return {
+    schemaVersion: FUTURES_REPORT_SCHEMA_VERSION,
+    recordedAtMs: input.recordedAtMs,
+    sessionId: input.sessionId,
+    kind: input.kind,
+    currentBalance: input.currentBalance,
+    currentEquity: input.currentEquity,
+    activeStake: input.activeStake,
+    stakeMode: input.stakeMode,
+    realizedNetPnlQuote: input.realizedNetPnlQuote,
+    tradesClosed: input.tradesClosed,
+    closedWinCount: input.closedWinCount,
+    closedLossCount: input.closedLossCount,
+    ...(input.stopRequested !== undefined
+      ? { stopRequested: input.stopRequested }
+      : {}),
+    ...(input.stopReason !== undefined ? { stopReason: input.stopReason } : {}),
+    ...(input.previousStakeMode !== undefined
+      ? { previousStakeMode: input.previousStakeMode }
+      : {}),
+    ...(input.previousActiveStake !== undefined
+      ? { previousActiveStake: input.previousActiveStake }
+      : {}),
+    ...(input.newStakeMode !== undefined ? { newStakeMode: input.newStakeMode } : {}),
+    ...(input.newActiveStake !== undefined ? { newActiveStake: input.newActiveStake } : {}),
   };
 }
 

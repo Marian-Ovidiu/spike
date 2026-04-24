@@ -121,6 +121,93 @@ export type LiquidationRiskEvent = FuturesReportEnvelope & {
   readonly riskRatio: number;
 };
 
+export type FuturesBalanceSnapshot = {
+  readonly currentBalance: number;
+  readonly currentEquity: number;
+  readonly activeStake: number;
+  readonly stakeMode: "fixed" | "compounding";
+  readonly stopRequested: boolean;
+  readonly stopReason: string | null;
+};
+
+export type FuturesBalanceDailyCurvePoint = {
+  readonly date: string;
+  readonly balanceStartOfDay: number;
+  readonly balanceEndOfDay: number;
+  readonly dailyReturnPct: number;
+  readonly returnRatePctPerHour: number;
+  readonly peakBalanceSeen: number;
+  readonly maxDrawdownPctSeen: number;
+};
+
+export type FuturesBalanceHistoryRecord = FuturesReportEnvelope & {
+  readonly kind:
+    | "balance_initialized"
+    | "balance_updated_after_trade"
+    | "stake_mode_changed"
+    | "stop_triggered_due_to_balance"
+    | "periodic_balance_snapshot";
+  readonly currentBalance: number;
+  readonly currentEquity: number;
+  readonly activeStake: number;
+  readonly stakeMode: "fixed" | "compounding";
+  readonly realizedNetPnlQuote: number;
+  readonly tradesClosed: number;
+  readonly closedWinCount: number;
+  readonly closedLossCount: number;
+  readonly stopRequested?: boolean;
+  readonly stopReason?: string | null;
+  readonly previousStakeMode?: "fixed" | "compounding";
+  readonly previousActiveStake?: number;
+  readonly newStakeMode?: "fixed" | "compounding";
+  readonly newActiveStake?: number;
+};
+
+export type FuturesBalanceProgress = FuturesReportEnvelope & {
+  readonly kind: "balance_progress";
+  readonly sessionStartedAt: string;
+  readonly snapshotAt: string;
+  readonly runtimeMs: number;
+  readonly outputDirectory: string;
+  readonly instrumentId?: InstrumentId;
+  readonly dailyCurve: readonly FuturesBalanceDailyCurvePoint[];
+  readonly balance: FuturesBalanceSnapshot & {
+    readonly startingBalance: number;
+    readonly reserveBalance: number;
+    readonly minBalanceToContinue: number;
+    readonly fixedStakeUntilBalance: number;
+  };
+  readonly performance: {
+    readonly realizedNetPnlQuote: number;
+    readonly unrealizedPnlQuote: number;
+    readonly returnPctOnStartingBalance: number;
+    readonly peakBalance: number;
+    readonly drawdownPct: number;
+    readonly tradesOpened: number;
+    readonly tradesClosed: number;
+    readonly closedWinCount: number;
+    readonly closedLossCount: number;
+    readonly closedBreakevenCount: number;
+    readonly avgWin: number;
+    readonly avgLoss: number;
+    readonly winRate: number;
+  };
+  readonly runStatus: {
+    readonly hasOpenPosition: boolean;
+    readonly currentTradeId?: string;
+    readonly side?: PositionSide;
+    readonly entryPrice?: number;
+    readonly currentMarkPrice?: number;
+    readonly holdDurationMs?: number;
+  };
+  readonly feed: {
+    readonly bootstrapRestOk: boolean;
+    readonly lastMessageAgeMs?: number;
+    readonly feedStale?: boolean;
+    readonly bookValid?: boolean;
+  };
+};
+
 export type ProfitLockTriggeredEvent = FuturesReportEnvelope & {
   readonly kind: "profit_lock_triggered";
   readonly tradeId: string;
@@ -133,6 +220,23 @@ export type ProfitLockTriggeredEvent = FuturesReportEnvelope & {
   readonly thresholdQuote: number;
   readonly holdDurationMs: number;
   readonly closeReason: "profit_lock";
+};
+
+export type TrailingProfitTriggeredEvent = FuturesReportEnvelope & {
+  readonly kind: "trailing_profit_triggered";
+  readonly tradeId: string;
+  readonly instrumentId: InstrumentId;
+  readonly side: PositionSide;
+  readonly quantityBase: number;
+  readonly entryPrice: number;
+  readonly exitPrice: number;
+  readonly estimatedNetPnlAtExitQuote: number;
+  readonly peakEstimatedNetPnlAtExitQuote: number;
+  readonly dropFromPeakQuote: number;
+  readonly dropThresholdQuote: number;
+  readonly thresholdQuote: number;
+  readonly holdDurationMs: number;
+  readonly closeReason: "trailing_profit";
 };
 
 export type PaperLiquidationEvent = FuturesReportEnvelope & {
@@ -376,6 +480,61 @@ export type SessionSummaryEvent = FuturesReportEnvelope & {
   readonly summary: FuturesSessionSummary;
 };
 
+export type FuturesSessionProgress = FuturesReportEnvelope & {
+  readonly kind: "session_progress";
+  readonly sessionStartedAt: string;
+  readonly snapshotAt: string;
+  readonly runtimeMs: number;
+  readonly outputDirectory: string;
+  readonly instrumentId?: InstrumentId;
+  readonly counters: {
+    readonly ticks: number;
+    readonly signalsEvaluated: number;
+    readonly signalsRejected: number;
+    readonly tradesOpened: number;
+    readonly tradesClosed: number;
+    readonly marginWarningCount: number;
+    readonly liquidationRiskCount: number;
+    readonly profitLockTriggeredCount: number;
+    readonly trailingProfitTriggeredCount: number;
+    readonly paperLiquidationCount: number;
+    readonly riskBlockedEntries: number;
+    readonly entryConfirmationPendingCount: number;
+    readonly entryConfirmationCancelledCount: number;
+    readonly entryConfirmationSatisfiedCount: number;
+    readonly exitPendingCount: number;
+    readonly exitRetryCount: number;
+    readonly exitRetryFailedCount: number;
+    readonly exitExecutionSkippedCount: number;
+    readonly forcedCloseCount: number;
+    readonly quantityRoundedCount: number;
+    readonly invalidOrderQuantityCount: number;
+    readonly notionalMismatchCount: number;
+  };
+  readonly pnl: {
+    readonly realizedNetPnlQuote: number;
+    readonly closedWinCount: number;
+    readonly closedLossCount: number;
+    readonly closedBreakevenCount: number;
+  };
+  readonly balance?: FuturesBalanceSnapshot;
+  readonly position?: {
+    readonly hasOpenPosition: true;
+    readonly currentTradeId: string;
+    readonly side: PositionSide;
+    readonly entryPrice: number;
+    readonly currentMarkPrice: number;
+    readonly unrealizedPnlQuote: number;
+    readonly holdDurationMs: number;
+  };
+  readonly feed: {
+    readonly bootstrapRestOk: boolean;
+    readonly lastMessageAgeMs?: number;
+    readonly feedStale?: boolean;
+    readonly bookValid?: boolean;
+  };
+};
+
 /** Union of all lines appended to `futures-events.jsonl`. */
 export type FuturesJsonlEvent =
   | SignalEvaluatedEvent
@@ -384,6 +543,7 @@ export type FuturesJsonlEvent =
   | MarginWarningEvent
   | LiquidationRiskEvent
   | ProfitLockTriggeredEvent
+  | TrailingProfitTriggeredEvent
   | PaperLiquidationEvent
   | PaperOpenEvent
   | PaperOpenRejectedEvent
@@ -418,9 +578,10 @@ export type FuturesSessionSummary = {
     readonly tradesOpened: number;
     readonly tradesClosed: number;
     readonly marginWarningCount: number;
-    readonly liquidationRiskCount: number;
-    readonly profitLockTriggeredCount: number;
-    readonly paperLiquidationCount: number;
+  readonly liquidationRiskCount: number;
+  readonly profitLockTriggeredCount: number;
+  readonly trailingProfitTriggeredCount: number;
+  readonly paperLiquidationCount: number;
     readonly riskBlockedEntries: number;
     readonly entryConfirmationPendingCount: number;
     readonly entryConfirmationCancelledCount: number;
@@ -440,6 +601,7 @@ export type FuturesSessionSummary = {
     readonly closedLossCount: number;
     readonly closedBreakevenCount: number;
   };
+  readonly balance?: FuturesBalanceSnapshot;
   readonly feed?: {
     readonly bootstrapRestOk: boolean;
     readonly messagesApprox?: number;

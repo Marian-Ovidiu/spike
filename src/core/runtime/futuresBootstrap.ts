@@ -44,6 +44,11 @@ export type FuturesMonitorRuntime = {
   blockEntriesOnExecutionFeedStale: boolean;
   entryConfirmationTicks: number;
   entryRequireReversal: boolean;
+  balanceTrackingEnabled: boolean;
+  balanceStartingBalance: number;
+  balanceReserveBalance: number;
+  balanceFixedStakeUntilBalance: number;
+  balanceMinBalanceToContinue: number;
 };
 
 function buildPaperConfig(): FuturesPaperEngineConfig {
@@ -70,6 +75,11 @@ function buildPaperConfig(): FuturesPaperEngineConfig {
     profitLockThresholdQuote: envNumber(
       "FUTURES_PROFIT_LOCK_THRESHOLD_QUOTE",
       1
+    ),
+    trailingProfitEnabled: envBool("FUTURES_TRAILING_PROFIT_ENABLED", false),
+    trailingProfitDropQuote: envNumber(
+      "FUTURES_TRAILING_PROFIT_DROP_QUOTE",
+      0
     ),
   };
 }
@@ -157,5 +167,19 @@ export function createFuturesMonitorRuntime(): FuturesMonitorRuntime {
       riskCfg.blockEntriesOnExecutionFeedStale,
     entryConfirmationTicks: envNumber("FUTURES_ENTRY_CONFIRMATION_TICKS", 2),
     entryRequireReversal: envBool("FUTURES_ENTRY_REQUIRE_REVERSAL", false),
+    balanceTrackingEnabled: envBool(
+      "FUTURES_BALANCE_TRACKING_ENABLED",
+      false
+    ),
+    balanceStartingBalance: envNumber("FUTURES_STARTING_BALANCE", 110),
+    balanceReserveBalance: envNumber("FUTURES_RESERVE_BALANCE", 10),
+    balanceFixedStakeUntilBalance: envNumber(
+      "FUTURES_FIXED_STAKE_UNTIL_BALANCE",
+      120
+    ),
+    balanceMinBalanceToContinue: envNumber(
+      "FUTURES_MIN_BALANCE_TO_CONTINUE",
+      100
+    ),
   };
 }

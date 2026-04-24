@@ -51,6 +51,7 @@ import {
   buildLiquidationRiskEvent,
   buildMarginWarningEvent,
   buildProfitLockTriggeredEvent,
+  buildTrailingProfitTriggeredEvent,
   buildPaperCloseEvent,
   buildPaperLiquidationEvent,
   buildPaperOpenEvent,
@@ -86,6 +87,7 @@ export type FuturesReplaySummary = {
   readonly marginWarningCount: number;
   readonly liquidationRiskCount: number;
   readonly profitLockTriggeredCount: number;
+  readonly trailingProfitTriggeredCount: number;
   readonly paperLiquidationCount: number;
   readonly exitPendingCount: number;
   readonly exitRetryCount: number;
@@ -121,6 +123,7 @@ export type FuturesReplaySummary = {
     readonly marginWarning: number;
     readonly liquidationRisk: number;
     readonly profitLockTriggered: number;
+    readonly trailingProfitTriggered: number;
     readonly paperLiquidation: number;
     readonly paperOpen: number;
     readonly paperOpenRejected: number;
@@ -348,6 +351,7 @@ class FuturesReplayReporter {
   private marginWarningCount = 0;
   private liquidationRiskCount = 0;
   private profitLockTriggeredCount = 0;
+  private trailingProfitTriggeredCount = 0;
   private paperLiquidationCount = 0;
   private riskBlockedEntries = 0;
   private exitPendingCount = 0;
@@ -733,6 +737,45 @@ class FuturesReplayReporter {
     );
   }
 
+  recordTrailingProfitTriggered(
+    recordedAtMs: number,
+    nowMs: number,
+    decision: Extract<FuturesPaperExitDecision, { kind: "closed" }>,
+    thresholdQuote: number
+  ): void {
+    const trade = this.activeTrade;
+    if (!trade || decision.trigger !== "trailing_profit") return;
+    this.trailingProfitTriggeredCount += 1;
+    const peakEstimatedNetPnlAtExitQuote =
+      decision.peakEstimatedNetPnlAtExitQuote ??
+      decision.estimatedNetPnlAtExitQuote;
+    const dropFromPeakQuote =
+      decision.dropFromPeakQuote ??
+      Math.max(0, peakEstimatedNetPnlAtExitQuote - decision.estimatedNetPnlAtExitQuote);
+    const dropThresholdQuote =
+      decision.dropThresholdQuote ?? thresholdQuote;
+    const effectiveThresholdQuote =
+      decision.thresholdQuote ?? thresholdQuote;
+    this.append(
+      buildTrailingProfitTriggeredEvent({
+        sessionId: this.sessionId,
+        recordedAtMs,
+        tradeId: trade.tradeId,
+        instrumentId: this.instrumentId,
+        side: trade.side,
+        quantityBase: decision.roundtrip.quantity,
+        entryPrice: decision.roundtrip.entryPrice,
+        exitPrice: decision.roundtrip.exitPrice,
+        estimatedNetPnlAtExitQuote: decision.estimatedNetPnlAtExitQuote,
+        peakEstimatedNetPnlAtExitQuote,
+        dropFromPeakQuote,
+        dropThresholdQuote,
+        thresholdQuote: effectiveThresholdQuote,
+        holdDurationMs: Math.max(0, nowMs - trade.openedAtMs),
+      })
+    );
+  }
+
   recordMarginLifecycle(
     recordedAtMs: number,
     nowMs: number,
@@ -1026,6 +1069,7 @@ class FuturesReplayReporter {
         marginWarningCount: this.marginWarningCount,
         liquidationRiskCount: this.liquidationRiskCount,
         profitLockTriggeredCount: this.profitLockTriggeredCount,
+        trailingProfitTriggeredCount: this.trailingProfitTriggeredCount,
         paperLiquidationCount: this.paperLiquidationCount,
         riskBlockedEntries: this.riskBlockedEntries,
         entryConfirmationPendingCount: this.entryConfirmationPendingCount,
@@ -1089,6 +1133,7 @@ class FuturesReplayReporter {
       marginWarningCount: this.marginWarningCount,
       liquidationRiskCount: this.liquidationRiskCount,
       profitLockTriggeredCount: this.profitLockTriggeredCount,
+      trailingProfitTriggeredCount: this.trailingProfitTriggeredCount,
       paperLiquidationCount: this.paperLiquidationCount,
       exitPendingCount: this.exitPendingCount,
       exitRetryCount: this.exitRetryCount,
@@ -1124,6 +1169,7 @@ class FuturesReplayReporter {
         marginWarning: this.marginWarningCount,
         liquidationRisk: this.liquidationRiskCount,
         profitLockTriggered: this.profitLockTriggeredCount,
+        trailingProfitTriggered: this.trailingProfitTriggeredCount,
         paperLiquidation: this.paperLiquidationCount,
         paperOpen: this.tradesOpened,
         paperOpenRejected: this.openRejected,
@@ -1251,6 +1297,16 @@ export async function runFuturesReplayFromPath(
     reporter.recordExitLifecycle(plan.condition.atMs, step.exitDecision, plan.condition.book);
     if (step.exitDecision?.kind === "closed" && step.exitDecision.trigger === "profit_lock") {
       reporter.recordProfitLockTriggered(
+        plan.condition.atMs,
+        plan.condition.atMs,
+        step.exitDecision,
+        profitLockThresholdQuote
+      );
+    } else if (
+      step.exitDecision?.kind === "closed" &&
+      step.exitDecision.trigger === "trailing_profit"
+    ) {
+      reporter.recordTrailingProfitTriggered(
         plan.condition.atMs,
         plan.condition.atMs,
         step.exitDecision,

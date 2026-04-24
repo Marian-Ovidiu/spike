@@ -7,6 +7,7 @@ export type FuturesPaperCloseReason =
   | "stop_loss"
   | "exit_timeout"
   | "profit_lock"
+  | "trailing_profit"
   | "manual"
   | "forced_exit"
   | "paper_liquidation";
@@ -15,7 +16,8 @@ export type FuturesPaperExitTrigger =
   | "take_profit"
   | "stop_loss"
   | "exit_timeout"
-  | "profit_lock";
+  | "profit_lock"
+  | "trailing_profit";
 
 export type FuturesPaperExitPendingReason =
   | "trigger_reached_book_invalid"
@@ -28,6 +30,10 @@ export type FuturesPaperExitDecision =
       readonly trigger: FuturesPaperExitTrigger;
       readonly forced: boolean;
       readonly estimatedNetPnlAtExitQuote: number;
+      readonly peakEstimatedNetPnlAtExitQuote?: number;
+      readonly dropFromPeakQuote?: number;
+      readonly dropThresholdQuote?: number;
+      readonly thresholdQuote?: number;
       readonly roundtrip: FuturesPaperRoundtrip;
     }
   | {
@@ -72,6 +78,10 @@ export type FuturesPaperEngineConfig = {
   profitLockEnabled?: boolean;
   /** Minimum estimated net PnL at exit, in quote currency, to trigger profit lock. */
   profitLockThresholdQuote?: number;
+  /** Enable trailing profit protection once profit lock has armed. */
+  trailingProfitEnabled?: boolean;
+  /** Drop from the peak executable net PnL, in quote currency, that triggers trailing profit protection. */
+  trailingProfitDropQuote?: number;
   /** Deprecated fallback, used only when explicit rates are absent. */
   leverage?: number;
 };

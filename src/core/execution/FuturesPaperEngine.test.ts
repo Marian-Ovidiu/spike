@@ -314,4 +314,45 @@ describe("FuturesPaperEngine", () => {
     expect(decision.roundtrip.closeReason).toBe("profit_lock");
     expect(eng.isFlat()).toBe(true);
   });
+
+  it("trails the peak executable profit and closes after a configured drop", () => {
+    const eng = new FuturesPaperEngine(
+      baseConfig({
+        slippageBps: 0,
+        feeRoundTripBps: 0,
+        takeProfitBps: 10_000,
+        stopLossBps: 10_000,
+        exitTimeoutMs: 0,
+        profitLockEnabled: true,
+        profitLockThresholdQuote: 1,
+        trailingProfitEnabled: true,
+        trailingProfitDropQuote: 5,
+      })
+    );
+    const openBook = book(100, 0);
+    const open = eng.openLong({
+      instrumentId: inst,
+      quantity: 1,
+      book: openBook,
+      nowMs: 0,
+      contract,
+    });
+    expect(open.ok).toBe(true);
+
+    const peakBook = book(120, 0);
+    const armed = eng.evaluateExit(peakBook, 1_000, contract);
+    expect(armed).toBeNull();
+
+    const retraceBook = book(114, 0);
+    const decision = eng.evaluateExit(retraceBook, 2_000, contract);
+    expect(decision?.kind).toBe("closed");
+    if (!decision || decision.kind !== "closed") throw new Error("closed");
+    expect(decision.trigger).toBe("trailing_profit");
+    expect(decision.estimatedNetPnlAtExitQuote).toBeCloseTo(140);
+    expect(decision.peakEstimatedNetPnlAtExitQuote).toBeCloseTo(200);
+    expect(decision.dropFromPeakQuote).toBeCloseTo(60);
+    expect(decision.dropThresholdQuote).toBeCloseTo(5);
+    expect(decision.roundtrip.closeReason).toBe("trailing_profit");
+    expect(eng.isFlat()).toBe(true);
+  });
 });
