@@ -95,10 +95,61 @@ export type FuturesPaperRoundtrip = {
   readonly grossPnlQuote: number;
   readonly feesQuote: number;
   readonly netPnlQuote: number;
+  readonly grossPnl?: number;
+  readonly fees?: number;
+  readonly spreadCost?: number;
+  readonly slippageCost?: number;
+  readonly latencyCost?: number;
+  readonly fundingCost?: number;
+  readonly netPnl?: number;
+  readonly edgeBeforeCosts?: number;
+  readonly edgeAfterCosts?: number;
   readonly openedAtMs: number;
   readonly closedAtMs: number;
   readonly closeReason: FuturesPaperCloseReason;
 };
+
+export interface FuturesPaperExecutionEngine {
+  getConfig(): FuturesPaperEngineConfig;
+  setConfig(patch: Partial<FuturesPaperEngineConfig>): void;
+  getCumulativeRealizedPnlQuote(): number;
+  getOpenPosition(): import("../domain/position.js").Position | null;
+  isFlat(): boolean;
+  openLong(input: {
+    instrumentId: InstrumentId;
+    quantity: number;
+    book: import("../domain/book.js").TopOfBookL1;
+    nowMs: number;
+    contract?: import("../domain/instrument.js").Instrument;
+  }): FuturesPaperOpenResult;
+  openShort(input: {
+    instrumentId: InstrumentId;
+    quantity: number;
+    book: import("../domain/book.js").TopOfBookL1;
+    nowMs: number;
+    contract?: import("../domain/instrument.js").Instrument;
+  }): FuturesPaperOpenResult;
+  closeManual(
+    book: import("../domain/book.js").TopOfBookL1,
+    nowMs: number
+  ): FuturesPaperRoundtrip | null;
+  evaluateExit(
+    book: import("../domain/book.js").TopOfBookL1 | null,
+    nowMs: number,
+    contract?: import("../domain/instrument.js").Instrument
+  ): FuturesPaperExitDecision | null;
+  onBook(
+    book: import("../domain/book.js").TopOfBookL1 | null,
+    nowMs: number,
+    contract?: import("../domain/instrument.js").Instrument
+  ): FuturesPaperRoundtrip | null;
+  evaluateMargin(input: {
+    markPrice: number | null;
+    nowMs: number;
+    book?: import("../domain/book.js").TopOfBookL1 | null;
+    contract?: import("../domain/instrument.js").Instrument;
+  }): FuturesPaperMarginDecision | null;
+}
 
 export type FuturesPaperOpenOk = {
   ok: true;

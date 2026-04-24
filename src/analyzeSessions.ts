@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./config/loadEnv.js";
 /**
  * Multi-session binary rollup: reads `session-summary.json` + optional `sessions/*.json`
  * under the monitor output directory, merges `binaryRunAnalytics` and optional `trades.jsonl`

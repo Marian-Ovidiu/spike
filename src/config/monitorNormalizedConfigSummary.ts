@@ -11,6 +11,7 @@ import {
   type AppConfig,
   type ConfigSourceMeta,
 } from "../config.js";
+import { readCurrentEnvNumber } from "./env.js";
 import {
   effectiveBinaryMaxEntryPriceForSide,
   effectiveBinaryMinMispricingThreshold,
@@ -104,10 +105,7 @@ export type NormalizedMonitorConfigSummary = {
 };
 
 function envIntPoly(key: string, fallback: number): number {
-  const raw = process.env[key]?.trim();
-  if (raw === undefined || raw === "") return fallback;
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) ? n : fallback;
+  return readCurrentEnvNumber(key, fallback);
 }
 
 function oneSignalEntry(

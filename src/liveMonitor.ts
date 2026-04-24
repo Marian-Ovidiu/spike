@@ -1,3 +1,5 @@
+import "./config/loadEnv.js";
+
 /**
  * Legacy **binary-first** live monitor (`SimulationEngine`, YES/NO execution, JSONL `output/monitor/`).
  * For the **futures core** stack use `src/core/runtime/runFuturesMonitor.ts` → `npm run monitor:futures`.

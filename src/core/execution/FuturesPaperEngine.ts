@@ -8,6 +8,7 @@ import type {
   FuturesPaperExitPendingReason,
   FuturesPaperExitTrigger,
   FuturesPaperCloseReason,
+  FuturesPaperExecutionEngine,
   FuturesPaperEngineConfig,
   FuturesPaperMarginDecision,
   FuturesPaperMarginSnapshot,
@@ -20,8 +21,14 @@ type InternalPosition = {
   side: PositionSide;
   quantity: number;
   avgEntryPrice: number;
+  entryMidPrice?: number;
   openedAtMs: number;
   feesOpenQuote: number;
+  spreadCostQuote?: number;
+  slippageCostQuote?: number;
+  latencyCostQuote?: number;
+  fundingCostQuote?: number;
+  edgeBeforeCostsQuote?: number;
 };
 
 type InternalExitState = {
@@ -261,12 +268,12 @@ function estimateNetPnlAtExecutableExit(input: {
   };
 }
 
-export class FuturesPaperEngine {
-  private cfg: FuturesPaperEngineConfig;
-  private pos: InternalPosition | null = null;
-  private exitState: InternalExitState | null = null;
-  private cumulativeRealizedPnlQuote = 0;
-  private peakExecutableNetPnlQuote: number | null = null;
+export class FuturesPaperEngine implements FuturesPaperExecutionEngine {
+  protected cfg: FuturesPaperEngineConfig;
+  protected pos: InternalPosition | null = null;
+  protected exitState: InternalExitState | null = null;
+  protected cumulativeRealizedPnlQuote = 0;
+  protected peakExecutableNetPnlQuote: number | null = null;
 
   constructor(config: FuturesPaperEngineConfig) {
     this.cfg = { ...config };
@@ -608,7 +615,7 @@ export class FuturesPaperEngine {
     };
   }
 
-  private closeAtBook(
+  protected closeAtBook(
     book: TopOfBookL1,
     nowMs: number,
     reason: FuturesPaperCloseReason,
@@ -677,7 +684,7 @@ export class FuturesPaperEngine {
     return roundtrip;
   }
 
-  private forceCloseWithoutBook(
+  protected forceCloseWithoutBook(
     nowMs: number,
     trigger: FuturesPaperExitTrigger,
     contract?: ContractMeta
@@ -730,7 +737,7 @@ export class FuturesPaperEngine {
     return roundtrip;
   }
 
-  private closeLiquidationWithoutBook(
+  protected closeLiquidationWithoutBook(
     markPrice: number,
     nowMs: number,
     contract?: ContractMeta,
@@ -786,7 +793,7 @@ export class FuturesPaperEngine {
     return roundtrip;
   }
 
-  private detectProfitProtectionTrigger(
+  protected detectProfitProtectionTrigger(
     book: TopOfBookL1 | null,
     contract?: ContractMeta
   ):

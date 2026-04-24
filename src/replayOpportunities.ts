@@ -1,3 +1,5 @@
+import "./config/loadEnv.js";
+
 // Replay monitor opportunities JSONL with current strategy gates (analysis-only, no trading).
 // Use after the priorRangeFraction persistence fix to compare stored rejections vs re-evaluated logic.
 

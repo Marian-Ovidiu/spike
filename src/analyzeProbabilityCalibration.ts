@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./config/loadEnv.js";
 /**
  * Offline binary probability calibration: reads `probability-calibration-events.jsonl`
  * under a monitor output directory and prints bucket reliability + verdict.

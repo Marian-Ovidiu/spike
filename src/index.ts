@@ -1,3 +1,5 @@
+import "./config/loadEnv.js";
+
 /**
  * Legacy entry: simplified `botLoop` with `marketFeedFactory` (binary / spot). Not the futures core runtime.
  * Futures stack: `npm run monitor:futures` → `src/core/runtime/runFuturesMonitor.ts`.

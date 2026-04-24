@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./config/loadEnv.js";
 /**
  * Offline binary run analytics: reads opportunities.jsonl, trades.jsonl, session-summary.json.
  *

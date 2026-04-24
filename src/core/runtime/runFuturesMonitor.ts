@@ -3,6 +3,8 @@
  *
  * Does not use `simulationEngine` or `strategyDecisionPipeline`.
  */
+import "../../config/loadEnv.js";
+
 import { randomUUID } from "node:crypto";
 import type { InstrumentId } from "../domain/instrument.js";
 import type { TopOfBookL1 } from "../domain/book.js";
@@ -17,6 +19,7 @@ import type {
   FuturesJsonlEvent,
   FuturesSessionSummary,
 } from "../reporting/futuresEventTypes.js";
+import { readCurrentEnvBool, readRuntimeConfig } from "../../config/env.js";
 import {
   FuturesReportingPersistence,
   buildEntryConfirmationCancelledEvent,
@@ -49,14 +52,6 @@ import { runFuturesStackStep, type FuturesEntryConfirmationUpdate, type FuturesS
 import type { PositionSide } from "../domain/sides.js";
 import type { SignalEvaluation } from "../signal/types.js";
 import type { RiskEvaluationInput, RiskGateResult } from "../risk/riskTypes.js";
-
-function envBool(key: string, fallback: boolean): boolean {
-  const v = process.env[key]?.trim().toLowerCase();
-  if (!v) return fallback;
-  if (v === "1" || v === "true" || v === "yes") return true;
-  if (v === "0" || v === "false" || v === "no") return false;
-  return fallback;
-}
 
 type ActiveTradeState = {
   tradeId: string;
@@ -1299,7 +1294,7 @@ function runMonitorLoop(
       reporter.recordOpenSuccess(now, step.openAttempt, now, step.openSignalSnapshot);
     } else if (step.openAttempt && !step.openAttempt.ok) {
       reporter.recordOpenRejected(now, step.openAttempt, step.openSignalSnapshot);
-    } else if (envBool("FUTURES_VERBOSE", false) && step.riskEvaluation) {
+    } else if (readCurrentEnvBool("FUTURES_VERBOSE", false) && step.riskEvaluation) {
       console.log(
         JSON.stringify({
           channel: "futures_monitor",
@@ -1368,7 +1363,8 @@ function runMonitorLoop(
 
 async function main(): Promise<void> {
   const ctx = createFuturesMonitorRuntime();
-  const { feed, tickIntervalMs } = ctx;
+  const runtime = readRuntimeConfig();
+  const { feed, marketData, metadata, tickIntervalMs } = ctx;
   const profitLockThresholdQuote =
     ctx.paper.getConfig().profitLockThresholdQuote ?? 1;
   const reporter = new FuturesMonitorReporter(
@@ -1381,8 +1377,35 @@ async function main(): Promise<void> {
       channel: "futures_monitor",
       type: "startup",
       sessionId: reporter.getSessionId(),
+      exchange: metadata.exchangeId,
+      tradingMode: runtime.tradingMode,
+      category:
+        runtime.futuresExchange === "bybit" ? runtime.bybitCategory : undefined,
+      symbol: metadata.instrument.symbol,
+      productId:
+        runtime.futuresExchange === "coinbase"
+          ? feed.contract.venueSymbol.code
+          : undefined,
+      feed:
+        runtime.futuresExchange === "bybit"
+          ? "public_ws"
+          : runtime.futuresExchange === "coinbase"
+            ? "coinbase_public"
+            : feed.implementationKind,
+      marketData: "public",
+      execution: ctx.realisticPaperMode ? "realistic_paper" : "paper",
+      liveTrading: runtime.tradingMode === "live",
+      bootstrap:
+        runtime.tradingMode === "public_paper" ? "public_or_skipped" : "signed",
+      signedEndpoints: runtime.tradingMode !== "public_paper",
+      trading: "paper",
       instrumentId: feed.instrumentId,
       contract: feed.contract,
+      exchangeMetadata: metadata,
+      marketDataAdapter: {
+        exchangeId: marketData.exchangeId,
+        instrument: marketData.instrument,
+      },
       venueKind: feed.venueKind,
       implementationKind: feed.implementationKind,
       capabilities: feed.capabilities,

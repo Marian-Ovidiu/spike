@@ -13,6 +13,12 @@ export function binanceUsdmPerpInstrumentId(symbolCode: string): InstrumentId {
   return `binance:usdm_perp:${u}`;
 }
 
+/** Stable id for Bybit linear perpetual instruments. */
+export function bybitUsdmPerpInstrumentId(symbolCode: string): InstrumentId {
+  const u = symbolCode.trim().toUpperCase();
+  return `bybit:usdm_perp:${u}`;
+}
+
 export function parseVenueFromInstrumentId(id: InstrumentId): VenueId | null {
   const parts = id.split(":");
   return parts.length >= 1 ? parts[0]! : null;

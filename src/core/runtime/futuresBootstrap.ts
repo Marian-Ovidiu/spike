@@ -1,40 +1,49 @@
 /**
  * Wiring for the futures-oriented monitor: shared app config + core modules only.
  */
-import "dotenv/config";
+import "../../config/loadEnv.js";
 
 import type { EvaluateSignalConditionsInput } from "../signal/signalEvaluate.js";
 import type { FuturesPaperEngineConfig } from "../execution/futuresPaperTypes.js";
 import { FuturesPaperEngine } from "../execution/FuturesPaperEngine.js";
+import {
+  RealisticPaperEngine,
+  type RealisticPaperEngineConfig,
+} from "../execution/RealisticPaperEngine.js";
 import { RiskEngine } from "../risk/RiskEngine.js";
 import type { RiskEngineConfig } from "../risk/riskConfig.js";
 import { RollingPriceBuffer } from "../signal/rollingPriceBuffer.js";
 import type { FuturesMarketFeed } from "../market/futuresFeed.js";
 import { createDefaultFuturesMarketFeed } from "../market/futuresFeed.js";
+import {
+  readPaperSimulationConfig,
+  readExchangeConfig,
+  readLiveSafetyConfig,
+  readRuntimeConfig,
+} from "../../config/env.js";
+import { assertCanUseLiveExecution } from "../../config/env.js";
 import { config } from "../../config.js";
+import type {
+  ExchangeMarketData,
+  MarketSnapshot as ExchangeMarketSnapshot,
+  BookSnapshot as ExchangeBookSnapshot,
+  TradeTick as ExchangeTradeTick,
+} from "../../exchanges/shared/ExchangeMarketData.js";
+import type {
+  ExchangeMetadata,
+  InstrumentMetadata,
+} from "../../exchanges/shared/ExchangeMetadata.js";
 
 /** Matches legacy `MIN_SAMPLES_FOR_STRATEGY` — spike math needs sufficient window. */
 export const FUTURES_MIN_SAMPLES_FOR_SIGNAL = 11;
 
-function envBool(key: string, fallback: boolean): boolean {
-  const v = process.env[key]?.trim().toLowerCase();
-  if (!v) return fallback;
-  if (v === "1" || v === "true" || v === "yes") return true;
-  if (v === "0" || v === "false" || v === "no") return false;
-  return fallback;
-}
-
-function envNumber(key: string, fallback: number): number {
-  const raw = process.env[key]?.trim();
-  if (!raw) return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 export type FuturesMonitorRuntime = {
   feed: FuturesMarketFeed;
+  marketData: ExchangeMarketData;
+  metadata: ExchangeMetadata;
   risk: RiskEngine;
   paper: FuturesPaperEngine;
+  realisticPaperMode: boolean;
   priceBuffer: RollingPriceBuffer;
   feedStaleMaxAgeMs: number;
   tickIntervalMs: number;
@@ -52,97 +61,170 @@ export type FuturesMonitorRuntime = {
 };
 
 function buildPaperConfig(): FuturesPaperEngineConfig {
+  const paper = readPaperSimulationConfig();
   return {
-    takeProfitBps: envNumber("FUTURES_TP_BPS", config.takeProfitBps),
-    stopLossBps: envNumber("FUTURES_SL_BPS", config.stopLossBps),
-    exitTimeoutMs: envNumber("FUTURES_EXIT_TIMEOUT_MS", config.exitTimeoutMs),
-    feeRoundTripBps: envNumber(
-      "FUTURES_FEE_ROUND_TRIP_BPS",
-      config.paperFeeRoundTripBps
-    ),
-    slippageBps: envNumber(
-      "FUTURES_SLIPPAGE_BPS",
-      config.binaryPaperSlippageBps
-    ),
-    exitGracePeriodMs: envNumber("FUTURES_EXIT_GRACE_MS", 5_000),
-    forcedExitPenaltyBps: envNumber("FUTURES_FORCED_EXIT_PENALTY_BPS", 25),
-    initialMarginRate: envNumber("FUTURES_INITIAL_MARGIN_RATE", 0.05),
-    maintenanceMarginRate: envNumber("FUTURES_MAINTENANCE_MARGIN_RATE", 0.0375),
-    marginWarningRatio: envNumber("FUTURES_MARGIN_WARNING_RATIO", 1.25),
-    liquidationRiskRatio: envNumber("FUTURES_LIQUIDATION_RISK_RATIO", 1.05),
-    liquidationPenaltyBps: envNumber("FUTURES_LIQUIDATION_PENALTY_BPS", 50),
-    profitLockEnabled: envBool("FUTURES_PROFIT_LOCK_ENABLED", false),
-    profitLockThresholdQuote: envNumber(
-      "FUTURES_PROFIT_LOCK_THRESHOLD_QUOTE",
-      1
-    ),
-    trailingProfitEnabled: envBool("FUTURES_TRAILING_PROFIT_ENABLED", false),
-    trailingProfitDropQuote: envNumber(
-      "FUTURES_TRAILING_PROFIT_DROP_QUOTE",
-      0
-    ),
+    takeProfitBps: paper.takeProfitBps,
+    stopLossBps: paper.stopLossBps,
+    exitTimeoutMs: paper.exitTimeoutMs,
+    feeRoundTripBps: paper.feeRoundTripBps,
+    slippageBps: paper.slippageBps,
+    exitGracePeriodMs: paper.exitGracePeriodMs,
+    forcedExitPenaltyBps: paper.forcedExitPenaltyBps,
+    initialMarginRate: paper.initialMarginRate,
+    maintenanceMarginRate: paper.maintenanceMarginRate,
+    marginWarningRatio: paper.marginWarningRatio,
+    liquidationRiskRatio: paper.liquidationRiskRatio,
+    liquidationPenaltyBps: paper.liquidationPenaltyBps,
+    profitLockEnabled: paper.profitLockEnabled,
+    profitLockThresholdQuote: paper.profitLockThresholdQuote,
+    trailingProfitEnabled: paper.trailingProfitEnabled,
+    trailingProfitDropQuote: paper.trailingProfitDropQuote,
   };
 }
 
 function buildRiskConfig(): RiskEngineConfig {
-  const blockStale = envBool(
-    "FUTURES_BLOCK_ON_STALE_FEED",
-    config.blockEntriesOnStaleFeed
-  );
-
-  const blockSignalStale = envBool("FUTURES_BLOCK_ON_SIGNAL_STALE", false);
-
   return {
-    blockEntriesOnExecutionFeedStale: blockStale,
-    blockEntriesOnSignalFeedStale: blockSignalStale,
-    maxEntrySpreadBps: envNumber(
-      "FUTURES_MAX_ENTRY_SPREAD_BPS",
-      config.maxEntrySpreadBps
-    ),
-    entryCooldownMs: envNumber(
-      "FUTURES_ENTRY_COOLDOWN_MS",
-      config.entryCooldownMs
-    ),
-    baseStakeQuote: envNumber("FUTURES_STAKE_QUOTE", config.stakePerTrade),
-    minTradeSizeQuote: envNumber(
-      "FUTURES_MIN_TRADE_QUOTE",
-      config.minTradeSize
-    ),
-    maxTradeSizeQuote: envNumber(
-      "FUTURES_MAX_TRADE_QUOTE",
-      config.maxTradeSize
-    ),
+    blockEntriesOnExecutionFeedStale: config.blockEntriesOnStaleFeed,
+    blockEntriesOnSignalFeedStale: false,
+    maxEntrySpreadBps: config.maxEntrySpreadBps,
+    entryCooldownMs: config.entryCooldownMs,
+    baseStakeQuote: config.stakePerTrade,
+    minTradeSizeQuote: config.minTradeSize,
+    maxTradeSizeQuote: config.maxTradeSize,
+  };
+}
+
+function buildInstrumentMetadata(
+  exchangeId: ExchangeMetadata["exchangeId"],
+  feed: FuturesMarketFeed
+): InstrumentMetadata {
+  const instrumentRef = {
+    exchangeId,
+    symbol: feed.contract.venueSymbol.code,
+    instrumentId: feed.instrumentId,
+    venueSymbol: feed.contract.venueSymbol.venue,
+  };
+  const metadata: InstrumentMetadata = {
+    exchangeId,
+    instrumentRef,
+    symbol: instrumentRef.symbol,
+    kind: feed.contract.kind,
+    baseAsset: feed.contract.baseAsset,
+    quoteAsset: feed.contract.quoteAsset,
+    settlementAsset: feed.contract.settlementAsset,
+    tickSize: feed.contract.tickSize,
+    lotSize: feed.contract.lotSize,
+  };
+  return {
+    ...metadata,
+    ...(feed.contract.minQuantity !== undefined
+      ? { minQuantity: feed.contract.minQuantity }
+      : {}),
+    ...(feed.contract.contractMultiplier !== undefined
+      ? { contractMultiplier: feed.contract.contractMultiplier }
+      : {}),
+  };
+}
+
+function toBookSnapshot(
+  book: NonNullable<ReturnType<FuturesMarketFeed["getTopOfBookL1"]>>
+): ExchangeBookSnapshot {
+  return {
+    bestBid: book.bestBid,
+    bestAsk: book.bestAsk,
+    midPrice: book.midPrice,
+    spreadBps: book.spreadBps,
+    ...(book.bestBidSize !== undefined ? { bestBidSize: book.bestBidSize } : {}),
+    ...(book.bestAskSize !== undefined ? { bestAskSize: book.bestAskSize } : {}),
+  };
+}
+
+function buildMarketDataAdapter(
+  exchangeId: ExchangeMetadata["exchangeId"],
+  feed: FuturesMarketFeed
+): ExchangeMarketData {
+  const instrument = buildInstrumentMetadata(exchangeId, feed).instrumentRef;
+  return {
+    exchangeId,
+    instrument,
+    getBook(nowMs = Date.now()): ExchangeBookSnapshot | null {
+      const book = feed.getTopOfBookL1?.();
+      return book ? toBookSnapshot(book) : null;
+    },
+    getTradeTick(nowMs = Date.now()): ExchangeTradeTick | null {
+      const snapshot = feed.getMarketSnapshot(nowMs);
+      const price =
+        snapshot?.signalMid ??
+        snapshot?.lastTradePrice ??
+        feed.getSignalMid() ??
+        feed.getMarkPrice() ??
+        null;
+      if (price === null) return null;
+      return {
+        exchangeId,
+        instrument,
+        observedAtMs: nowMs,
+        price,
+        sequence: snapshot?.sequence ?? feed.getSequence?.(),
+      };
+    },
+    getMarketSnapshot(nowMs = Date.now()): ExchangeMarketSnapshot | null {
+      const snapshot = feed.getMarketSnapshot(nowMs);
+      if (!snapshot) return null;
+      return {
+        exchangeId,
+        instrument,
+        observedAtMs: snapshot.observedAtMs,
+        signalMid: snapshot.signalMid,
+        lastTradePrice: snapshot.lastTradePrice,
+        book: snapshot.book ? toBookSnapshot(snapshot.book) : null,
+        staleness: snapshot.staleness,
+        markPrice: snapshot.markPrice,
+        indexPrice: snapshot.indexPrice,
+        sequence: snapshot.sequence,
+      };
+    },
   };
 }
 
 export function createFuturesMonitorRuntime(): FuturesMonitorRuntime {
-  const futuresContractSymbol =
-    process.env.FUTURES_CONTRACT_SYMBOL?.trim() ||
-    process.env.FUTURES_DEFAULT_SYMBOL?.trim() ||
-    "BTCUSDT";
+  const runtime = readRuntimeConfig();
+  const futuresContractSymbol = runtime.futuresContractSymbol;
+  const paper = readPaperSimulationConfig();
+  const exchangeId = runtime.futuresExchange;
+  if (runtime.tradingMode !== "public_paper") {
+    readExchangeConfig();
+  }
+  if (runtime.tradingMode === "live") {
+    assertCanUseLiveExecution({
+      runtime,
+      exchange: readExchangeConfig(),
+      liveSafety: readLiveSafetyConfig(),
+    });
+  }
   const feed = createDefaultFuturesMarketFeed({
     symbol: futuresContractSymbol,
-    initialSignalMid: envNumber("FUTURES_PAPER_MID", 95_000),
-    initialSpreadBps: envNumber("FUTURES_PAPER_SPREAD_BPS", 2),
-    syntheticUpdateMs: envNumber("FUTURES_FEED_SYNTHETIC_UPDATE_MS", 2_000),
-    oscillationBps: envNumber("FUTURES_FEED_OSCILLATION_BPS", 18),
-    markBasisBps: envNumber("FUTURES_FEED_MARK_BASIS_BPS", 0.8),
-    indexBasisBps: envNumber("FUTURES_FEED_INDEX_BASIS_BPS", -0.2),
-    fundingBiasBps: envNumber("FUTURES_FEED_FUNDING_BIAS_BPS", 0.05),
-    spotProxyFallback: envBool("FUTURES_USE_SPOT_PROXY_FALLBACK", false),
+    initialSignalMid: paper.initialSignalMid,
+    initialSpreadBps: paper.initialSpreadBps,
+    syntheticUpdateMs: paper.syntheticUpdateMs,
+    oscillationBps: paper.oscillationBps,
+    markBasisBps: paper.markBasisBps,
+    indexBasisBps: paper.indexBasisBps,
+    fundingBiasBps: paper.fundingBiasBps,
+    spotProxyFallback: paper.useSpotProxyFallback,
   });
 
-  const feedStaleMaxAgeMs = envNumber(
-    "FUTURES_FEED_STALE_MAX_MS",
-    config.feedStaleMaxAgeMs
-  );
-
-  const tickIntervalMs = envNumber(
-    "FUTURES_TICK_INTERVAL_MS",
-    5_000
-  );
+  const feedStaleMaxAgeMs = paper.feedStaleMaxAgeMs;
+  const tickIntervalMs = paper.tickIntervalMs;
 
   const riskCfg = buildRiskConfig();
+  const paperConfig = {
+    ...buildPaperConfig(),
+    ...paper,
+  } as RealisticPaperEngineConfig;
+  const paperEngine = paper.realisticMode
+    ? new RealisticPaperEngine(paperConfig)
+    : new FuturesPaperEngine(paperConfig);
 
   const signalInputBase: Omit<EvaluateSignalConditionsInput, "prices"> = {
     rangeThreshold: config.rangeThreshold,
@@ -156,8 +238,16 @@ export function createFuturesMonitorRuntime(): FuturesMonitorRuntime {
 
   return {
     feed,
+    marketData: buildMarketDataAdapter(exchangeId, feed),
+    metadata: {
+      exchangeId,
+      instrument: buildInstrumentMetadata(exchangeId, feed),
+      feeSchedule: { makerFeeBps: 0, takerFeeBps: 0 },
+      venueLabel: runtime.futuresExchange,
+    },
     risk: new RiskEngine(riskCfg),
-    paper: new FuturesPaperEngine(buildPaperConfig()),
+    paper: paperEngine,
+    realisticPaperMode: paper.realisticMode,
     priceBuffer: new RollingPriceBuffer(config.priceBufferSize),
     feedStaleMaxAgeMs,
     tickIntervalMs,
@@ -165,21 +255,12 @@ export function createFuturesMonitorRuntime(): FuturesMonitorRuntime {
     signalInputBase,
     blockEntriesOnExecutionFeedStale:
       riskCfg.blockEntriesOnExecutionFeedStale,
-    entryConfirmationTicks: envNumber("FUTURES_ENTRY_CONFIRMATION_TICKS", 2),
-    entryRequireReversal: envBool("FUTURES_ENTRY_REQUIRE_REVERSAL", false),
-    balanceTrackingEnabled: envBool(
-      "FUTURES_BALANCE_TRACKING_ENABLED",
-      false
-    ),
-    balanceStartingBalance: envNumber("FUTURES_STARTING_BALANCE", 110),
-    balanceReserveBalance: envNumber("FUTURES_RESERVE_BALANCE", 10),
-    balanceFixedStakeUntilBalance: envNumber(
-      "FUTURES_FIXED_STAKE_UNTIL_BALANCE",
-      120
-    ),
-    balanceMinBalanceToContinue: envNumber(
-      "FUTURES_MIN_BALANCE_TO_CONTINUE",
-      100
-    ),
+    entryConfirmationTicks: paper.entryConfirmationTicks,
+    entryRequireReversal: paper.entryRequireReversal,
+    balanceTrackingEnabled: paper.balanceTrackingEnabled,
+    balanceStartingBalance: paper.balanceStartingBalance,
+    balanceReserveBalance: paper.balanceReserveBalance,
+    balanceFixedStakeUntilBalance: paper.balanceFixedStakeUntilBalance,
+    balanceMinBalanceToContinue: paper.balanceMinBalanceToContinue,
   };
 }

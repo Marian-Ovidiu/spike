@@ -9,6 +9,9 @@ import {
   type BinanceSpotAdapterOptions,
 } from "./binanceSpotAdapter.js";
 import { binanceUsdmPerpInstrumentId } from "./instrumentRef.js";
+import { createBybitFuturesMarketFeed, type BybitFuturesFeedOptions } from "./bybitFuturesFeed.js";
+import { createCoinbaseFuturesMarketFeed, type CoinbaseFuturesFeedOptions } from "./coinbaseFuturesFeed.js";
+import { readRuntimeConfig } from "../../config/env.js";
 
 export type FuturesVenueKind = "perpetual_swap" | "dated_future";
 
@@ -16,6 +19,8 @@ export type FuturesInstrumentType = FuturesVenueKind;
 
 export type FuturesFeedImplementationKind =
   | "futures_native_paper"
+  | "bybit_public_ws"
+  | "coinbase_public"
   | "spot_proxy"
   | "spot_paper_proxy";
 
@@ -24,8 +29,14 @@ export type FuturesPriceSourceKind =
   | "synthetic_execution_book"
   | "synthetic_mark_price"
   | "synthetic_index_price"
+  | "bybit_public_orderbook"
+  | "bybit_public_ticker"
+  | "coinbase_public_orderbook"
+  | "coinbase_public_ticker"
   | "spot_proxy_signal_mid"
   | "spot_proxy_execution_book";
+
+export type FuturesExchangeKind = "binance" | "bybit" | "coinbase";
 
 export type FuturesFeedCapabilities = {
   readonly supportsMarkPrice: boolean;
@@ -46,6 +57,7 @@ export type FuturesPriceSources = {
 export type FuturesContractMetadata = Instrument & {
   readonly instrumentType: FuturesInstrumentType;
   readonly settlementAsset: string;
+  readonly minNotional?: number;
 };
 
 export type FuturesMarketTick = {
@@ -80,6 +92,7 @@ export type FuturesMarketSnapshot = MarketSnapshot & {
 
 export type FuturesFeedConfig = {
   readonly symbol?: string;
+  readonly productId?: string;
   readonly instrumentId?: InstrumentId;
   readonly contract?: Partial<Instrument>;
   readonly venueKind?: FuturesVenueKind;
@@ -156,6 +169,10 @@ function defaultContract(input: FuturesFeedConfig): FuturesContractMetadata {
     minQuantity: input.contract?.minQuantity ?? input.contract?.lotSize ?? 0.001,
     contractMultiplier: input.contract?.contractMultiplier ?? 1,
   };
+}
+
+export function resolveFuturesExchangeFromEnv(): FuturesExchangeKind {
+  return readRuntimeConfig().futuresExchange;
 }
 
 function clampPositive(value: number, fallback: number): number {
@@ -599,6 +616,27 @@ export function createDefaultFuturesMarketFeed(
     spotProxyFallback?: boolean;
   }
 ): FuturesMarketFeed {
+  const exchange = resolveFuturesExchangeFromEnv();
+  if (exchange === "bybit") {
+    const bybitOptions: BybitFuturesFeedOptions = {};
+    if (options?.symbol !== undefined) {
+      bybitOptions.symbol = options.symbol;
+    }
+    if (options?.instrumentId !== undefined) {
+      bybitOptions.instrumentId = options.instrumentId;
+    }
+    return createBybitFuturesMarketFeed(bybitOptions);
+  }
+  if (exchange === "coinbase") {
+    const coinbaseOptions: CoinbaseFuturesFeedOptions = {};
+    if (options?.productId !== undefined) {
+      coinbaseOptions.productId = options.productId;
+    }
+    if (options?.instrumentId !== undefined) {
+      coinbaseOptions.instrumentId = options.instrumentId;
+    }
+    return createCoinbaseFuturesMarketFeed(coinbaseOptions);
+  }
   if (options?.spotProxyFallback === true) {
     const spotOptions: BinanceSpotAdapterOptions = {};
     if (options.symbol !== undefined) {
@@ -637,3 +675,5 @@ export function createTemporaryFuturesMarketFeed(
 ): FuturesMarketFeed {
   return createDefaultFuturesMarketFeed(options);
 }
+
+export { createCoinbaseFuturesMarketFeed } from "./coinbaseFuturesFeed.js";

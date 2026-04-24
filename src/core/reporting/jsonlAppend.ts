@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { FuturesJsonlEvent } from "./futuresEventTypes.js";
+import { readCurrentEnvString } from "../../config/env.js";
 
 const DEFAULT_OUTPUT_DIR = "output/futures-monitor";
 
@@ -9,7 +10,7 @@ const DEFAULT_OUTPUT_DIR = "output/futures-monitor";
  * Directory for futures JSONL + session summary (`FUTURES_REPORT_OUTPUT_DIR` overrides).
  */
 export function resolveFuturesReportOutputDir(): string {
-  const raw = process.env.FUTURES_REPORT_OUTPUT_DIR?.trim();
+  const raw = readCurrentEnvString("FUTURES_REPORT_OUTPUT_DIR", "");
   return raw && raw.length > 0 ? raw : DEFAULT_OUTPUT_DIR;
 }
 

@@ -1,11 +1,25 @@
-# Legacy layout
+# Legacy Modules
 
-Codice **fuori dal core futures** (`src/core/`) mantenuto per compatibilità con il prodotto **binary-first** e con la modalità spot documentata nel README principale.
+This directory contains compatibility and non-futures modules that are still kept
+in the tree for temporary backward compatibility.
 
-| Path | Contenuto |
-|------|-----------|
-| `legacy/spot/` | Gate `LEGACY_SPOT_MARKET_MODE`, exit/quote spot bps |
-| `legacy/binary/` | Placeholder (spostamenti futuri da `src/binary/` se si fa quarantena esplicita) |
-| `legacy/btcPriceService.ts` | REST ticker `/ticker/price` — **nessun import** nel resto di `src/`; vedi commento in cima al file |
+Active futures spike-monitor path:
+- `src/core/runtime/*`
+- `src/core/market/futuresFeed.ts`
+- `src/core/market/bybitFuturesFeed.ts`
+- `src/core/execution/liveSafetyGuard.ts`
+- `src/core/exchange/futuresOrderValidator.ts`
+- `src/exchanges/shared/*`
+- `src/config/env.ts`
 
-I moduli **`src/binary/**`**, **`liveMonitor.ts`**, **`botLoop.ts`**, **`simulationEngine.ts`**, **`strategy/**` non sono stati spostati: restano **entry e pipeline del prodotto legacy** ancora referenziati da `npm run monitor` e test.
+Legacy compatibility path:
+- `src/legacy/exchange/*`
+- `src/legacy/spot/*`
+- `src/legacy/binary/*`
+- `src/legacy/adapters/*`
+
+Current policy:
+- Do not delete legacy modules yet.
+- Keep temporary reexports in the original paths until all call sites are migrated.
+- Do not wire live order execution here.
+

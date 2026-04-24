@@ -1,3 +1,5 @@
+import "./config/loadEnv.js";
+
 /**
  * Legacy CSV backtest: `backtest.ts` + `SimulationEngine` (binary-first by default; `--spot-legacy` for old spot).
  * **Futures** offline replay: `npm run replay:futures` → `src/core/replay/runFuturesReplay.ts` (no `backtest.ts`).

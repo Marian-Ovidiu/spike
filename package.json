@@ -15,6 +15,9 @@
     "analyze-run": "npm run build && node dist/analyzeRun.js",
     "analyze-sessions": "npm run build && node dist/analyzeSessions.js",
     "analyze-probability-calibration": "npm run build && node dist/analyzeProbabilityCalibration.js",
+    "futures:api-check": "npm run build && node dist/core/exchange/runBinanceFuturesApiCheck.js",
+    "bybit:api-check": "npm run build && node dist/core/exchange/runBybitApiCheck.js",
+    "coinbase:api-check": "npm run build && node dist/exchanges/coinbase/runCoinbaseApiCheck.js",
     "test": "vitest run"
   },
   "keywords": [],
@@ -22,9 +25,11 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@coinbase/cdp-sdk": "^1.48.2",
     "axios": "^1.15.0",
     "dotenv": "^17.4.2",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",

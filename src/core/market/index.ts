@@ -18,6 +18,7 @@ export type {
   FuturesContractMetadata,
   FuturesFeedCapabilities,
   FuturesFeedImplementationKind,
+  FuturesExchangeKind,
   FuturesMarketFeed,
   FuturesPriceSourceKind,
   FuturesPriceSources,
@@ -40,8 +41,10 @@ export {
 export {
   createCompatSpotProxyFuturesFeed,
   createDefaultFuturesMarketFeed,
+  createCoinbaseFuturesMarketFeed,
   createFuturesPaperMarketFeed,
   createTemporaryFuturesMarketFeed,
+  resolveFuturesExchangeFromEnv,
 } from "./futuresFeed.js";
 
 export type { CoreVenueAdapterKind, FuturesDualFeedPlaceholder } from "./futuresExtension.js";

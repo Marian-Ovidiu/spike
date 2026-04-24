@@ -1,3 +1,5 @@
+import "../../config/loadEnv.js";
+
 /**
  * Offline replay / minimal backtest for the futures core stack.
  *
@@ -36,6 +38,10 @@ import type { SignalEvaluation } from "../signal/types.js";
 import type { RiskEvaluationInput, RiskGateResult } from "../risk/riskTypes.js";
 import type { FuturesPaperRoundtrip } from "../execution/futuresPaperTypes.js";
 import type { FuturesJsonlEvent, FuturesSessionSummary } from "../reporting/futuresEventTypes.js";
+import {
+  readCurrentEnvNumber,
+  readCurrentEnvString,
+} from "../../config/env.js";
 import {
   FuturesReportingPersistence,
   buildEntryConfirmationCancelledEvent,
@@ -159,10 +165,9 @@ function parseArgs(argv: string[]): {
   let epochStartMs = 0;
   let defaultSpreadBps = 3;
   let failureProfile: ReplayFailureProfile =
-    (process.env.FUTURES_REPLAY_FAILURE_PROFILE?.trim() as ReplayFailureProfile) ||
+    (readCurrentEnvString("FUTURES_REPLAY_FAILURE_PROFILE", "off") as ReplayFailureProfile) ||
     "off";
-  let replaySeed = Number(process.env.FUTURES_REPLAY_SEED?.trim() || "1337");
-  if (!Number.isFinite(replaySeed)) replaySeed = 1337;
+  let replaySeed = readCurrentEnvNumber("FUTURES_REPLAY_SEED", 1337);
   let forceExitDisruption =
     failureProfile === "stress" || failureProfile === "chaos";
   let reportOutDir: string | undefined;
@@ -390,7 +395,7 @@ class FuturesReplayReporter {
   ) {
     const resolvedOutputDir =
       outputDir ??
-      (process.env.FUTURES_REPLAY_REPORT_OUTPUT_DIR?.trim() ||
+      (readCurrentEnvString("FUTURES_REPLAY_REPORT_OUTPUT_DIR", "") ||
         "output/futures-replay");
     this.persistence = new FuturesReportingPersistence(resolvedOutputDir);
   }
